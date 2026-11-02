@@ -48,7 +48,7 @@ Beim Start von mwm, z. B. in `~/.config/mwm/autostart`:
 | Ctrl+V | im aktuellen Ordner einfügen |
 | Entf | in den Papierkorb |
 | Shift+Entf | endgültig löschen, nach Rückfrage (`y`/`j` bestätigt, jede andere Taste bricht ab) |
-| Esc | Suche/Meldung löschen, ohne laufende Suche: Markierungen aufheben |
+| Esc | der Reihe nach: Suche löschen, sonst Meldung löschen, sonst Markierungen aufheben |
 
 In Eingabefeldern (Pfad, Umbenennen, neuer Ordner): ← → Pos1 Ende bewegen
 den Cursor, Backspace/Entf löschen, Ctrl+U leert, Enter bestätigt, Esc
@@ -57,31 +57,50 @@ bricht ab.
 Maus: Klick wählt, Doppelklick öffnet, Mausrad scrollt, Scrollbar ziehen
 oder in die Leiste klicken, Pfeil-Button oder Maus-Zurück-Taste (8) für
 „nach oben“, Klick in die Pfadzeile zum Bearbeiten, Ctrl+Klick markiert,
-Shift+Klick markiert den Bereich bis zur Auswahl.
+Shift+Klick markiert den Bereich bis zur Auswahl, ein einfacher Klick hebt
+alle Markierungen auf.
 
 ## Dateien verwalten
 
 Die Markierungen gelten im aktuellen Ordner und bleiben beim automatischen
-Neuladen erhalten; beim Ordnerwechsel verfallen sie. Ohne Markierung
-wirkt jede Aktion auf die ausgewählte Zeile.
+Neuladen erhalten; beim Ordnerwechsel, nach Ctrl+C/Ctrl+X und bei einem
+einfachen Klick verfallen sie. Ohne Markierung wirkt jede Aktion auf die
+ausgewählte Zeile.
 
-Kopieren (`cp -a`), Verschieben und endgültiges Löschen (`rm -rf`) laufen
-in einem Hintergrundprozess, das Fenster bleibt bedienbar; eine weitere
-Aktion wartet, bis die laufende fertig ist. Verschoben wird per
-`rename`, über Dateisystemgrenzen mit `mv`. Das Ergebnis, bei Fehlern der
-erste davon, steht in der Statuszeile.
+Kopieren, Verschieben und endgültiges Löschen laufen in einem
+Hintergrundprozess, das Fenster bleibt bedienbar; eine weitere Aktion
+(auch F2/F7) wartet, bis die laufende fertig ist. Beendet man mfm
+vorher, läuft sie zu Ende. Das Ergebnis, bei Fehlern der erste davon,
+steht in der Statuszeile. Nach Ctrl+X bleibt die Zwischenablage stehen,
+bis das Verschieben ganz geklappt hat.
 
-Überschrieben wird nie: Ist ein Name im Ziel schon vergeben, heißt die
-Kopie `name (copy).txt`, `name (copy 2).txt` usw. So erzeugt auch
-Ctrl+C, Ctrl+V im selben Ordner ein Duplikat. Einen Ordner in sich selbst
-zu kopieren oder zu verschieben lehnt mfm ab. Auch Umbenennen
-überschreibt nichts; ist der neue Name vergeben, meldet mfm das.
+Überschrieben wird nie. Verschoben wird innerhalb eines Dateisystems per
+`rename`, das keinen vorhandenen Namen ersetzt. Kopien (`cp -a`) und
+Verschiebungen über Dateisystemgrenzen (`mv`) landen zuerst in einem
+versteckten Ordner `.mfm-XXXXXX` im Ziel und werden von dort umbenannt:
+Eine halbe Kopie erscheint nie unter dem echten Namen, und der Name wird
+erst in diesem Moment gewählt. Ist er vergeben (auch nur in anderer
+Groß-/Kleinschreibung auf FAT-Laufwerken), heißt die Kopie
+`name (copy).txt`, `name (copy 2).txt` usw., ein verschobener Eintrag
+`name (2).txt`, `name (3).txt`. So erzeugt auch Ctrl+C, Ctrl+V im
+selben Ordner ein Duplikat. Einen Ordner in sich selbst zu kopieren oder
+zu verschieben lehnt mfm ab. Auch Umbenennen überschreibt nichts; ist der
+neue Name vergeben, meldet mfm das. (Einzige Lücke: Dateisysteme ohne
+atomares „umbenennen ohne zu ersetzen“, z. B. NFS, bei Ordnern.)
+
+Endgültiges Löschen ist `rm -rf --one-file-system`: Eingehängte
+Dateisysteme darunter bleiben unberührt, und einen Einhängepunkt selbst
+löscht mfm nicht.
 
 Der Papierkorb folgt der freedesktop.org-Spezifikation, Dateien lassen
 sich also mit jedem Dateimanager wiederherstellen, der sie kennt (oder per
 Hand aus `files/`, der Originalpfad steht in `info/*.trashinfo`). Er liegt
 in `$XDG_DATA_HOME/Trash` (Standard `~/.local/share/Trash`), für Dateien
-auf anderen Dateisystemen in `.Trash-$UID` an deren Wurzel. Geht das nicht
+auf anderen Dateisystemen an deren Wurzel in `.Trash/$UID` (wenn der
+Administrator einen gemeinsamen `.Trash` eingerichtet hat), sonst in
+`.Trash-$UID`; dort steht der Originalpfad relativ zur Wurzel, damit er
+auch stimmt, wenn der Datenträger woanders eingehängt wird. Was schon im
+Papierkorb liegt, wird nicht noch einmal hineingelegt. Geht es nicht
 (z. B. schreibgeschützt), bleibt Shift+Entf.
 
 Der Ordner wird jede Sekunde auf Änderungen geprüft und neu eingelesen,

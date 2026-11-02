@@ -11,7 +11,7 @@
  *         typing                      jump to name (type-ahead)
  *         Ctrl+L  edit path   Ctrl+H  hidden files   Ctrl+R / F5  reload
  *         Ctrl+T  terminal here   Ctrl+Q / Ctrl+W / Alt+F4  quit
- *         Esc  clear search and message, else the marks
+ *         Esc  clear the search, else the message, else the marks
  *         Space / Insert  mark   Ctrl+A  mark all   Ctrl+C / Ctrl+X  copy /
  *         cut   Ctrl+V  paste   Delete  to the trash   Shift+Delete  delete
  *         F2  rename   F7 / Ctrl+Shift+N  new folder
@@ -19,9 +19,10 @@
  *         Ctrl+click mark, Shift+click mark a range,
  *         up-arrow button or back button (btn 8) for the parent directory.
  *
- * Copy, move and permanent delete run cp -a, mv and rm -r in a child
- * process, one item after the other; nothing is overwritten, a taken name
- * gets " (copy)". The trash follows the freedesktop.org specification.
+ * Copy, move and permanent delete run in a child process, one item after
+ * the other (cp -a, rename or mv, rm -rf --one-file-system). Nothing is
+ * overwritten: a taken name gets " (copy)" or, when moving, " (2)". The
+ * trash follows the freedesktop.org specification.
  *
  * Paths are kept logical, as the shell's `cd` does: after entering a
  * symlinked directory, ".." leads back to where the link is.
@@ -50,7 +51,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -100,7 +100,7 @@ static size_t edit_cur;
 /* F2 / F7: a name typed into the status line */
 enum { PR_NONE, PR_RENAME, PR_MKDIR };
 static int prompt, pfresh;
-static char pbuf[NAME_MAX + 1], pold[NAME_MAX + 1];
+static char pbuf[NAME_MAX + 1], pold[NAME_MAX + 1], pdir[PATH_MAX];
 static size_t pcur;
 static int up_pressed, dragging, drag_off;
 static Time last_click;
@@ -111,6 +111,7 @@ static int dirty = 1;
 static char clip_dir[PATH_MAX];
 static char **clip;
 static int nclip, clip_move;
+static unsigned clip_gen;       /* counts clipboard changes */
 /* Shift+Delete waits for y/n; the names are taken when it is pressed */
 static char pend_dir[PATH_MAX];
 static char **pend;
@@ -123,6 +124,7 @@ static const char *const op_ing[] = { "copying", "moving", "deleting" };
 static const char *const op_ed[] = { "copied", "moved", "deleted" };
 static struct {
 	int fd, op, n, fails;
+	unsigned clip_gen;      /* the clipboard a move started from */
 	char dir[PATH_MAX], first[NAME_MAX + 1];
 	char out[512];
 	size_t outlen;
@@ -1034,6 +1036,153 @@ static char **targets(int *n)
 	return v;
 }
 
+/* ---- safe renames ------------------------------------------------------- */
+
+/* The longest prefix of s[0..n) of at most max bytes that does not end
+ * inside a UTF-8 sequence. */
+static int u8_fit(const char *s, int n, int max)
+{
+	if (n <= max)
+		return n;
+	while (max > 0 && (s[max] & 0xc0) == 0x80)
+		max--;
+	return max;
+}
+
+/* Which mount `path` is on: the mount ID where the kernel reports one
+ * (it tells bind mounts and btrfs subvolumes apart), else the device. */
+static int mount_id(const char *path, int follow, uint64_t *id)
+{
+	struct statx sx;
+	if (statx(AT_FDCWD, path, follow ? 0 : AT_SYMLINK_NOFOLLOW,
+	    STATX_MNT_ID, &sx) < 0)
+		return -1;
+	if (sx.stx_mask & STATX_MNT_ID)
+		*id = sx.stx_mnt_id;
+	else
+		*id = 1ULL << 63 | (uint64_t)sx.stx_dev_major << 32 |
+			sx.stx_dev_minor;
+	return 0;
+}
+
+/* Is path (not followed) a mount point, i.e. on another mount than the
+ * directory it is in? */
+static int is_mount(const char *path)
+{
+	char par[PATH_MAX];
+	uint64_t a, b;
+	snprintf(par, sizeof par, "%s", path);
+	parent_of(par);
+	return mount_id(path, 0, &a) == 0 && mount_id(par, 1, &b) == 0 &&
+		a != b;
+}
+
+static int same_dir(const char *a, const char *b)
+{
+	struct stat x, y;
+	return !strcmp(a, b) || (stat(a, &x) == 0 && stat(b, &y) == 0 &&
+		x.st_dev == y.st_dev && x.st_ino == y.st_ino);
+}
+
+/* Is directory dir the same as p, or inside it (physically)? */
+static int inside(const char *dir, const char *p)
+{
+	char a[PATH_MAX], b[PATH_MAX];
+	if (!realpath(dir, a) || !realpath(p, b))
+		return 0;
+	size_t n = strlen(b);
+	return !strncmp(a, b, n) && (a[n] == 0 || a[n] == '/' || n == 1);
+}
+
+/* rename() that never replaces an existing `to`. */
+static int rename_new(const char *from, const char *to)
+{
+	struct stat st;
+	if (renameat2(AT_FDCWD, from, AT_FDCWD, to, RENAME_NOREPLACE) == 0)
+		return 0;
+	if (errno != EINVAL && errno != ENOSYS && errno != EOPNOTSUPP)
+		return -1;
+	/* No atomic no-replace on this file system (NFS, some FUSE). A
+	 * hard link never replaces anything; directories can't have one. */
+	if (lstat(from, &st) < 0)
+		return -1;
+	if (!S_ISDIR(st.st_mode)) {
+		if (link(from, to) == 0) {
+			if (unlink(from) == 0)
+				return 0;
+			int e = errno;
+			unlink(to);
+			errno = e;
+			return -1;
+		}
+		if (errno == EEXIST)
+			return -1;
+	}
+	if (lstat(to, &st) == 0) {
+		errno = EEXIST;
+		return -1;
+	}
+	return rename(from, to);
+}
+
+/* A name for `name` in dir that is not taken: the name itself, else
+ * "name (copy).ext", "name (copy 2).ext", ... for a copy and "name (2).ext",
+ * ... for a move; directories keep dots in the name. A name that gets too
+ * long is shortened before the suffix. */
+static int free_name(const char *dir, const char *name, int isdir, int move,
+	char *out)
+{
+	const char *dot = isdir ? NULL : strrchr(name, '.');
+	int len = strlen(name);
+	int stem = dot && dot != name && len - (dot - name) <= 32 ?
+		(int)(dot - name) : len;
+	char p[PATH_MAX], sfx[32];
+	struct stat st;
+	for (int k = 0; k < 10000; k++) {
+		if (k == 0)
+			sfx[0] = 0;
+		else if (move)
+			snprintf(sfx, sizeof sfx, " (%d)", k + 1);
+		else if (k == 1)
+			snprintf(sfx, sizeof sfx, " (copy)");
+		else
+			snprintf(sfx, sizeof sfx, " (copy %d)", k);
+		int room = NAME_MAX - (int)strlen(sfx) - (len - stem);
+		int s = u8_fit(name, stem, room);
+		snprintf(out, NAME_MAX + 1, "%.*s%s%s", s, name, sfx,
+			name + stem);
+		if (join(p, dir, out) < 0)
+			return -1;
+		if (lstat(p, &st) == 0)
+			continue;
+		if (errno != ENOENT)
+			return -1;
+		return 0;
+	}
+	errno = EEXIST;
+	return -1;
+}
+
+/* Rename `from` into dir under a free name for `name`. The name is picked
+ * right before the rename, which refuses to replace anything, and picked
+ * again if something took it in between. The final name goes to out. */
+static int place(const char *from, const char *dir, const char *name,
+	int isdir, int move, char *out)
+{
+	char to[PATH_MAX];
+	for (int tries = 0; tries < 100; tries++) {
+		if (free_name(dir, name, isdir, move, out) < 0 ||
+		    join(to, dir, out) < 0)
+			return -1;
+		if (rename_new(from, to) == 0)
+			return 0;
+		if (errno != EEXIST)
+			return -1;
+	}
+	errno = EEXIST;
+	return -1;
+}
+
 /* ---- trash (freedesktop.org Trash specification) ------------------------ */
 
 /* mkdir -p with mode 0700 for what is created. */
@@ -1054,24 +1203,8 @@ static int mkdirs(const char *path)
 	}
 }
 
-/* rename() that never replaces an existing `to`. */
-static int rename_new(const char *from, const char *to)
-{
-	if (renameat2(AT_FDCWD, from, AT_FDCWD, to, RENAME_NOREPLACE) == 0)
-		return 0;
-	if (errno != EINVAL && errno != ENOSYS)
-		return -1;
-	/* the file system cannot do it atomically */
-	struct stat st;
-	if (lstat(to, &st) == 0) {
-		errno = EEXIST;
-		return -1;
-	}
-	return rename(from, to);
-}
-
 /* $XDG_DATA_HOME/Trash, by default ~/.local/share/Trash. */
-static int home_trash(char *out)
+static int home_trash(char *out, int create)
 {
 	const char *d = getenv("XDG_DATA_HOME"), *h = getenv("HOME");
 	int n;
@@ -1085,34 +1218,33 @@ static int home_trash(char *out)
 		errno = n < 0 ? ENOENT : ENAMETOOLONG;
 		return -1;
 	}
-	return mkdirs(out);
+	return create ? mkdirs(out) : 0;
 }
 
-/* $topdir/.Trash-$uid on the file system of `path`, whose device is dev. */
-static int topdir_trash(const char *path, dev_t dev, char *out)
+/* Is the physical directory rp a trash or inside one? */
+static int in_trash(const char *rp)
 {
-	char p[PATH_MAX], up[PATH_MAX];
+	char t[PATH_MAX], rt[PATH_MAX], own[32];
+	if (home_trash(t, 0) == 0 && realpath(t, rt) && inside(rp, rt))
+		return 1;
+	snprintf(own, sizeof own, ".Trash-%u", (unsigned)getuid());
+	for (const char *s = rp; (s = strchr(s, '/'));) {
+		s++;
+		size_t n = strcspn(s, "/");
+		if ((n == 6 && !strncmp(s, ".Trash", 6)) ||
+		    (n == strlen(own) && !strncmp(s, own, n)))
+			return 1;
+	}
+	return 0;
+}
+
+/* A directory we may use as a trash: ours, not a link. */
+static int own_dir(const char *p)
+{
 	struct stat st;
-	snprintf(p, sizeof p, "%s", path);
-	parent_of(p);
-	if (!realpath(p, up))
+	if (mkdir(p, 0700) < 0 && errno != EEXIST)
 		return -1;
-	snprintf(p, sizeof p, "%s", up);
-	while (strcmp(p, "/")) {
-		snprintf(up, sizeof up, "%s", p);
-		parent_of(up);
-		if (stat(up, &st) < 0 || st.st_dev != dev)
-			break;
-		snprintf(p, sizeof p, "%s", up);
-	}
-	if (snprintf(out, PATH_MAX, "%s/.Trash-%u", strcmp(p, "/") ? p : "",
-	    (unsigned)getuid()) >= PATH_MAX - 32) {
-		errno = ENAMETOOLONG;
-		return -1;
-	}
-	if (mkdir(out, 0700) < 0 && errno != EEXIST)
-		return -1;
-	if (lstat(out, &st) < 0)
+	if (lstat(p, &st) < 0)
 		return -1;
 	if (!S_ISDIR(st.st_mode) || st.st_uid != getuid()) {
 		errno = EPERM;
@@ -1121,10 +1253,45 @@ static int topdir_trash(const char *path, dev_t dev, char *out)
 	return 0;
 }
 
-/* Move path into the trash directory t: info/NAME.trashinfo is created
- * first (exclusively, which reserves NAME), then the file goes to
- * files/NAME. */
-static int trash_into(const char *t, const char *path)
+/* The trash for files on mount `mnt` whose physical parent is rpar: the
+ * top directory of that mount goes to top, the trash to out. That is
+ * $topdir/.Trash/$uid if the administrator set up a shared .Trash (a real
+ * directory with the sticky bit), else $topdir/.Trash-$uid. */
+static int topdir_trash(const char *rpar, uint64_t mnt, char *top,
+	char *out)
+{
+	char up[PATH_MAX];
+	struct stat st;
+	uint64_t id;
+	snprintf(top, PATH_MAX, "%s", rpar);
+	while (strcmp(top, "/")) {
+		snprintf(up, sizeof up, "%s", top);
+		parent_of(up);
+		if (mount_id(up, 1, &id) < 0 || id != mnt)
+			break;
+		snprintf(top, PATH_MAX, "%s", up);
+	}
+	const char *tp = strcmp(top, "/") ? top : "";
+	unsigned uid = getuid();
+	if (strlen(tp) >= PATH_MAX - 32) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	snprintf(out, PATH_MAX, "%s/.Trash", tp);
+	if (lstat(out, &st) == 0 && S_ISDIR(st.st_mode) &&
+	    (st.st_mode & S_ISVTX)) {
+		snprintf(out, PATH_MAX, "%s/.Trash/%u", tp, uid);
+		if (own_dir(out) == 0)
+			return 0;
+	}
+	snprintf(out, PATH_MAX, "%s/.Trash-%u", tp, uid);
+	return own_dir(out);
+}
+
+/* Move path into the trash directory t, recording `orig` as the original
+ * path. info/NAME.trashinfo is created first (exclusively, which reserves
+ * NAME), then the file goes to files/NAME. */
+static int trash_into(const char *t, const char *path, const char *orig)
 {
 	static char url[3 * PATH_MAX + 1];
 	char files[PATH_MAX], info[PATH_MAX], fp[PATH_MAX], ip[PATH_MAX];
@@ -1132,12 +1299,11 @@ static int trash_into(const char *t, const char *path)
 	const char *base = strrchr(path, '/') + 1;
 	snprintf(files, sizeof files, "%s/files", t);
 	snprintf(info, sizeof info, "%s/info", t);
-	if ((mkdir(files, 0700) < 0 && errno != EEXIST) ||
-	    (mkdir(info, 0700) < 0 && errno != EEXIST))
+	if (own_dir(files) < 0 || own_dir(info) < 0)
 		return -1;
 
 	size_t o = 0;
-	for (const unsigned char *s = (const unsigned char *)path; *s; s++) {
+	for (const unsigned char *s = (const unsigned char *)orig; *s; s++) {
 		if ((*s < 0x80 && isalnum(*s)) || strchr("/-._~", *s))
 			url[o++] = *s;
 		else
@@ -1151,7 +1317,7 @@ static int trash_into(const char *t, const char *path)
 		snprintf(date, sizeof date, "1970-01-01T00:00:00");
 
 	/* room for ".trashinfo" and a ".NNN" counter */
-	int keep = MIN((int)strlen(base), NAME_MAX - 10 - 5);
+	int keep = u8_fit(base, strlen(base), NAME_MAX - 10 - 4);
 	for (int k = 1; k < 1000; k++) {
 		if (k == 1)
 			snprintf(name, sizeof name, "%.*s", keep, base);
@@ -1192,21 +1358,44 @@ static int trash_into(const char *t, const char *path)
 	return -1;
 }
 
-static int trash_one(const char *path)
+/* Trash one entry. On failure, why it failed goes to err. */
+static int trash_one(const char *path, char *err, size_t esz)
 {
-	char t[PATH_MAX];
-	struct stat st, ts;
-	if (lstat(path, &st) < 0)
+	char par[PATH_MAX], rpar[PATH_MAX], orig[PATH_MAX], t[PATH_MAX];
+	char top[PATH_MAX];
+	const char *base = strrchr(path, '/') + 1;
+	uint64_t mnt, tm;
+	snprintf(par, sizeof par, "%s", path);
+	parent_of(par);
+	if (!realpath(par, rpar) || mount_id(path, 0, &mnt) < 0)
+		goto fail;
+	if (in_trash(rpar)) {
+		snprintf(err, esz, "%s is already in the trash", base);
 		return -1;
-	if (home_trash(t) == 0 && stat(t, &ts) == 0 && ts.st_dev == st.st_dev) {
-		if (trash_into(t, path) == 0)
-			return 0;
-		if (errno != EXDEV)     /* e.g. a bind mount */
-			return -1;
 	}
-	if (topdir_trash(path, st.st_dev, t) < 0)
+	if (is_mount(path)) {
+		snprintf(err, esz, "%s is a mount point", base);
 		return -1;
-	return trash_into(t, path);
+	}
+	/* The physical path, which stays right when a link to it goes. */
+	if (join(orig, rpar, base) < 0)
+		goto fail;
+	if (home_trash(t, 1) == 0 && mount_id(t, 1, &tm) == 0 && tm == mnt) {
+		if (trash_into(t, path, orig) == 0)
+			return 0;
+		if (errno != EXDEV)
+			goto fail;
+	}
+	if (topdir_trash(rpar, mnt, top, t) < 0)
+		goto fail;
+	/* In a topdir trash the path is relative to the top, so it still
+	 * holds when the medium is mounted somewhere else. */
+	const char *rel = orig + (strcmp(top, "/") ? strlen(top) : 0) + 1;
+	if (trash_into(t, path, rel) == 0)
+		return 0;
+fail:
+	snprintf(err, esz, "%s: %s", base, strerror(errno));
+	return -1;
 }
 
 /* ---- copy, move, delete ------------------------------------------------- */
@@ -1266,47 +1455,110 @@ static int wait_prog(const char *prog, char *const argv[], char *msg,
 	return -1;
 }
 
-/* The child that does a job: cp -a, a rename (mv across file systems)
- * or rm -r for each item, one after the other. */
-static void worker(int op, int n, char **src, char **dst, int out)
+/* One failure line for mfm; a newline in a file name must not make two. */
+static void report(int out, const char *fmt, ...)
 {
-	static const char *const progs[] = { "cp", "mv", "rm" };
-	char prog[PATH_MAX], msg[1024];
+	char b[1200];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(b, sizeof b, fmt, ap);
+	va_end(ap);
+	for (char *s = b; *s; s++)
+		if (*s == '\n')
+			*s = '?';
+	dprintf(out, "%s\n", b);
+}
+
+/* Run cp, mv or rm (looked up once) with up to four arguments. */
+static int tool(int which, const char *a1, const char *a2, const char *a3,
+	const char *a4, char *msg, size_t msz)
+{
+	static const char *const names[] = { "cp", "mv", "rm" };
+	static char path[3][PATH_MAX];
+	static int err[3] = { -1, -1, -1 };
+	if (err[which] < 0)
+		err[which] = find_prog(names[which], path[which]);
+	if (err[which]) {
+		snprintf(msg, msz, "cannot run %s: %s", names[which],
+			strerror(err[which]));
+		return -1;
+	}
+	char *argv[] = { (char *)names[which], (char *)a1, (char *)a2,
+		(char *)a3, (char *)a4, NULL };
+	return wait_prog(path[which], argv, msg, msz);
+}
+
+/*
+ * The child that does a job, one item after the other. A move within a
+ * file system is a rename. A copy, or a move to another file system, goes
+ * to a hidden directory in the target first (cp -a / mv) and is renamed
+ * into place from there, so a partial copy never shows under the real name
+ * and the final name is picked only when it is used: nothing is ever
+ * overwritten, not even on a case-insensitive file system. Delete is
+ * rm -rf, which neither enters nor removes other mounts.
+ */
+static void worker(int op, const char *sdir, char **names, int n,
+	const char *ddir, int out)
+{
+	char src[PATH_MAX], tmp[PATH_MAX], t[PATH_MAX], msg[1024];
+	char final[NAME_MAX + 1];
+	setsid();               /* not killed with mfm's terminal */
 	signal(SIGCHLD, SIG_DFL);
 	signal(SIGPIPE, SIG_IGN);       /* mfm may quit; finish the job */
-	int e = find_prog(progs[op], prog);
 	for (int i = 0; i < n; i++) {
-		const char *base = strrchr(src[i], '/') + 1;
+		const char *nm = names[i];
+		struct stat st;
+		if (join(src, sdir, nm) < 0 || lstat(src, &st) < 0) {
+			report(out, "%s: %s", nm, strerror(errno));
+			continue;
+		}
+		int isdir = S_ISDIR(st.st_mode);
+		if (op == OP_DELETE) {
+			if (isdir && is_mount(src))
+				report(out, "%s is a mount point, not deleted",
+					nm);
+			else if (tool(2, "-rf", "--one-file-system", "--", src,
+			    msg, sizeof msg) < 0)
+				report(out, "%s", msg);
+			continue;
+		}
 		if (op == OP_MOVE) {
-			if (rename_new(src[i], dst[i]) == 0)
+			if (place(src, ddir, nm, isdir, 1, final) == 0)
 				continue;
-			/* EINVAL: into itself, which mv explains better */
-			if (errno != EXDEV && errno != EINVAL) {
-				dprintf(out, "%s: %s\n", base, strerror(errno));
+			/* EINVAL: into itself, which paste() rules out */
+			if (errno != EXDEV) {
+				report(out, "%s: %s", nm, strerror(errno));
 				continue;
 			}
 		}
-		if (e) {
-			dprintf(out, "cannot run %s: %s\n", progs[op],
-				strerror(e));
+		if (join(tmp, ddir, ".mfm-XXXXXX") < 0 || !mkdtemp(tmp) ||
+		    join(t, tmp, nm) < 0) {
+			report(out, "%s: %s", nm, strerror(errno));
 			continue;
 		}
-		char *argv[8];
-		int a = 0;
-		argv[a++] = (char *)progs[op];
-		if (op == OP_COPY)
-			argv[a++] = "-a";
-		if (op == OP_DELETE)
-			argv[a++] = "-rf";
-		else
-			argv[a++] = "-T";       /* dst is the name, never a dir */
-		argv[a++] = "--";
-		argv[a++] = src[i];
-		if (op != OP_DELETE)
-			argv[a++] = dst[i];
-		argv[a] = NULL;
-		if (wait_prog(prog, argv, msg, sizeof msg) < 0)
-			dprintf(out, "%s\n", msg);
+		int ok = op == OP_COPY ?
+			tool(0, "-a", "--", src, t, msg, sizeof msg) == 0 :
+			tool(1, "--", src, t, NULL, msg, sizeof msg) == 0;
+		/* A failed mv may have removed part of the source already:
+		 * whatever arrived is kept. A failed copy is cleaned up. */
+		if (op == OP_MOVE && !ok && lstat(t, &st) < 0) {
+			report(out, "%s", msg);
+			rmdir(tmp);
+			continue;
+		}
+		if (op == OP_COPY && !ok) {
+			report(out, "%s", msg);
+			tool(2, "-rf", "--", tmp, NULL, msg, sizeof msg);
+			continue;
+		}
+		if (place(t, ddir, nm, isdir, op == OP_MOVE, final) < 0) {
+			report(out, "%s: %s (left in %s)", nm, strerror(errno),
+				strrchr(tmp, '/') + 1);
+			continue;
+		}
+		rmdir(tmp);
+		if (!ok)
+			report(out, "%s (moved only partly)", msg);
 	}
 	_exit(0);
 }
@@ -1319,10 +1571,10 @@ static int busy(void)
 	return 1;
 }
 
-/* Start op on the absolute paths src (and dst). `first` is selected in
- * `dir` when it is done. */
-static void start_job(int op, int n, char **src, char **dst,
-	const char *dir, const char *first)
+/* Start op on the entries `names` of sdir, into ddir. `first` is selected
+ * in ddir when it is done. */
+static void start_job(int op, const char *sdir, char **names, int n,
+	const char *ddir, const char *first)
 {
 	int p[2];
 	if (pipe2(p, O_CLOEXEC) < 0) {
@@ -1337,8 +1589,13 @@ static void start_job(int op, int n, char **src, char **dst,
 		return;
 	}
 	if (pid == 0) {
-		close(p[0]);
-		worker(op, n, src, dst, p[1]);
+		/* Keep nothing of mfm but the pipe: holding on to the X
+		 * connection would keep the window up after mfm quits. */
+		if (p[1] != 3 && dup2(p[1], 3) < 0)
+			_exit(1);
+		fcntl(3, F_SETFD, FD_CLOEXEC);
+		close_range(4, ~0U, 0);
+		worker(op, sdir, names, n, ddir, 3);
 	}
 	close(p[1]);
 	fcntl(p[0], F_SETFL, O_NONBLOCK);
@@ -1347,9 +1604,30 @@ static void start_job(int op, int n, char **src, char **dst,
 	job.n = n;
 	job.fails = 0;
 	job.outlen = 0;
-	snprintf(job.dir, sizeof job.dir, "%s", dir);
+	job.clip_gen = clip_gen;
+	snprintf(job.dir, sizeof job.dir, "%s", ddir);
 	snprintf(job.first, sizeof job.first, "%s", first ? first : "");
 	set_status(0, "%s %d item%s ...", op_ing[op], n, n == 1 ? "" : "s");
+}
+
+static void select_name(const char *name)
+{
+	for (int i = 0; i < nents; i++)
+		if (!strcmp(ents[i].name, name)) {
+			sel = i;
+			show_sel();
+			dirty = 1;
+			return;
+		}
+}
+
+static void clip_clear(void)
+{
+	free_names(clip, nclip);
+	clip = NULL;
+	nclip = 0;
+	clip_gen++;
+	dirty = 1;
 }
 
 static void job_done(void)
@@ -1358,14 +1636,12 @@ static void job_done(void)
 	job.fd = -1;
 	job.out[job.outlen] = 0;
 	job.out[strcspn(job.out, "\n")] = 0;
-	if (reload() == 0 && job.first[0] && !strcmp(cwd, job.dir)) {
-		for (int i = 0; i < nents; i++)
-			if (!strcmp(ents[i].name, job.first)) {
-				sel = i;
-				show_sel();
-				break;
-			}
-	}
+	/* A move that worked used up the clipboard, unless it was replaced
+	 * in the meantime. */
+	if (job.op == OP_MOVE && !job.fails && job.clip_gen == clip_gen)
+		clip_clear();
+	if (reload() == 0 && job.first[0] && !strcmp(cwd, job.dir))
+		select_name(job.first);
 	int ok = job.n - job.fails;
 	if (job.fails)
 		set_status(1, "%d of %d failed: %s", job.fails, job.n, job.out);
@@ -1397,71 +1673,19 @@ static void job_poll(void)
 	}
 }
 
-static int same_dir(const char *a, const char *b)
-{
-	struct stat x, y;
-	return !strcmp(a, b) || (stat(a, &x) == 0 && stat(b, &y) == 0 &&
-		x.st_dev == y.st_dev && x.st_ino == y.st_ino);
-}
-
-/* Is directory dir the same as p, or inside it (physically)? */
-static int inside(const char *dir, const char *p)
-{
-	char a[PATH_MAX], b[PATH_MAX];
-	if (!realpath(dir, a) || !realpath(p, b))
-		return 0;
-	size_t n = strlen(b);
-	return !strncmp(a, b, n) && (a[n] == 0 || a[n] == '/' || n == 1);
-}
-
-/* A name for `name` in dir that is not taken, on disk or by the first
- * ntaken paths of `taken`: the name itself, else "name (copy).ext",
- * "name (copy 2).ext", ... (directories keep dots in the name). */
-static int free_name(const char *dir, const char *name, int isdir,
-	char **taken, int ntaken, char *out)
-{
-	const char *dot = isdir ? NULL : strrchr(name, '.');
-	int stem = dot && dot != name ? (int)(dot - name) : (int)strlen(name);
-	char p[PATH_MAX], sfx[32];
-	struct stat st;
-	for (int k = 0; k < 10000; k++) {
-		if (k == 0)
-			sfx[0] = 0;
-		else if (k == 1)
-			snprintf(sfx, sizeof sfx, " (copy)");
-		else
-			snprintf(sfx, sizeof sfx, " (copy %d)", k);
-		if (snprintf(out, NAME_MAX + 1, "%.*s%s%s", stem, name, sfx,
-		    name + stem) > NAME_MAX || join(p, dir, out) < 0) {
-			errno = ENAMETOOLONG;
-			return -1;
-		}
-		if (lstat(p, &st) == 0)
-			continue;
-		if (errno != ENOENT)
-			return -1;
-		int used = 0;
-		for (int j = 0; j < ntaken && !used; j++)
-			used = !strcmp(taken[j], p);
-		if (!used)
-			return 0;
-	}
-	errno = EEXIST;
-	return -1;
-}
-
-/* Ctrl+C / Ctrl+X */
+/* Ctrl+C / Ctrl+X. The marks have done their job then. */
 static void clip_set(int move)
 {
 	int n;
 	char **v = targets(&n);
 	if (!v)
 		return;
-	free_names(clip, nclip);
+	clip_clear();
 	clip = v;
 	nclip = n;
 	clip_move = move;
 	snprintf(clip_dir, sizeof clip_dir, "%s", cwd);
+	unmark_all();
 	if (n == 1)
 		set_status(0, "%s \"%s\": Ctrl+V in the target directory",
 			move ? "move" : "copy", clip[0]);
@@ -1470,11 +1694,10 @@ static void clip_set(int move)
 			move ? "move" : "copy", n);
 }
 
-/* Ctrl+V: copy or move the clipboard into cwd. Nothing is overwritten;
- * a name that is taken gets " (copy)". */
+/* Ctrl+V: copy or move the clipboard into cwd. */
 static void paste(void)
 {
-	char p[PATH_MAX], nm[NAME_MAX + 1];
+	char p[PATH_MAX];
 	if (!nclip) {
 		set_status(1, "nothing to paste: mark with Space, then "
 			"Ctrl+C or Ctrl+X");
@@ -1486,55 +1709,28 @@ static void paste(void)
 		set_status(1, "already in this directory");
 		return;
 	}
-	int cnt = nclip, n = 0;
-	char **src = calloc(cnt, sizeof *src);
-	char **dst = calloc(cnt, sizeof *dst);
-	char first[NAME_MAX + 1] = "";
-	for (int i = 0; src && dst && i < cnt; i++) {
+	for (int i = 0; i < nclip; i++) {
 		struct stat st;
-		if (join(p, clip_dir, clip[i]) < 0 ||
-		    !(src[n] = strdup(p))) {
+		if (join(p, clip_dir, clip[i]) < 0) {
 			set_status(1, "%s: %s", clip[i], strerror(errno));
-			goto out;
+			return;
 		}
-		int isdir = stat(p, &st) == 0 && S_ISDIR(st.st_mode);
 		/* cp would fail, but only after copying one level */
 		if (lstat(p, &st) == 0 && S_ISDIR(st.st_mode) &&
 		    inside(cwd, p)) {
 			set_status(1, "%s: cannot %s a directory into itself",
 				clip[i], clip_move ? "move" : "copy");
-			goto out;
+			return;
 		}
-		if (free_name(cwd, clip[i], isdir, dst, n, nm) < 0 ||
-		    join(p, cwd, nm) < 0 || !(dst[n] = strdup(p))) {
-			set_status(1, "%s: %s", clip[i], strerror(errno));
-			free(src[n]);
-			src[n] = NULL;
-			goto out;
-		}
-		if (!n)
-			snprintf(first, sizeof first, "%s", nm);
-		n++;
 	}
-	if (!src || !dst) {
-		set_status(1, "%s", strerror(ENOMEM));
-		goto out;
-	}
-	start_job(clip_move ? OP_MOVE : OP_COPY, n, src, dst, cwd, first);
-	if (clip_move && job.fd >= 0) {
-		free_names(clip, nclip);        /* the sources are gone */
-		clip = NULL;
-		nclip = 0;
-	}
-out:
-	free_names(src, cnt);
-	free_names(dst, cnt);
+	start_job(clip_move ? OP_MOVE : OP_COPY, clip_dir, clip, nclip, cwd,
+		clip[0]);
 }
 
 /* Delete: into the trash, at once. */
 static void trash(void)
 {
-	char p[PATH_MAX], err[sizeof status_msg] = "";
+	char p[PATH_MAX], err[sizeof status_msg] = "", e[sizeof status_msg];
 	int n, ok = 0;
 	if (busy())
 		return;
@@ -1542,13 +1738,14 @@ static void trash(void)
 	if (!v)
 		return;
 	for (int i = 0; i < n; i++) {
-		if (join(p, cwd, v[i]) < 0 || trash_one(p) < 0) {
-			if (!err[0])
-				snprintf(err, sizeof err, "%s: %s", v[i],
-					strerror(errno));
-		} else {
+		if (join(p, cwd, v[i]) < 0)
+			snprintf(e, sizeof e, "%s: %s", v[i], strerror(errno));
+		else if (trash_one(p, e, sizeof e) == 0) {
 			ok++;
+			continue;
 		}
+		if (!err[0])
+			snprintf(err, sizeof err, "%s", e);
 	}
 	free_names(v, n);
 	reload();
@@ -1560,7 +1757,8 @@ static void trash(void)
 			n == 1 ? "" : "s");
 }
 
-/* Shift+Delete: ask first. */
+/* Shift+Delete: ask first. The question is drawn from pend, so no other
+ * message can hide it. */
 static void ask_delete(void)
 {
 	int n;
@@ -1573,30 +1771,19 @@ static void ask_delete(void)
 	pend = v;
 	npend = n;
 	snprintf(pend_dir, sizeof pend_dir, "%s", cwd);
-	if (n == 1)
-		set_status(1, "delete \"%s\" permanently? (y/n)", pend[0]);
-	else
-		set_status(1, "delete %d items permanently? (y/n)", n);
+	dirty = 1;
 }
 
 static void answer_delete(int yes)
 {
-	char p[PATH_MAX];
-	char **src = yes ? calloc(npend, sizeof *src) : NULL;
-	int n = 0;
-	for (int i = 0; src && i < npend; i++)
-		if (join(p, pend_dir, pend[i]) == 0 && (src[n] = strdup(p)))
-			n++;
-	if (!yes)
-		set_status(0, "nothing deleted");
-	else if (!src || n < npend)
-		set_status(1, "nothing deleted: %s", strerror(ENOMEM));
+	if (yes)
+		start_job(OP_DELETE, pend_dir, pend, npend, pend_dir, NULL);
 	else
-		start_job(OP_DELETE, n, src, NULL, pend_dir, NULL);
-	free_names(src, n);
+		set_status(0, "nothing deleted");
 	free_names(pend, npend);
 	pend = NULL;
 	npend = 0;
+	dirty = 1;
 }
 
 /* ---- navigation --------------------------------------------------------- */
@@ -1858,6 +2045,8 @@ static int line_key(char *b, size_t sz, size_t *cur, int *fresh, int sel,
 		    txt[0] == 0x7f)
 			return 0;
 		if (cut) {
+			if (len - c + n >= sz)
+				return 0;       /* would not fit: keep all */
 			memmove(b, b + c, len - c + 1);
 			len -= c;
 			c = 0;
@@ -1865,14 +2054,18 @@ static int line_key(char *b, size_t sz, size_t *cur, int *fresh, int sel,
 			b[0] = 0;
 			len = c = 0;
 		}
-		if (len + n < sz) {
-			memmove(b + c + n, b + c, len - c + 1);
-			memcpy(b + c, txt, n);
-			c += n;
-		}
+		if (len + n >= sz)
+			return 0;
+		memmove(b + c + n, b + c, len - c + 1);
+		memcpy(b + c, txt, n);
+		c += n;
 	}
+	/* Deleting can join stray bytes into one character; keep the
+	 * cursor on a character boundary. */
+	for (p = b; (size_t)(p - b) < c;)
+		u8_next(&p);
 	*fresh = 0;
-	*cur = c;
+	*cur = p - b;
 	dirty = 1;
 	return 0;
 }
@@ -1925,19 +2118,25 @@ static void edit_key(KeySym ks, const char *txt, int n, int ctrl)
 
 /* ---- rename, new folder ------------------------------------------------- */
 
-static void select_name(const char *name)
+/* Is there an entry named exactly `name` in dir? (lstat can't tell on a
+ * case-insensitive file system.) */
+static int listed(const char *dir, const char *name)
 {
-	for (int i = 0; i < nents; i++)
-		if (!strcmp(ents[i].name, name)) {
-			sel = i;
-			show_sel();
-			dirty = 1;
-			return;
-		}
+	DIR *d = opendir(dir);
+	struct dirent *de;
+	int found = 0;
+	if (!d)
+		return 0;
+	while (!found && (de = readdir(d)))
+		found = !strcmp(de->d_name, name);
+	closedir(d);
+	return found;
 }
 
 static void prompt_begin(int kind)
 {
+	if (busy())             /* the job may be working on that entry */
+		return;
 	if (kind == PR_RENAME) {
 		if (sel < 0 || sel >= nents || ents[sel].up) {
 			set_status(1, "nothing selected");
@@ -1955,6 +2154,7 @@ static void prompt_begin(int kind)
 		pfresh = 0;
 	}
 	prompt = kind;
+	snprintf(pdir, sizeof pdir, "%s", cwd);
 	search[0] = 0;
 	clear_status();
 	dirty = 1;
@@ -1968,6 +2168,11 @@ static void prompt_commit(void)
 	dirty = 1;
 	if (!pbuf[0] || (kind == PR_RENAME && !strcmp(pbuf, pold)))
 		return;
+	if (strcmp(pdir, cwd)) {        /* the directory went away meanwhile */
+		set_status(1, "%s is gone, nothing %s", pdir,
+			kind == PR_RENAME ? "renamed" : "created");
+		return;
+	}
 	if (strchr(pbuf, '/') || !strcmp(pbuf, ".") || !strcmp(pbuf, "..")) {
 		set_status(1, "not a valid name: %s", pbuf);
 		return;
@@ -1991,12 +2196,18 @@ static void prompt_commit(void)
 	int r;
 	if (join(p, cwd, pold) < 0) {
 		r = -1;
-	} else if (!strcasecmp(pold, pbuf) && lstat(p, &a) == 0 &&
-		   lstat(q, &b) == 0 && a.st_dev == b.st_dev &&
-		   a.st_ino == b.st_ino) {
-		/* only the case changes, on a file system that ignores it:
-		 * the "existing" target is the file itself */
+	} else if (lstat(p, &a) == 0 && lstat(q, &b) == 0 &&
+		   a.st_dev == b.st_dev && a.st_ino == b.st_ino) {
+		/* The "existing" target is the file itself: only the case
+		 * changes on a file system that ignores it (the old name is
+		 * gone from the listing afterwards), or both names are hard
+		 * links to one file, and rename() leaves both alone. */
 		r = rename(p, q);
+		if (r == 0 && listed(cwd, pold)) {
+			set_status(1, "%s and %s are the same file", pold,
+				pbuf);
+			return;
+		}
 	} else {
 		r = rename_new(p, q);
 	}
@@ -2126,7 +2337,9 @@ static void draw_input(struct rect r, const char *b, size_t cur,
 	snprintf(pre, sizeof pre, "%.*s", (int)cur, b);
 	int dc = strlen(disp(pre));
 	const char *d = disp(b);
-	int n = strlen(d), ew = textw("...", 3), maxw = r.w - 2;
+	int n = strlen(d);
+	dc = MIN(dc, n);
+	int ew = textw("...", 3), maxw = r.w - 2;
 	int x = r.x, start = 0, end = n;
 	if (maxw <= 2 * ew)
 		return;
@@ -2300,7 +2513,8 @@ static void draw(void)
 		XCopyArea(dpy, buf, win, gc, 0, 0, W, H, 0, 0);
 		return;
 	}
-	if (!status_msg[0] && !search[0] && sel < nents && !ents[sel].up) {
+	if (!pend && !status_msg[0] && !search[0] && sel < nents &&
+	    !ents[sel].up) {
 		char p[11], sz[32];
 		perms(&ents[sel], p);
 		if (ents[sel].dir || ents[sel].nostat)
@@ -2315,7 +2529,15 @@ static void draw(void)
 		rw += 16;
 	}
 	XftColor *sc = &xc_fg;
-	if (status_msg[0]) {
+	if (pend) {
+		if (npend == 1)
+			snprintf(s, sizeof s, "delete \"%s\" permanently? "
+				"(y/n)", pend[0]);
+		else
+			snprintf(s, sizeof s, "delete %d items permanently? "
+				"(y/n)", npend);
+		sc = &xc_err;
+	} else if (status_msg[0]) {
 		snprintf(s, sizeof s, "%s", status_msg);
 		if (status_err)
 			sc = &xc_err;
@@ -2604,6 +2826,7 @@ static void key(KeySym ks, const char *txt, int n, unsigned state)
 	/* A type-ahead that timed out is over: Backspace means "parent". */
 	if (search[0] && now_ms() - search_ms >= TYPEAHEAD_MS)
 		search[0] = 0;
+	int had_msg = status_msg[0] != 0;
 	clear_status();
 	if (ctrl) {
 		switch (ks) {
@@ -2660,10 +2883,10 @@ static void key(KeySym ks, const char *txt, int n, unsigned state)
 			go_parent();
 		}
 		return;
-	case XK_Escape:
+	case XK_Escape:         /* one thing at a time */
 		if (search[0])
 			search[0] = 0;
-		else
+		else if (!had_msg)
 			unmark_all();
 		dirty = 1;
 		return;
@@ -2772,7 +2995,13 @@ static void on_button(XButtonEvent *ev)
 			sel = i;
 			last_idx = -1;
 		/* A double click needs both clicks on the same, still
-		 * selected row of the same listing. */
+		 * selected row of the same listing. A plain click drops the
+		 * marks, so a Delete after it hits what was clicked. */
+		} else if (nmarked()) {
+			unmark_all();
+			sel = i;
+			last_idx = i;
+			last_click = ev->time;
 		} else if (i == last_idx && i == sel &&
 		    ev->time - last_click < DCLICK_MS) {
 			last_idx = -1;
