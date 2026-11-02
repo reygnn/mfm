@@ -2133,6 +2133,33 @@ static int listed(const char *dir, const char *name)
 	return found;
 }
 
+/* Rename p to q in cwd by way of a temporary name. */
+static int rename_via_tmp(const char *p, const char *q)
+{
+	char t[PATH_MAX], nm[64];
+	int k;
+	for (k = 0; k < 100; k++) {
+		snprintf(nm, sizeof nm, ".mfm-rename-%d-%d", (int)getpid(), k);
+		if (join(t, cwd, nm) < 0)
+			return -1;
+		if (rename_new(p, t) == 0)
+			break;
+		if (errno != EEXIST)
+			return -1;
+	}
+	if (k == 100) {
+		errno = EEXIST;
+		return -1;
+	}
+	if (rename_new(t, q) == 0)
+		return 0;
+	int e = errno;
+	if (rename(t, p) < 0)   /* put it back; failing that, say where */
+		set_status(1, "%s is now %s", strrchr(p, '/') + 1, nm);
+	errno = e;
+	return -1;
+}
+
 static void prompt_begin(int kind)
 {
 	if (busy())             /* the job may be working on that entry */
@@ -2198,16 +2225,17 @@ static void prompt_commit(void)
 		r = -1;
 	} else if (lstat(p, &a) == 0 && lstat(q, &b) == 0 &&
 		   a.st_dev == b.st_dev && a.st_ino == b.st_ino) {
-		/* The "existing" target is the file itself: only the case
-		 * changes on a file system that ignores it (the old name is
-		 * gone from the listing afterwards), or both names are hard
-		 * links to one file, and rename() leaves both alone. */
-		r = rename(p, q);
-		if (r == 0 && listed(cwd, pold)) {
+		/* The "existing" target is the file itself. Either both
+		 * names are hard links to one file, or only the case changes
+		 * on a file system that ignores case (FAT). rename() does
+		 * nothing in both cases, so the case change goes through a
+		 * temporary name. */
+		if (listed(cwd, pbuf)) {
 			set_status(1, "%s and %s are the same file", pold,
 				pbuf);
 			return;
 		}
+		r = rename_via_tmp(p, q);
 	} else {
 		r = rename_new(p, q);
 	}
