@@ -11,9 +11,16 @@
  *         typing                      jump to name (type-ahead)
  *         Ctrl+L  edit path   Ctrl+H  hidden files   Ctrl+R / F5  reload
  *         Ctrl+T  terminal here   Ctrl+Q / Ctrl+W / Alt+F4  quit
- *         Esc  clear search and message
+ *         Esc  clear search and message, else the marks
+ *         Space / Insert  mark   Ctrl+A  mark all   Ctrl+C / Ctrl+X  copy /
+ *         cut   Ctrl+V  paste   Delete  to the trash   Shift+Delete  delete
  * Mouse:  click select, double-click open, wheel scroll, scrollbar drag,
+ *         Ctrl+click mark, Shift+click mark a range,
  *         up-arrow button or back button (btn 8) for the parent directory.
+ *
+ * Copy, move and permanent delete run cp -a, mv and rm -r in a child
+ * process, one item after the other; nothing is overwritten, a taken name
+ * gets " (copy)". The trash follows the freedesktop.org specification.
  *
  * Paths are kept logical, as the shell's `cd` does: after entering a
  * symlinked directory, ".." leads back to where the link is.
@@ -44,6 +51,7 @@
 #include <string.h>
 #include <sys/select.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <wctype.h>
@@ -64,6 +72,7 @@ struct ent {
 	time_t mtime;
 	int dir, link, up;
 	int nostat;     /* stat failed: only the name and d_type are known */
+	int mark;       /* marked for copy, move or delete */
 };
 
 struct rect { int x, y, w, h; };
@@ -90,6 +99,27 @@ static Time last_click;
 static int last_idx = -1;
 static int dirty = 1;
 
+/* Ctrl+C / Ctrl+X: names in clip_dir to copy or move on Ctrl+V */
+static char clip_dir[PATH_MAX];
+static char **clip;
+static int nclip, clip_move;
+/* Shift+Delete waits for y/n; the names are taken when it is pressed */
+static char pend_dir[PATH_MAX];
+static char **pend;
+static int npend;
+
+/* The running copy, move or delete. A child process does the work and
+ * writes one line per failed item to fd; EOF means it is done. */
+enum { OP_COPY, OP_MOVE, OP_DELETE };
+static const char *const op_ing[] = { "copying", "moving", "deleting" };
+static const char *const op_ed[] = { "copied", "moved", "deleted" };
+static struct {
+	int fd, op, n, fails;
+	char dir[PATH_MAX], first[NAME_MAX + 1];
+	char out[512];
+	size_t outlen;
+} job = { .fd = -1 };
+
 /* ---- X ------------------------------------------------------------------ */
 
 static const long EVENT_MASK = ExposureMask | KeyPressMask | ButtonPressMask |
@@ -112,7 +142,7 @@ static int W = 680, H = 480;
 static Atom a_protocols, a_delete, a_ping, a_name, a_icon_name, a_utf8,
 	a_icon, a_pid;
 static unsigned long px_bg, px_top, px_bot, px_list, px_sel, px_trough,
-	px_fg, px_folder, px_paper;
+	px_fg, px_folder, px_paper, px_mark;
 static XftColor xc_fg, xc_sel, xc_dim, xc_err;
 static int rowh, barh;
 static struct rect r_up, r_path, r_list, r_sb, r_status;
@@ -361,6 +391,7 @@ static void theme_init(void)
 	px_list = pixel(mix(bg, 0xffffff, 0.3f));
 	px_trough = pixel(mix(bg, 0x000000, 0.12f));
 	px_sel = pixel(act);
+	px_mark = pixel(mix(mix(bg, 0xffffff, 0.3f), act, 0.4f));
 	px_fg = pixel(fg);
 	px_folder = pixel(0xc9a85c);
 	px_paper = pixel(0xf6f6f6);
@@ -566,6 +597,33 @@ static void show_sel(void)
 	clamp_top();
 }
 
+static int name_cmp(const void *a, const void *b)
+{
+	return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+/* Carry the marks of the current listing over to v, by name. */
+static void keep_marks(struct ent *v, int n)
+{
+	int k = 0;
+	for (int i = 0; i < nents; i++)
+		k += ents[i].mark;
+	if (!k)
+		return;
+	char **m = malloc(k * sizeof *m);
+	if (!m)
+		return;         /* the marks are lost, nothing worse */
+	k = 0;
+	for (int i = 0; i < nents; i++)
+		if (ents[i].mark)
+			m[k++] = ents[i].name;
+	qsort(m, k, sizeof *m, name_cmp);
+	for (int i = 0; i < n; i++)
+		v[i].mark = !v[i].up &&
+			bsearch(&v[i].name, m, k, sizeof *m, name_cmp);
+	free(m);
+}
+
 /*
  * Read `path` (absolute, normalized). Selects `select` if present, else
  * the entry at index `fallback`. Keeps the old listing on failure and
@@ -642,6 +700,8 @@ static int load(const char *path, const char *select, int fallback)
 
 	cwd_mtime = mt;
 	cwd_unsure = unsure;
+	if (!strcmp(path, cwd))
+		keep_marks(v, n);
 	free_ents(ents, nents);
 	ents = v;
 	nents = n;
@@ -889,6 +949,646 @@ static void open_terminal(void)
 	else if (e)
 		set_status(1, "cannot run %s: %s (set MFM_TERMINAL)", name,
 			strerror(e));
+}
+
+/* ---- marks -------------------------------------------------------------- */
+
+static int nmarked(void)
+{
+	int k = 0;
+	for (int i = 0; i < nents; i++)
+		k += ents[i].mark;
+	return k;
+}
+
+static void toggle_mark(int i)
+{
+	if (i >= 0 && i < nents && !ents[i].up) {
+		ents[i].mark = !ents[i].mark;
+		dirty = 1;
+	}
+}
+
+/* Ctrl+A: mark everything, or unmark everything if all is marked. */
+static void mark_all(void)
+{
+	int all = 1;
+	for (int i = 0; i < nents; i++)
+		if (!ents[i].up && !ents[i].mark)
+			all = 0;
+	for (int i = 0; i < nents; i++)
+		ents[i].mark = !all && !ents[i].up;
+	dirty = 1;
+}
+
+static void unmark_all(void)
+{
+	for (int i = 0; i < nents; i++)
+		ents[i].mark = 0;
+	dirty = 1;
+}
+
+static void free_names(char **v, int n)
+{
+	for (int i = 0; v && i < n; i++)
+		free(v[i]);
+	free(v);
+}
+
+/* The names an operation works on: the marked entries, else the selected
+ * one. NULL (with a message) if there are none. */
+static char **targets(int *n)
+{
+	int k = nmarked(), use_sel = !k;
+	*n = 0;
+	if (use_sel) {
+		if (sel < 0 || sel >= nents || ents[sel].up) {
+			set_status(1, "nothing selected");
+			return NULL;
+		}
+		k = 1;
+	}
+	char **v = calloc(k, sizeof *v);
+	int j = 0;
+	for (int i = 0; v && i < nents && j < k; i++) {
+		if (use_sel ? i != sel : !ents[i].mark)
+			continue;
+		if (!(v[j++] = strdup(ents[i].name))) {
+			free_names(v, k);
+			v = NULL;
+		}
+	}
+	if (!v) {
+		set_status(1, "%s", strerror(ENOMEM));
+		return NULL;
+	}
+	*n = k;
+	return v;
+}
+
+/* ---- trash (freedesktop.org Trash specification) ------------------------ */
+
+/* mkdir -p with mode 0700 for what is created. */
+static int mkdirs(const char *path)
+{
+	char p[PATH_MAX];
+	snprintf(p, sizeof p, "%s", path);
+	for (char *s = p + 1;; s++) {
+		if (*s && *s != '/')
+			continue;
+		char c = *s;
+		*s = 0;
+		if (mkdir(p, 0700) < 0 && errno != EEXIST)
+			return -1;
+		*s = c;
+		if (!c)
+			return 0;
+	}
+}
+
+/* rename() that never replaces an existing `to`. */
+static int rename_new(const char *from, const char *to)
+{
+	if (renameat2(AT_FDCWD, from, AT_FDCWD, to, RENAME_NOREPLACE) == 0)
+		return 0;
+	if (errno != EINVAL && errno != ENOSYS)
+		return -1;
+	/* the file system cannot do it atomically */
+	struct stat st;
+	if (lstat(to, &st) == 0) {
+		errno = EEXIST;
+		return -1;
+	}
+	return rename(from, to);
+}
+
+/* $XDG_DATA_HOME/Trash, by default ~/.local/share/Trash. */
+static int home_trash(char *out)
+{
+	const char *d = getenv("XDG_DATA_HOME"), *h = getenv("HOME");
+	int n;
+	if (d && d[0] == '/')
+		n = snprintf(out, PATH_MAX, "%s/Trash", d);
+	else if (h && *h)
+		n = snprintf(out, PATH_MAX, "%s/.local/share/Trash", h);
+	else
+		n = -1;
+	if (n < 0 || n >= PATH_MAX - 32) {
+		errno = n < 0 ? ENOENT : ENAMETOOLONG;
+		return -1;
+	}
+	return mkdirs(out);
+}
+
+/* $topdir/.Trash-$uid on the file system of `path`, whose device is dev. */
+static int topdir_trash(const char *path, dev_t dev, char *out)
+{
+	char p[PATH_MAX], up[PATH_MAX];
+	struct stat st;
+	snprintf(p, sizeof p, "%s", path);
+	parent_of(p);
+	if (!realpath(p, up))
+		return -1;
+	snprintf(p, sizeof p, "%s", up);
+	while (strcmp(p, "/")) {
+		snprintf(up, sizeof up, "%s", p);
+		parent_of(up);
+		if (stat(up, &st) < 0 || st.st_dev != dev)
+			break;
+		snprintf(p, sizeof p, "%s", up);
+	}
+	if (snprintf(out, PATH_MAX, "%s/.Trash-%u", strcmp(p, "/") ? p : "",
+	    (unsigned)getuid()) >= PATH_MAX - 32) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	if (mkdir(out, 0700) < 0 && errno != EEXIST)
+		return -1;
+	if (lstat(out, &st) < 0)
+		return -1;
+	if (!S_ISDIR(st.st_mode) || st.st_uid != getuid()) {
+		errno = EPERM;
+		return -1;
+	}
+	return 0;
+}
+
+/* Move path into the trash directory t: info/NAME.trashinfo is created
+ * first (exclusively, which reserves NAME), then the file goes to
+ * files/NAME. */
+static int trash_into(const char *t, const char *path)
+{
+	static char url[3 * PATH_MAX + 1];
+	char files[PATH_MAX], info[PATH_MAX], fp[PATH_MAX], ip[PATH_MAX];
+	char name[NAME_MAX + 1], date[32];
+	const char *base = strrchr(path, '/') + 1;
+	snprintf(files, sizeof files, "%s/files", t);
+	snprintf(info, sizeof info, "%s/info", t);
+	if ((mkdir(files, 0700) < 0 && errno != EEXIST) ||
+	    (mkdir(info, 0700) < 0 && errno != EEXIST))
+		return -1;
+
+	size_t o = 0;
+	for (const unsigned char *s = (const unsigned char *)path; *s; s++) {
+		if ((*s < 0x80 && isalnum(*s)) || strchr("/-._~", *s))
+			url[o++] = *s;
+		else
+			o += sprintf(url + o, "%%%02X", *s);
+	}
+	url[o] = 0;
+	time_t now = time(NULL);
+	struct tm tm;
+	if (!localtime_r(&now, &tm) ||
+	    !strftime(date, sizeof date, "%Y-%m-%dT%H:%M:%S", &tm))
+		snprintf(date, sizeof date, "1970-01-01T00:00:00");
+
+	/* room for ".trashinfo" and a ".NNN" counter */
+	int keep = MIN((int)strlen(base), NAME_MAX - 10 - 5);
+	for (int k = 1; k < 1000; k++) {
+		if (k == 1)
+			snprintf(name, sizeof name, "%.*s", keep, base);
+		else
+			snprintf(name, sizeof name, "%.*s.%d", keep, base, k);
+		struct stat st;
+		if (join(fp, files, name) < 0 ||
+		    snprintf(ip, sizeof ip, "%s/%s.trashinfo", info, name) >=
+		    (int)sizeof ip) {
+			errno = ENAMETOOLONG;
+			return -1;
+		}
+		int fd = open(ip, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+		if (fd < 0) {
+			if (errno == EEXIST)
+				continue;
+			return -1;
+		}
+		if (lstat(fp, &st) == 0) {      /* left over: try another name */
+			close(fd);
+			unlink(ip);
+			continue;
+		}
+		FILE *f = fdopen(fd, "w");
+		int bad = !f || fprintf(f, "[Trash Info]\nPath=%s\n"
+			"DeletionDate=%s\n", url, date) < 0;
+		if (f ? fclose(f) != 0 : close(fd) != 0)
+			bad = 1;
+		if (bad || rename_new(path, fp) < 0) {
+			int e = bad ? EIO : errno;
+			unlink(ip);
+			errno = e;
+			return -1;
+		}
+		return 0;
+	}
+	errno = EEXIST;
+	return -1;
+}
+
+static int trash_one(const char *path)
+{
+	char t[PATH_MAX];
+	struct stat st, ts;
+	if (lstat(path, &st) < 0)
+		return -1;
+	if (home_trash(t) == 0 && stat(t, &ts) == 0 && ts.st_dev == st.st_dev) {
+		if (trash_into(t, path) == 0)
+			return 0;
+		if (errno != EXDEV)     /* e.g. a bind mount */
+			return -1;
+	}
+	if (topdir_trash(path, st.st_dev, t) < 0)
+		return -1;
+	return trash_into(t, path);
+}
+
+/* ---- copy, move, delete ------------------------------------------------- */
+
+/* Run prog and wait for it, with stderr captured. 0 on success, else -1
+ * and the first line of its error output (or a substitute) in msg. */
+static int wait_prog(const char *prog, char *const argv[], char *msg,
+	size_t msz)
+{
+	int p[2], st = 0;
+	char buf[1024];
+	size_t len = 0;
+	if (pipe2(p, O_CLOEXEC) < 0) {
+		snprintf(msg, msz, "%s: %s", argv[0], strerror(errno));
+		return -1;
+	}
+	pid_t pid = fork();
+	if (pid < 0) {
+		snprintf(msg, msz, "%s: %s", argv[0], strerror(errno));
+		close(p[0]);
+		close(p[1]);
+		return -1;
+	}
+	if (pid == 0) {
+		int nul = open("/dev/null", O_RDONLY);
+		if (nul >= 0)
+			dup2(nul, 0);
+		dup2(p[1], 2);
+		execv(prog, argv);
+		dprintf(2, "cannot run %s: %s\n", argv[0], strerror(errno));
+		_exit(127);
+	}
+	close(p[1]);
+	for (;;) {
+		char junk[512];
+		ssize_t r = len < sizeof buf - 1 ?
+			read(p[0], buf + len, sizeof buf - 1 - len) :
+			read(p[0], junk, sizeof junk);
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r <= 0)
+			break;
+		if (len < sizeof buf - 1)
+			len += r;
+	}
+	close(p[0]);
+	while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+		;
+	if (WIFEXITED(st) && WEXITSTATUS(st) == 0)
+		return 0;
+	buf[len] = 0;
+	buf[strcspn(buf, "\n")] = 0;
+	if (buf[0])
+		snprintf(msg, msz, "%s", buf);
+	else
+		snprintf(msg, msz, "%s failed", argv[0]);
+	return -1;
+}
+
+/* The child that does a job: cp -a, a rename (mv across file systems)
+ * or rm -r for each item, one after the other. */
+static void worker(int op, int n, char **src, char **dst, int out)
+{
+	static const char *const progs[] = { "cp", "mv", "rm" };
+	char prog[PATH_MAX], msg[1024];
+	signal(SIGCHLD, SIG_DFL);
+	signal(SIGPIPE, SIG_IGN);       /* mfm may quit; finish the job */
+	int e = find_prog(progs[op], prog);
+	for (int i = 0; i < n; i++) {
+		const char *base = strrchr(src[i], '/') + 1;
+		if (op == OP_MOVE) {
+			if (rename_new(src[i], dst[i]) == 0)
+				continue;
+			/* EINVAL: into itself, which mv explains better */
+			if (errno != EXDEV && errno != EINVAL) {
+				dprintf(out, "%s: %s\n", base, strerror(errno));
+				continue;
+			}
+		}
+		if (e) {
+			dprintf(out, "cannot run %s: %s\n", progs[op],
+				strerror(e));
+			continue;
+		}
+		char *argv[8];
+		int a = 0;
+		argv[a++] = (char *)progs[op];
+		if (op == OP_COPY)
+			argv[a++] = "-a";
+		if (op == OP_DELETE)
+			argv[a++] = "-rf";
+		else
+			argv[a++] = "-T";       /* dst is the name, never a dir */
+		argv[a++] = "--";
+		argv[a++] = src[i];
+		if (op != OP_DELETE)
+			argv[a++] = dst[i];
+		argv[a] = NULL;
+		if (wait_prog(prog, argv, msg, sizeof msg) < 0)
+			dprintf(out, "%s\n", msg);
+	}
+	_exit(0);
+}
+
+static int busy(void)
+{
+	if (job.fd < 0)
+		return 0;
+	set_status(1, "still %s, please wait", op_ing[job.op]);
+	return 1;
+}
+
+/* Start op on the absolute paths src (and dst). `first` is selected in
+ * `dir` when it is done. */
+static void start_job(int op, int n, char **src, char **dst,
+	const char *dir, const char *first)
+{
+	int p[2];
+	if (pipe2(p, O_CLOEXEC) < 0) {
+		set_status(1, "cannot start %s: %s", op_ing[op], strerror(errno));
+		return;
+	}
+	pid_t pid = fork();
+	if (pid < 0) {
+		set_status(1, "cannot start %s: %s", op_ing[op], strerror(errno));
+		close(p[0]);
+		close(p[1]);
+		return;
+	}
+	if (pid == 0) {
+		close(p[0]);
+		worker(op, n, src, dst, p[1]);
+	}
+	close(p[1]);
+	fcntl(p[0], F_SETFL, O_NONBLOCK);
+	job.fd = p[0];
+	job.op = op;
+	job.n = n;
+	job.fails = 0;
+	job.outlen = 0;
+	snprintf(job.dir, sizeof job.dir, "%s", dir);
+	snprintf(job.first, sizeof job.first, "%s", first ? first : "");
+	set_status(0, "%s %d item%s ...", op_ing[op], n, n == 1 ? "" : "s");
+}
+
+static void job_done(void)
+{
+	close(job.fd);
+	job.fd = -1;
+	job.out[job.outlen] = 0;
+	job.out[strcspn(job.out, "\n")] = 0;
+	if (reload() == 0 && job.first[0] && !strcmp(cwd, job.dir)) {
+		for (int i = 0; i < nents; i++)
+			if (!strcmp(ents[i].name, job.first)) {
+				sel = i;
+				show_sel();
+				break;
+			}
+	}
+	int ok = job.n - job.fails;
+	if (job.fails)
+		set_status(1, "%d of %d failed: %s", job.fails, job.n, job.out);
+	else
+		set_status(0, "%s %d item%s%s", op_ed[job.op], ok,
+			ok == 1 ? "" : "s",
+			job.op == OP_DELETE ? " permanently" : "");
+}
+
+/* Read what the worker reports, without blocking. */
+static void job_poll(void)
+{
+	char b[256];
+	while (job.fd >= 0) {
+		ssize_t r = read(job.fd, b, sizeof b);
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+			return;
+		if (r <= 0) {
+			job_done();
+			return;
+		}
+		for (ssize_t i = 0; i < r; i++) {
+			if (job.outlen < sizeof job.out - 1)
+				job.out[job.outlen++] = b[i];
+			job.fails += b[i] == '\n';
+		}
+	}
+}
+
+static int same_dir(const char *a, const char *b)
+{
+	struct stat x, y;
+	return !strcmp(a, b) || (stat(a, &x) == 0 && stat(b, &y) == 0 &&
+		x.st_dev == y.st_dev && x.st_ino == y.st_ino);
+}
+
+/* Is directory dir the same as p, or inside it (physically)? */
+static int inside(const char *dir, const char *p)
+{
+	char a[PATH_MAX], b[PATH_MAX];
+	if (!realpath(dir, a) || !realpath(p, b))
+		return 0;
+	size_t n = strlen(b);
+	return !strncmp(a, b, n) && (a[n] == 0 || a[n] == '/' || n == 1);
+}
+
+/* A name for `name` in dir that is not taken, on disk or by the first
+ * ntaken paths of `taken`: the name itself, else "name (copy).ext",
+ * "name (copy 2).ext", ... (directories keep dots in the name). */
+static int free_name(const char *dir, const char *name, int isdir,
+	char **taken, int ntaken, char *out)
+{
+	const char *dot = isdir ? NULL : strrchr(name, '.');
+	int stem = dot && dot != name ? (int)(dot - name) : (int)strlen(name);
+	char p[PATH_MAX], sfx[32];
+	struct stat st;
+	for (int k = 0; k < 10000; k++) {
+		if (k == 0)
+			sfx[0] = 0;
+		else if (k == 1)
+			snprintf(sfx, sizeof sfx, " (copy)");
+		else
+			snprintf(sfx, sizeof sfx, " (copy %d)", k);
+		if (snprintf(out, NAME_MAX + 1, "%.*s%s%s", stem, name, sfx,
+		    name + stem) > NAME_MAX || join(p, dir, out) < 0) {
+			errno = ENAMETOOLONG;
+			return -1;
+		}
+		if (lstat(p, &st) == 0)
+			continue;
+		if (errno != ENOENT)
+			return -1;
+		int used = 0;
+		for (int j = 0; j < ntaken && !used; j++)
+			used = !strcmp(taken[j], p);
+		if (!used)
+			return 0;
+	}
+	errno = EEXIST;
+	return -1;
+}
+
+/* Ctrl+C / Ctrl+X */
+static void clip_set(int move)
+{
+	int n;
+	char **v = targets(&n);
+	if (!v)
+		return;
+	free_names(clip, nclip);
+	clip = v;
+	nclip = n;
+	clip_move = move;
+	snprintf(clip_dir, sizeof clip_dir, "%s", cwd);
+	if (n == 1)
+		set_status(0, "%s \"%s\": Ctrl+V in the target directory",
+			move ? "move" : "copy", clip[0]);
+	else
+		set_status(0, "%s %d items: Ctrl+V in the target directory",
+			move ? "move" : "copy", n);
+}
+
+/* Ctrl+V: copy or move the clipboard into cwd. Nothing is overwritten;
+ * a name that is taken gets " (copy)". */
+static void paste(void)
+{
+	char p[PATH_MAX], nm[NAME_MAX + 1];
+	if (!nclip) {
+		set_status(1, "nothing to paste: mark with Space, then "
+			"Ctrl+C or Ctrl+X");
+		return;
+	}
+	if (busy())
+		return;
+	if (clip_move && same_dir(clip_dir, cwd)) {
+		set_status(1, "already in this directory");
+		return;
+	}
+	int cnt = nclip, n = 0;
+	char **src = calloc(cnt, sizeof *src);
+	char **dst = calloc(cnt, sizeof *dst);
+	char first[NAME_MAX + 1] = "";
+	for (int i = 0; src && dst && i < cnt; i++) {
+		struct stat st;
+		if (join(p, clip_dir, clip[i]) < 0 ||
+		    !(src[n] = strdup(p))) {
+			set_status(1, "%s: %s", clip[i], strerror(errno));
+			goto out;
+		}
+		int isdir = stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+		/* cp would fail, but only after copying one level */
+		if (lstat(p, &st) == 0 && S_ISDIR(st.st_mode) &&
+		    inside(cwd, p)) {
+			set_status(1, "%s: cannot %s a directory into itself",
+				clip[i], clip_move ? "move" : "copy");
+			goto out;
+		}
+		if (free_name(cwd, clip[i], isdir, dst, n, nm) < 0 ||
+		    join(p, cwd, nm) < 0 || !(dst[n] = strdup(p))) {
+			set_status(1, "%s: %s", clip[i], strerror(errno));
+			free(src[n]);
+			src[n] = NULL;
+			goto out;
+		}
+		if (!n)
+			snprintf(first, sizeof first, "%s", nm);
+		n++;
+	}
+	if (!src || !dst) {
+		set_status(1, "%s", strerror(ENOMEM));
+		goto out;
+	}
+	start_job(clip_move ? OP_MOVE : OP_COPY, n, src, dst, cwd, first);
+	if (clip_move && job.fd >= 0) {
+		free_names(clip, nclip);        /* the sources are gone */
+		clip = NULL;
+		nclip = 0;
+	}
+out:
+	free_names(src, cnt);
+	free_names(dst, cnt);
+}
+
+/* Delete: into the trash, at once. */
+static void trash(void)
+{
+	char p[PATH_MAX], err[sizeof status_msg] = "";
+	int n, ok = 0;
+	if (busy())
+		return;
+	char **v = targets(&n);
+	if (!v)
+		return;
+	for (int i = 0; i < n; i++) {
+		if (join(p, cwd, v[i]) < 0 || trash_one(p) < 0) {
+			if (!err[0])
+				snprintf(err, sizeof err, "%s: %s", v[i],
+					strerror(errno));
+		} else {
+			ok++;
+		}
+	}
+	free_names(v, n);
+	reload();
+	if (ok < n)
+		set_status(1, "%d of %d not moved to the trash: %s "
+			"(Shift+Del deletes permanently)", n - ok, n, err);
+	else
+		set_status(0, "moved %d item%s to the trash", n,
+			n == 1 ? "" : "s");
+}
+
+/* Shift+Delete: ask first. */
+static void ask_delete(void)
+{
+	int n;
+	if (busy())
+		return;
+	char **v = targets(&n);
+	if (!v)
+		return;
+	free_names(pend, npend);
+	pend = v;
+	npend = n;
+	snprintf(pend_dir, sizeof pend_dir, "%s", cwd);
+	if (n == 1)
+		set_status(1, "delete \"%s\" permanently? (y/n)", pend[0]);
+	else
+		set_status(1, "delete %d items permanently? (y/n)", n);
+}
+
+static void answer_delete(int yes)
+{
+	char p[PATH_MAX];
+	char **src = yes ? calloc(npend, sizeof *src) : NULL;
+	int n = 0;
+	for (int i = 0; src && i < npend; i++)
+		if (join(p, pend_dir, pend[i]) == 0 && (src[n] = strdup(p)))
+			n++;
+	if (!yes)
+		set_status(0, "nothing deleted");
+	else if (!src || n < npend)
+		set_status(1, "nothing deleted: %s", strerror(ENOMEM));
+	else
+		start_job(OP_DELETE, n, src, NULL, pend_dir, NULL);
+	free_names(src, n);
+	free_names(pend, npend);
+	pend = NULL;
+	npend = 0;
 }
 
 /* ---- navigation --------------------------------------------------------- */
@@ -1335,7 +2035,11 @@ static void draw(void)
 		if (i == sel) {
 			fill(px_sel, lx + 1, y, lw - 2, rowh);
 			c = cd = &xc_sel;
+		} else if (e->mark) {
+			fill(px_mark, lx + 1, y, lw - 2, rowh);
 		}
+		if (e->mark)
+			fill(i == sel ? px_mark : px_sel, lx + 1, y, 3, rowh);
 		draw_icon(lx + 5, y, e);
 		int x = lx + 5 + rowh + 2, right = lx + lw - 8;
 		if (show_date) {
@@ -1394,9 +2098,19 @@ static void draw(void)
 	} else if (search[0]) {
 		snprintf(s, sizeof s, "Find: %s", search);
 	} else {
-		int n = nents - (nents && ents[0].up);
-		snprintf(s, sizeof s, "%d item%s%s", n, n == 1 ? "" : "s",
-			show_hidden ? ", hidden shown" : "");
+		int n = nents - (nents && ents[0].up), m = nmarked();
+		size_t l = snprintf(s, sizeof s, "%d item%s", n,
+			n == 1 ? "" : "s");
+		if (m)
+			l += snprintf(s + l, sizeof s - l, ", %d marked", m);
+		if (show_hidden)
+			l += snprintf(s + l, sizeof s - l, ", hidden shown");
+		if (nclip)
+			l += snprintf(s + l, sizeof s - l, ", %d to %s", nclip,
+				clip_move ? "move" : "copy");
+		if (job.fd >= 0)
+			snprintf(s + l, sizeof s - l, ", %s ...",
+				op_ing[job.op]);
 	}
 	text_fit(sc, in_s.x, in_s.y, in_s.h, in_s.w - rw, s, 0);
 
@@ -1649,9 +2363,14 @@ static void key(KeySym ks, const char *txt, int n, unsigned state)
 	if (ks >= XK_A && ks <= XK_Z)
 		ks += XK_a - XK_A;
 	int ctrl = state & ControlMask, alt = state & Mod1Mask;
+	int shift = state & ShiftMask;
 
 	if (editing) {
 		edit_key(ks, txt, n, ctrl);
+		return;
+	}
+	if (pend) {
+		answer_delete(!ctrl && !alt && (ks == XK_y || ks == XK_j));
 		return;
 	}
 	/* A type-ahead that timed out is over: Backspace means "parent". */
@@ -1670,6 +2389,10 @@ static void key(KeySym ks, const char *txt, int n, unsigned state)
 		case XK_r: reload(); break;
 		case XK_l: edit_begin(); break;
 		case XK_t: open_terminal(); break;
+		case XK_a: mark_all(); break;
+		case XK_c: clip_set(0); break;
+		case XK_x: clip_set(1); break;
+		case XK_v: paste(); break;
 		}
 		return;
 	}
@@ -1706,10 +2429,30 @@ static void key(KeySym ks, const char *txt, int n, unsigned state)
 		}
 		return;
 	case XK_Escape:
-		search[0] = 0;
+		if (search[0])
+			search[0] = 0;
+		else
+			unmark_all();
 		dirty = 1;
 		return;
 	case XK_F5: reload(); return;
+	case XK_Insert: case XK_KP_Insert:
+		toggle_mark(sel);
+		move_sel(1);
+		return;
+	case XK_Delete: case XK_KP_Delete:
+		if (shift)
+			ask_delete();
+		else
+			trash();
+		return;
+	case XK_space:
+		if (!search[0]) {       /* else part of a type-ahead name */
+			toggle_mark(sel);
+			move_sel(1);
+			return;
+		}
+		break;
 	}
 	if (n > 0 && (unsigned char)txt[0] >= 0x20 && txt[0] != 0x7f)
 		typeahead(txt, n);
@@ -1743,6 +2486,8 @@ static void on_key(XKeyEvent *ev)
 static void on_button(XButtonEvent *ev)
 {
 	int x = ev->x, y = ev->y;
+	if (pend)
+		answer_delete(0);
 	if (editing && !in(r_path, x, y)) {
 		editing = 0;
 		dirty = 1;
@@ -1778,9 +2523,19 @@ static void on_button(XButtonEvent *ev)
 			return;
 		search[0] = 0;
 		clear_status();
+		if (ev->state & ControlMask) {
+			toggle_mark(i);
+			sel = i;
+			last_idx = -1;
+		} else if (ev->state & ShiftMask) {
+			for (int k = MIN(sel, i); k <= MAX(sel, i); k++)
+				if (!ents[k].up)
+					ents[k].mark = 1;
+			sel = i;
+			last_idx = -1;
 		/* A double click needs both clicks on the same, still
 		 * selected row of the same listing. */
-		if (i == last_idx && i == sel &&
+		} else if (i == last_idx && i == sel &&
 		    ev->time - last_click < DCLICK_MS) {
 			last_idx = -1;
 			activate(i);
@@ -1962,6 +2717,7 @@ int main(int argc, char **argv)
 		/* Timers run on every pass, so a steady stream of events
 		 * (held keys, scrolling) cannot starve them. */
 		uint64_t now = now_ms();
+		job_poll();
 		if (now >= next_poll) {
 			poll_dir();
 			next_poll = now + POLL_MS;
@@ -1985,7 +2741,9 @@ int main(int argc, char **argv)
 			XFlush(dpy);
 			FD_ZERO(&fds);
 			FD_SET(xfd, &fds);
-			select(xfd + 1, &fds, NULL, NULL, &tv);
+			if (job.fd >= 0)
+				FD_SET(job.fd, &fds);
+			select(MAX(xfd, job.fd) + 1, &fds, NULL, NULL, &tv);
 			continue;
 		}
 		XEvent ev;

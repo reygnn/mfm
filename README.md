@@ -40,11 +40,42 @@ Beim Start von mwm, z. B. in `~/.config/mwm/autostart`:
 | Ctrl+R / F5 | neu laden |
 | Ctrl+T | Terminal im aktuellen Ordner |
 | Ctrl+Q / Ctrl+W / Alt+F4 | beenden (Alt+F4 fängt unter mwm der Window Manager ab und schließt das Fenster) |
-| Esc | Suche/Meldung löschen |
+| Leertaste / Einfg | markieren bzw. Markierung aufheben, weiter zur nächsten Zeile (Leertaste während einer Namenssuche gehört zum Namen) |
+| Ctrl+A | alles markieren bzw. alle Markierungen aufheben |
+| Ctrl+C / Ctrl+X | Markierte (sonst die Auswahl) zum Kopieren bzw. Verschieben merken |
+| Ctrl+V | im aktuellen Ordner einfügen |
+| Entf | in den Papierkorb |
+| Shift+Entf | endgültig löschen, nach Rückfrage (`y`/`j` bestätigt, jede andere Taste bricht ab) |
+| Esc | Suche/Meldung löschen, ohne laufende Suche: Markierungen aufheben |
 
 Maus: Klick wählt, Doppelklick öffnet, Mausrad scrollt, Scrollbar ziehen
 oder in die Leiste klicken, Pfeil-Button oder Maus-Zurück-Taste (8) für
-„nach oben“, Klick in die Pfadzeile zum Bearbeiten.
+„nach oben“, Klick in die Pfadzeile zum Bearbeiten, Ctrl+Klick markiert,
+Shift+Klick markiert den Bereich bis zur Auswahl.
+
+## Kopieren, Verschieben, Löschen
+
+Die Markierungen gelten im aktuellen Ordner und bleiben beim automatischen
+Neuladen erhalten; beim Ordnerwechsel verfallen sie. Ohne Markierung
+wirkt jede Aktion auf die ausgewählte Zeile.
+
+Kopieren (`cp -a`), Verschieben und endgültiges Löschen (`rm -rf`) laufen
+in einem Hintergrundprozess, das Fenster bleibt bedienbar; eine weitere
+Aktion wartet, bis die laufende fertig ist. Verschoben wird per
+`rename`, über Dateisystemgrenzen mit `mv`. Das Ergebnis, bei Fehlern der
+erste davon, steht in der Statuszeile.
+
+Überschrieben wird nie: Ist ein Name im Ziel schon vergeben, heißt die
+Kopie `name (copy).txt`, `name (copy 2).txt` usw. So erzeugt auch
+Ctrl+C, Ctrl+V im selben Ordner ein Duplikat. Einen Ordner in sich selbst
+zu kopieren oder zu verschieben lehnt mfm ab.
+
+Der Papierkorb folgt der freedesktop.org-Spezifikation, Dateien lassen
+sich also mit jedem Dateimanager wiederherstellen, der sie kennt (oder per
+Hand aus `files/`, der Originalpfad steht in `info/*.trashinfo`). Er liegt
+in `$XDG_DATA_HOME/Trash` (Standard `~/.local/share/Trash`), für Dateien
+auf anderen Dateisystemen in `.Trash-$UID` an deren Wurzel. Geht das nicht
+(z. B. schreibgeschützt), bleibt Shift+Entf.
 
 Der Ordner wird jede Sekunde auf Änderungen geprüft und neu eingelesen,
 wobei Auswahl und Scrollposition erhalten bleiben. Verschwindet er oder wird
@@ -79,8 +110,8 @@ so etwas ein kleines Skript eintragen. Das Programm wird nur in den
 absoluten Einträgen von `$PATH` gesucht, nie im gerade angezeigten Ordner.
 Fehlt es, steht das in der Statuszeile.
 
-Nicht enthalten (bewusst): Kopieren, Verschieben, Löschen, Umbenennen.
-Dafür Ctrl+T und die Shell.
+Nicht enthalten (bewusst): Umbenennen, Ordner anlegen. Dafür Ctrl+T und
+die Shell.
 
 ## Lizenz
 
