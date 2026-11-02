@@ -36,6 +36,8 @@ Beim Start von mwm, z. B. in `~/.config/mwm/autostart`:
 | Alt+Pos1 | Home-Verzeichnis |
 | Buchstaben tippen | zum Namen springen (Groß/klein egal, auch bei Umlauten; nach 1 s beginnt die Suche neu) |
 | Ctrl+L | Pfad eingeben (`/…` oder `~…` beginnt neu, Ctrl+U leert) |
+| F2 | umbenennen (der Name ohne Endung ist ausgewählt: Tippen ersetzt ihn, ← → setzen den Cursor) |
+| F7 / Ctrl+Shift+N | neuer Ordner |
 | Ctrl+H | versteckte Dateien ein/aus |
 | Ctrl+R / F5 | neu laden |
 | Ctrl+T | Terminal im aktuellen Ordner |
@@ -48,12 +50,16 @@ Beim Start von mwm, z. B. in `~/.config/mwm/autostart`:
 | Shift+Entf | endgültig löschen, nach Rückfrage (`y`/`j` bestätigt, jede andere Taste bricht ab) |
 | Esc | Suche/Meldung löschen, ohne laufende Suche: Markierungen aufheben |
 
+In Eingabefeldern (Pfad, Umbenennen, neuer Ordner): ← → Pos1 Ende bewegen
+den Cursor, Backspace/Entf löschen, Ctrl+U leert, Enter bestätigt, Esc
+bricht ab.
+
 Maus: Klick wählt, Doppelklick öffnet, Mausrad scrollt, Scrollbar ziehen
 oder in die Leiste klicken, Pfeil-Button oder Maus-Zurück-Taste (8) für
 „nach oben“, Klick in die Pfadzeile zum Bearbeiten, Ctrl+Klick markiert,
 Shift+Klick markiert den Bereich bis zur Auswahl.
 
-## Kopieren, Verschieben, Löschen
+## Dateien verwalten
 
 Die Markierungen gelten im aktuellen Ordner und bleiben beim automatischen
 Neuladen erhalten; beim Ordnerwechsel verfallen sie. Ohne Markierung
@@ -68,7 +74,8 @@ erste davon, steht in der Statuszeile.
 Überschrieben wird nie: Ist ein Name im Ziel schon vergeben, heißt die
 Kopie `name (copy).txt`, `name (copy 2).txt` usw. So erzeugt auch
 Ctrl+C, Ctrl+V im selben Ordner ein Duplikat. Einen Ordner in sich selbst
-zu kopieren oder zu verschieben lehnt mfm ab.
+zu kopieren oder zu verschieben lehnt mfm ab. Auch Umbenennen
+überschreibt nichts; ist der neue Name vergeben, meldet mfm das.
 
 Der Papierkorb folgt der freedesktop.org-Spezifikation, Dateien lassen
 sich also mit jedem Dateimanager wiederherstellen, der sie kennt (oder per
@@ -110,8 +117,7 @@ so etwas ein kleines Skript eintragen. Das Programm wird nur in den
 absoluten Einträgen von `$PATH` gesucht, nie im gerade angezeigten Ordner.
 Fehlt es, steht das in der Statuszeile.
 
-Nicht enthalten (bewusst): Umbenennen, Ordner anlegen. Dafür Ctrl+T und
-die Shell.
+Alles darüber hinaus (Rechte, Links, Archive, …): Ctrl+T und die Shell.
 
 ## Lizenz
 

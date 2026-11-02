@@ -14,6 +14,7 @@
  *         Esc  clear search and message, else the marks
  *         Space / Insert  mark   Ctrl+A  mark all   Ctrl+C / Ctrl+X  copy /
  *         cut   Ctrl+V  paste   Delete  to the trash   Shift+Delete  delete
+ *         F2  rename   F7 / Ctrl+Shift+N  new folder
  * Mouse:  click select, double-click open, wheel scroll, scrollbar drag,
  *         Ctrl+click mark, Shift+click mark a range,
  *         up-arrow button or back button (btn 8) for the parent directory.
@@ -49,6 +50,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -94,6 +96,12 @@ static char search[128];
 static uint64_t search_ms;      /* monotonic time of the last type-ahead key */
 static int editing, edit_fresh;
 static char edit[PATH_MAX];
+static size_t edit_cur;
+/* F2 / F7: a name typed into the status line */
+enum { PR_NONE, PR_RENAME, PR_MKDIR };
+static int prompt, pfresh;
+static char pbuf[NAME_MAX + 1], pold[NAME_MAX + 1];
+static size_t pcur;
 static int up_pressed, dragging, drag_off;
 static Time last_click;
 static int last_idx = -1;
@@ -1781,7 +1789,93 @@ static void typeahead(const char *txt, int n)
 	dirty = 1;
 }
 
-/* ---- path editing ------------------------------------------------------- */
+/* ---- text input ------------------------------------------------------- */
+
+/*
+ * One line of input with a cursor at byte *cur, shared by the path field
+ * and the prompt. Returns 1 for Return, -1 for Escape, else 0.
+ * While *fresh, the text before the cursor counts as selected: with
+ * `sel`, typing replaces it and Backspace/Delete remove it; without (the
+ * path field), only "/" or "~" start over. Only keys that change the text
+ * or move the cursor end the fresh state; Shift, AltGr or a dead key
+ * pressed on the way to "/" or "~" must not.
+ */
+static int line_key(char *b, size_t sz, size_t *cur, int *fresh, int sel,
+	KeySym ks, const char *txt, int n, int ctrl)
+{
+	size_t len = strlen(b), c = MIN(*cur, len);
+	const char *p;
+	int cut = *fresh && sel && c > 0;       /* a selection to replace */
+	switch (ks) {
+	case XK_Return: case XK_KP_Enter:
+		return 1;
+	case XK_Escape:
+		return -1;
+	case XK_Left: case XK_KP_Left:
+		if (c)
+			c = u8_prev(b, c);
+		break;
+	case XK_Right: case XK_KP_Right:
+		if (c < len) {
+			p = b + c;
+			u8_next(&p);
+			c = p - b;
+		}
+		break;
+	case XK_Home: case XK_KP_Home:
+		c = 0;
+		break;
+	case XK_End: case XK_KP_End:
+		c = len;
+		break;
+	case XK_BackSpace:
+		if (cut) {
+			memmove(b, b + c, len - c + 1);
+			c = 0;
+		} else if (c) {
+			size_t q = u8_prev(b, c);
+			memmove(b + q, b + c, len - c + 1);
+			c = q;
+		}
+		break;
+	case XK_Delete: case XK_KP_Delete:
+		if (cut) {
+			memmove(b, b + c, len - c + 1);
+			c = 0;
+		} else if (c < len) {
+			p = b + c;
+			u8_next(&p);
+			memmove(b + c, p, len - (p - b) + 1);
+		}
+		break;
+	default:
+		if (ctrl && ks == XK_u) {
+			b[0] = 0;
+			c = 0;
+			break;
+		}
+		if (ctrl || n <= 0 || (unsigned char)txt[0] < 0x20 ||
+		    txt[0] == 0x7f)
+			return 0;
+		if (cut) {
+			memmove(b, b + c, len - c + 1);
+			len -= c;
+			c = 0;
+		} else if (*fresh && !sel && (txt[0] == '/' || txt[0] == '~')) {
+			b[0] = 0;
+			len = c = 0;
+		}
+		if (len + n < sz) {
+			memmove(b + c + n, b + c, len - c + 1);
+			memcpy(b + c, txt, n);
+			c += n;
+		}
+	}
+	*fresh = 0;
+	*cur = c;
+	dirty = 1;
+	return 0;
+}
 
 static void edit_begin(void)
 {
@@ -1789,6 +1883,7 @@ static void edit_begin(void)
 	if ((size_t)snprintf(edit, sizeof edit, "%s%s", cwd,
 	    strcmp(cwd, "/") ? "/" : "") >= sizeof edit)
 		snprintf(edit, sizeof edit, "%s", cwd);
+	edit_cur = strlen(edit);
 	dirty = 1;
 }
 
@@ -1816,34 +1911,114 @@ static void edit_commit(void)
 	}
 }
 
-/* Only keys that change the text count; Shift, AltGr or a dead key
- * pressed on the way to "/" or "~" must not end the fresh state. */
 static void edit_key(KeySym ks, const char *txt, int n, int ctrl)
 {
-	size_t len = strlen(edit);
-	if (ks == XK_Return || ks == XK_KP_Enter) {
+	int r = line_key(edit, sizeof edit, &edit_cur, &edit_fresh, 0, ks,
+		txt, n, ctrl);
+	if (r > 0) {
 		edit_commit();
-	} else if (ks == XK_Escape) {
+	} else if (r < 0) {
 		editing = 0;
-	} else if (ks == XK_BackSpace) {
-		edit[u8_prev(edit, len)] = 0;
-		edit_fresh = 0;
-	} else if (ctrl && ks == XK_u) {
-		edit[0] = 0;
-		edit_fresh = 0;
-	} else if (!ctrl && n > 0 && (unsigned char)txt[0] >= 0x20 &&
-		   txt[0] != 0x7f) {
-		if (edit_fresh && (txt[0] == '/' || txt[0] == '~'))
-			len = 0;
-		edit_fresh = 0;
-		if (len + n < sizeof edit) {
-			memcpy(edit + len, txt, n);
-			edit[len + n] = 0;
+		dirty = 1;
+	}
+}
+
+/* ---- rename, new folder ------------------------------------------------- */
+
+static void select_name(const char *name)
+{
+	for (int i = 0; i < nents; i++)
+		if (!strcmp(ents[i].name, name)) {
+			sel = i;
+			show_sel();
+			dirty = 1;
+			return;
 		}
+}
+
+static void prompt_begin(int kind)
+{
+	if (kind == PR_RENAME) {
+		if (sel < 0 || sel >= nents || ents[sel].up) {
+			set_status(1, "nothing selected");
+			return;
+		}
+		snprintf(pold, sizeof pold, "%s", ents[sel].name);
+		snprintf(pbuf, sizeof pbuf, "%s", pold);
+		/* The name without its extension is selected, as usual. */
+		const char *dot = ents[sel].dir ? NULL : strrchr(pbuf, '.');
+		pcur = dot && dot != pbuf ? (size_t)(dot - pbuf) : strlen(pbuf);
+		pfresh = 1;
 	} else {
+		pbuf[0] = 0;
+		pcur = 0;
+		pfresh = 0;
+	}
+	prompt = kind;
+	search[0] = 0;
+	clear_status();
+	dirty = 1;
+}
+
+static void prompt_commit(void)
+{
+	char p[PATH_MAX], q[PATH_MAX];
+	int kind = prompt;
+	prompt = PR_NONE;
+	dirty = 1;
+	if (!pbuf[0] || (kind == PR_RENAME && !strcmp(pbuf, pold)))
+		return;
+	if (strchr(pbuf, '/') || !strcmp(pbuf, ".") || !strcmp(pbuf, "..")) {
+		set_status(1, "not a valid name: %s", pbuf);
 		return;
 	}
-	dirty = 1;
+	if (join(q, cwd, pbuf) < 0) {
+		set_status(1, "%s: %s", pbuf, strerror(errno));
+		return;
+	}
+	if (kind == PR_MKDIR) {
+		if (mkdir(q, 0777) < 0) {
+			set_status(1, "cannot create %s: %s", pbuf,
+				strerror(errno));
+			return;
+		}
+		reload();
+		select_name(pbuf);
+		set_status(0, "created %s", pbuf);
+		return;
+	}
+	struct stat a, b;
+	int r;
+	if (join(p, cwd, pold) < 0) {
+		r = -1;
+	} else if (!strcasecmp(pold, pbuf) && lstat(p, &a) == 0 &&
+		   lstat(q, &b) == 0 && a.st_dev == b.st_dev &&
+		   a.st_ino == b.st_ino) {
+		/* only the case changes, on a file system that ignores it:
+		 * the "existing" target is the file itself */
+		r = rename(p, q);
+	} else {
+		r = rename_new(p, q);
+	}
+	if (r < 0) {
+		set_status(1, "cannot rename %s: %s", pold, strerror(errno));
+		return;
+	}
+	reload();
+	select_name(pbuf);
+	set_status(0, "renamed %s to %s", pold, pbuf);
+}
+
+static void prompt_key(KeySym ks, const char *txt, int n, int ctrl)
+{
+	int r = line_key(pbuf, sizeof pbuf, &pcur, &pfresh, 1, ks, txt, n,
+		ctrl);
+	if (r > 0) {
+		prompt_commit();
+	} else if (r < 0) {
+		prompt = PR_NONE;
+		dirty = 1;
+	}
 }
 
 /* ---- drawing ------------------------------------------------------------ */
@@ -1941,6 +2116,41 @@ static int text_fit(XftColor *c, int x, int y, int h, int maxw,
 	return ew + textw(s + j, n - j);
 }
 
+/* An input line in r, scrolled so the cursor (at byte cur of the raw
+ * text b) shows. With `selected`, the text before the cursor is drawn as
+ * selected. */
+static void draw_input(struct rect r, const char *b, size_t cur,
+	int selected)
+{
+	static char pre[PATH_MAX];
+	snprintf(pre, sizeof pre, "%.*s", (int)cur, b);
+	int dc = strlen(disp(pre));
+	const char *d = disp(b);
+	int n = strlen(d), ew = textw("...", 3), maxw = r.w - 2;
+	int x = r.x, start = 0, end = n;
+	if (maxw <= 2 * ew)
+		return;
+	if (fit_prefix(d, n, maxw) < n) {
+		if (fit_prefix(d, dc, maxw - ew) < dc) {
+			start = fit_suffix(d, dc, maxw - 2 * ew);
+			text(&xc_fg, x, r.y, r.h, "...", 3);
+			x += ew;
+		}
+		end = start + fit_prefix(d + start, n - start,
+			maxw - (x - r.x) - ew);
+	}
+	int wsel = textw(d + start, dc - start);
+	if (selected && dc > start)
+		fill(px_sel, x, r.y + 2, wsel, r.h - 4);
+	text(selected ? &xc_sel : &xc_fg, x, r.y, r.h, d + start, dc - start);
+	if (end > dc)
+		text(&xc_fg, x + wsel, r.y, r.h, d + dc, end - dc);
+	if (end < n)
+		text(&xc_fg, x + textw(d + start, end - start), r.y, r.h,
+			"...", 3);
+	fill(px_fg, x + wsel, r.y + 3, 1, r.h - 6);
+}
+
 static void draw_icon(int x, int y, const struct ent *e)
 {
 	int s = rowh - 6, iy = y + 3;
@@ -2015,10 +2225,12 @@ static void draw(void)
 		r_path.w - 2 * BEV, r_path.h - 2 * BEV };
 	fill(editing ? px_paper : px_list, in_p.x, in_p.y, in_p.w, in_p.h);
 	bevel(r_path, 0);
-	int w = text_fit(&xc_fg, in_p.x + 4, in_p.y, in_p.h, in_p.w - 10,
-		editing ? edit : cwd, 1);
 	if (editing)
-		fill(px_fg, in_p.x + 5 + w, in_p.y + 3, 1, in_p.h - 6);
+		draw_input((struct rect){ in_p.x + 4, in_p.y, in_p.w - 8,
+			in_p.h }, edit, edit_cur, 0);
+	else
+		text_fit(&xc_fg, in_p.x + 4, in_p.y, in_p.h, in_p.w - 10, cwd,
+			1);
 
 	/* list */
 	int lx = r_list.x + BEV, ly = r_list.y + BEV + 2;
@@ -2076,6 +2288,18 @@ static void draw(void)
 	struct rect in_s = { r_status.x + BEV + 4, r_status.y,
 		r_status.w - 2 * BEV - 8, r_status.h };
 	int rw = 0;
+	if (prompt) {
+		const char *l = prompt == PR_RENAME ? "Rename to: " :
+			"New folder: ";
+		int lw = textw(l, strlen(l));
+		text(&xc_fg, in_s.x, in_s.y, in_s.h, l, strlen(l));
+		fill(px_paper, in_s.x + lw, in_s.y + BEV + 1, in_s.w - lw,
+			in_s.h - 2 * BEV - 2);
+		draw_input((struct rect){ in_s.x + lw + 3, in_s.y,
+			in_s.w - lw - 3, in_s.h }, pbuf, pcur, pfresh);
+		XCopyArea(dpy, buf, win, gc, 0, 0, W, H, 0, 0);
+		return;
+	}
 	if (!status_msg[0] && !search[0] && sel < nents && !ents[sel].up) {
 		char p[11], sz[32];
 		perms(&ents[sel], p);
@@ -2369,6 +2593,10 @@ static void key(KeySym ks, const char *txt, int n, unsigned state)
 		edit_key(ks, txt, n, ctrl);
 		return;
 	}
+	if (prompt) {
+		prompt_key(ks, txt, n, ctrl);
+		return;
+	}
 	if (pend) {
 		answer_delete(!ctrl && !alt && (ks == XK_y || ks == XK_j));
 		return;
@@ -2393,6 +2621,10 @@ static void key(KeySym ks, const char *txt, int n, unsigned state)
 		case XK_c: clip_set(0); break;
 		case XK_x: clip_set(1); break;
 		case XK_v: paste(); break;
+		case XK_n:
+			if (shift)
+				prompt_begin(PR_MKDIR);
+			break;
 		}
 		return;
 	}
@@ -2436,6 +2668,8 @@ static void key(KeySym ks, const char *txt, int n, unsigned state)
 		dirty = 1;
 		return;
 	case XK_F5: reload(); return;
+	case XK_F2: prompt_begin(PR_RENAME); return;
+	case XK_F7: prompt_begin(PR_MKDIR); return;
 	case XK_Insert: case XK_KP_Insert:
 		toggle_mark(sel);
 		move_sel(1);
@@ -2488,6 +2722,10 @@ static void on_button(XButtonEvent *ev)
 	int x = ev->x, y = ev->y;
 	if (pend)
 		answer_delete(0);
+	if (prompt) {
+		prompt = PR_NONE;
+		dirty = 1;
+	}
 	if (editing && !in(r_path, x, y)) {
 		editing = 0;
 		dirty = 1;
