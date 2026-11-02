@@ -81,3 +81,7 @@ Fehlt es, steht das in der Statuszeile.
 
 Nicht enthalten (bewusst): Kopieren, Verschieben, Löschen, Umbenennen.
 Dafür Ctrl+T und die Shell.
+
+## Lizenz
+
+MIT, siehe [LICENSE](LICENSE).
