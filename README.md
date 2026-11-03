@@ -60,6 +60,21 @@ oder in die Leiste klicken, Pfeil-Button oder Maus-Zurück-Taste (8) für
 Shift+Klick markiert den Bereich bis zur Auswahl, ein einfacher Klick hebt
 alle Markierungen auf.
 
+Rechtsklick in die Liste öffnet ein Kontextmenü mit den Befehlen von oben
+(Öffnen, Ausschneiden, Kopieren, Einfügen, Umbenennen, Papierkorb,
+endgültig löschen, neuer Ordner, Terminal, versteckte Dateien, neu laden).
+Ein Rechtsklick auf einen markierten Eintrag behält die Markierungen:
+Ausschneiden, Kopieren, Papierkorb und Löschen wirken dann auf alle
+markierten, Öffnen und Umbenennen gibt es nur bei höchstens einer
+Markierung. Ein Rechtsklick auf einen anderen Eintrag wählt nur diesen
+aus. Auf freier Fläche wirkt das Menü auf die Markierungen, sonst nur auf
+den Ordner. Solange kopiert oder verschoben wird, sind Einfügen,
+Umbenennen, Papierkorb, Löschen und neuer Ordner gesperrt. Gedrückt
+halten, auf einen Befehl ziehen und loslassen führt ihn aus, ebenso ein
+Klick darauf; ↑ ↓ und Enter gehen auch, Esc oder ein Klick daneben
+schließt das Menü. Hat sich die Liste geändert, während das Menü offen war
+(Eintrag verschwunden, anderer Ordner), passiert nichts.
+
 ## Dateien verwalten
 
 Die Markierungen gelten im aktuellen Ordner und bleiben beim automatischen

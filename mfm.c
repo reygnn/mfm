@@ -18,6 +18,9 @@
  * Mouse:  click select, double-click open, wheel scroll, scrollbar drag,
  *         Ctrl+click mark, Shift+click mark a range,
  *         up-arrow button or back button (btn 8) for the parent directory.
+ *         Right click in the list: a menu with the commands above; cut,
+ *         copy, trash and delete take the marks if a marked entry or the
+ *         empty area was clicked.
  *
  * Copy, move and permanent delete run in a child process, one item after
  * the other (cp -a, rename or mv, rm -rf --one-file-system). Nothing is
@@ -64,6 +67,7 @@
 #define DCLICK_MS 400
 #define TYPEAHEAD_MS 1000
 #define POLL_MS 1000
+#define MENU_CLICK_MS 300       /* a quicker click leaves the menu open */
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
@@ -2828,6 +2832,321 @@ static void setup_window(void)
 	resize_buffer();
 }
 
+/* ---- context menu ------------------------------------------------------- */
+
+/*
+ * The right-button menu: an override-redirect window that holds the
+ * pointer and keyboard grabs while it is up. Press, drag and release on
+ * an item runs it; a quick click leaves the menu open for a second click.
+ * Up/Down move through it, Return runs an item, Esc closes it.
+ *
+ * The listing may be reloaded while the menu is up (the directory poll, a
+ * finished job). A command only runs if the directory, the clicked entry
+ * and the number of marks are still what the menu was opened on.
+ */
+enum { M_OPEN, M_CUT, M_COPY, M_PASTE, M_RENAME, M_TRASH, M_DELETE,
+	M_MKDIR, M_TERM, M_HIDDEN, M_RELOAD, M_SEP };
+static const struct { int id; const char *label, *accel; } menu_items[] = {
+	{ M_OPEN, "Open", "Enter" },
+	{ M_SEP, NULL, NULL },
+	{ M_CUT, "Cut", "Ctrl+X" },
+	{ M_COPY, "Copy", "Ctrl+C" },
+	{ M_PASTE, "Paste", "Ctrl+V" },
+	{ M_SEP, NULL, NULL },
+	{ M_RENAME, "Rename", "F2" },
+	{ M_TRASH, "Move to trash", "Del" },
+	{ M_DELETE, "Delete permanently", "Shift+Del" },
+	{ M_SEP, NULL, NULL },
+	{ M_MKDIR, "New folder", "F7" },
+	{ M_TERM, "Terminal here", "Ctrl+T" },
+	{ M_HIDDEN, "Show hidden files", "Ctrl+H" },
+	{ M_RELOAD, "Reload", "F5" },
+};
+#define NMENU ((int)(sizeof menu_items / sizeof menu_items[0]))
+static Window mwin;
+static Pixmap mbuf;
+static XftDraw *mxd;
+static int menu_on, menu_dirty, menu_hot = -1, menu_w, menu_h;
+static int menu_presses, menu_entered;
+static int menu_ok[NMENU], menu_y[NMENU + 1];  /* item i: y[i]..y[i+1] */
+static Time menu_time;
+/* what the menu was opened on; menu_name is "" for the empty area */
+static char menu_dir[PATH_MAX], menu_name[NAME_MAX + 1];
+static int menu_nmarks;
+
+static void toggle_hidden(void)
+{
+	show_hidden = !show_hidden;
+	reload();
+	set_status(0, "hidden files %s", show_hidden ? "shown" : "hidden");
+}
+
+static const char *menu_label(int i)
+{
+	if (menu_items[i].id == M_HIDDEN && show_hidden)
+		return "Hide hidden files";
+	return menu_items[i].label;
+}
+
+static int menu_inside(int x, int y)
+{
+	return x >= 0 && y >= 0 && x < menu_w && y < menu_h;
+}
+
+/* The item at (x, y) in the menu window, or -1. */
+static int menu_at(int x, int y)
+{
+	if (x < BEV || x >= menu_w - BEV)
+		return -1;
+	for (int i = 0; i < NMENU; i++)
+		if (y >= menu_y[i] && y < menu_y[i + 1])
+			return menu_items[i].id == M_SEP ? -1 : i;
+	return -1;
+}
+
+static void menu_draw(void)
+{
+	Pixmap keep_buf = buf;
+	XftDraw *keep_xd = xd;
+	buf = mbuf;             /* fill/bevel/text draw into buf and xd */
+	xd = mxd;
+	fill(px_bg, 0, 0, menu_w, menu_h);
+	bevel((struct rect){ 0, 0, menu_w, menu_h }, 1);
+	for (int i = 0; i < NMENU; i++) {
+		int y = menu_y[i], h = menu_y[i + 1] - y;
+		if (menu_items[i].id == M_SEP) {
+			fill(px_bot, BEV + 2, y + 3, menu_w - 2 * BEV - 4, 1);
+			fill(px_top, BEV + 2, y + 4, menu_w - 2 * BEV - 4, 1);
+			continue;
+		}
+		XftColor *c = menu_ok[i] ? &xc_fg : &xc_dim;
+		if (i == menu_hot) {
+			fill(px_sel, BEV, y, menu_w - 2 * BEV, h);
+			c = &xc_sel;
+		}
+		const char *l = menu_label(i), *a = menu_items[i].accel;
+		text(c, BEV + 12, y, h, l, strlen(l));
+		text(c, menu_w - BEV - 12 - textw(a, strlen(a)), y, h, a,
+			strlen(a));
+	}
+	XCopyArea(dpy, buf, mwin, gc, 0, 0, menu_w, menu_h, 0, 0);
+	buf = keep_buf;
+	xd = keep_xd;
+}
+
+static void menu_close(void)
+{
+	if (!menu_on)
+		return;
+	XUngrabPointer(dpy, CurrentTime);
+	XUngrabKeyboard(dpy, CurrentTime);
+	XUnmapWindow(dpy, mwin);
+	/* The command that follows may block (a slow directory); the
+	 * desktop must not stay grabbed meanwhile. */
+	XFlush(dpy);
+	menu_on = 0;
+	menu_hot = -1;
+	dirty = 1;
+}
+
+/* Which items work: `row` is the clicked entry, or -1 for the empty area
+ * of the list. Commands on entries take the marks, else the selection. */
+static void menu_enable(int row)
+{
+	int nm = nmarked(), idle = job.fd < 0;
+	int entry = row >= 0 && !ents[row].up;
+	int some = entry || (row < 0 && nm);
+	for (int i = 0; i < NMENU; i++) {
+		switch (menu_items[i].id) {
+		/* the clicked entry alone, so not while others are marked */
+		case M_OPEN: menu_ok[i] = row >= 0 && nm <= 1; break;
+		case M_RENAME: menu_ok[i] = entry && nm <= 1 && idle; break;
+		case M_CUT: case M_COPY: menu_ok[i] = some; break;
+		case M_TRASH: case M_DELETE: menu_ok[i] = some && idle; break;
+		case M_PASTE: menu_ok[i] = nclip > 0 && idle; break;
+		case M_MKDIR: menu_ok[i] = idle; break;
+		default: menu_ok[i] = 1;
+		}
+	}
+}
+
+/* Open the menu at the root position (xr, yr) for list row `row` (-1:
+ * the empty area). */
+static void menu_open(int xr, int yr, Time t, int row)
+{
+	int ih = rowh + 4, aw = 0;
+	int lw = textw("Hide hidden files", strlen("Hide hidden files"));
+	menu_y[0] = BEV + 2;
+	for (int i = 0; i < NMENU; i++) {
+		int sep = menu_items[i].id == M_SEP;
+		menu_y[i + 1] = menu_y[i] + (sep ? 8 : ih);
+		if (sep)
+			continue;
+		lw = MAX(lw, textw(menu_items[i].label,
+			strlen(menu_items[i].label)));
+		aw = MAX(aw, textw(menu_items[i].accel,
+			strlen(menu_items[i].accel)));
+	}
+	int w = 2 * (BEV + 12) + lw + 32 + aw, h = menu_y[NMENU] + BEV + 2;
+	menu_enable(row);
+	if (!mwin) {
+		XSetWindowAttributes wa = {
+			.override_redirect = True,
+			.save_under = True,
+			.background_pixel = px_bg,
+			.event_mask = ExposureMask,
+		};
+		mwin = XCreateWindow(dpy, root, 0, 0, 1, 1, 0, depth,
+			InputOutput, vis, CWOverrideRedirect | CWSaveUnder |
+			CWBackPixel | CWEventMask, &wa);
+	}
+	if (!mbuf || w != menu_w || h != menu_h) {
+		if (mxd)
+			XftDrawDestroy(mxd);
+		if (mbuf)
+			XFreePixmap(dpy, mbuf);
+		mbuf = XCreatePixmap(dpy, mwin, w, h, depth);
+		mxd = XftDrawCreate(dpy, mbuf, vis, cmap);
+	}
+	menu_w = w;
+	menu_h = h;
+	/* Below and right of the pointer, else above or left of it with
+	 * the pointer still on the corner, and always on the screen. */
+	int sw = DisplayWidth(dpy, scr), sh = DisplayHeight(dpy, scr);
+	int x = xr + w <= sw ? xr : xr - w + 1;
+	int y = yr + h <= sh ? yr : yr - h + 1;
+	x = MAX(0, MIN(x, sw - w));
+	y = MAX(0, MIN(y, sh - h));
+	XMoveResizeWindow(dpy, mwin, x, y, w, h);
+	XMapRaised(dpy, mwin);
+	if (XGrabPointer(dpy, mwin, False, ButtonPressMask |
+	    ButtonReleaseMask | PointerMotionMask, GrabModeAsync,
+	    GrabModeAsync, None, None, t) != GrabSuccess) {
+		XUnmapWindow(dpy, mwin);
+		return;
+	}
+	/* The keys come to win even if the focus follows the pointer onto
+	 * the menu. Without the grab they still work under click-to-focus. */
+	XGrabKeyboard(dpy, win, False, GrabModeAsync, GrabModeAsync, t);
+	snprintf(menu_dir, sizeof menu_dir, "%s", cwd);
+	snprintf(menu_name, sizeof menu_name, "%s",
+		row >= 0 ? ents[row].name : "");
+	menu_nmarks = nmarked();
+	menu_on = 1;
+	menu_hot = -1;
+	menu_presses = 0;
+	menu_entered = 0;
+	menu_time = t;
+	menu_dirty = 1;
+}
+
+/* Is the listing still the one the menu was opened on? */
+static int menu_valid(void)
+{
+	if (strcmp(cwd, menu_dir))
+		return 0;
+	if (menu_name[0] && (sel < 0 || sel >= nents ||
+	    strcmp(ents[sel].name, menu_name)))
+		return 0;
+	return nmarked() == menu_nmarks;
+}
+
+static void menu_run(int i)
+{
+	int id = menu_items[i].id;
+	menu_close();
+	search[0] = 0;
+	clear_status();
+	if (id != M_HIDDEN && id != M_RELOAD && !menu_valid()) {
+		set_status(1, "the listing changed, nothing done");
+		return;
+	}
+	switch (id) {
+	case M_OPEN: activate(sel); break;
+	case M_CUT: clip_set(1); break;
+	case M_COPY: clip_set(0); break;
+	case M_PASTE: paste(); break;
+	case M_RENAME: prompt_begin(PR_RENAME); break;
+	case M_TRASH: trash(); break;
+	case M_DELETE: ask_delete(); break;
+	case M_MKDIR: prompt_begin(PR_MKDIR); break;
+	case M_TERM: open_terminal(); break;
+	case M_HIDDEN: toggle_hidden(); break;
+	case M_RELOAD: reload(); break;
+	}
+	dirty = 1;
+}
+
+static void menu_key(KeySym ks)
+{
+	int d;
+	switch (ks) {
+	case XK_Escape:
+		menu_close();
+		return;
+	case XK_Return: case XK_KP_Enter:
+		if (menu_hot >= 0)
+			menu_run(menu_hot);
+		return;
+	case XK_Up: case XK_KP_Up: d = -1; break;
+	case XK_Down: case XK_KP_Down: d = 1; break;
+	default: return;
+	}
+	int i = menu_hot < 0 ? (d > 0 ? -1 : NMENU) : menu_hot;
+	for (int k = 0; k < NMENU; k++) {
+		i = (i + d + NMENU) % NMENU;
+		if (menu_items[i].id != M_SEP && menu_ok[i]) {
+			menu_hot = i;
+			menu_dirty = 1;
+			return;
+		}
+	}
+}
+
+/* The pointer highlights the enabled item under it. Until it first
+ * reaches one, a nudge does not drop an item chosen with the keys. */
+static void menu_motion(XMotionEvent *ev)
+{
+	int i = menu_at(ev->x, ev->y);
+	if (i >= 0 && !menu_ok[i])
+		i = -1;
+	if (i >= 0)
+		menu_entered = 1;
+	else if (!menu_entered)
+		return;
+	if (i != menu_hot) {
+		menu_hot = i;
+		menu_dirty = 1;
+	}
+}
+
+static void menu_press(XButtonEvent *ev)
+{
+	if (ev->button > Button3)
+		return;
+	if (menu_inside(ev->x, ev->y))
+		menu_presses++;
+	else
+		menu_close();
+}
+
+/* A release runs the highlighted item under the pointer: one that was
+ * pointed at, not one the menu merely opened on top of. */
+static void menu_release(XButtonEvent *ev)
+{
+	if (ev->button > Button3)
+		return;
+	/* the release of a click that opened the menu: it stays (the
+	 * server's millisecond clock wraps at 32 bits) */
+	if (!menu_presses && (uint32_t)(ev->time - menu_time) < MENU_CLICK_MS)
+		return;
+	int i = menu_at(ev->x, ev->y);
+	if (i >= 0 && i == menu_hot)
+		menu_run(i);
+	else if (!menu_inside(ev->x, ev->y))
+		menu_close();
+}
+
 /* ---- events ------------------------------------------------------------- */
 
 static void key(KeySym ks, const char *txt, int n, unsigned state)
@@ -2839,6 +3158,10 @@ static void key(KeySym ks, const char *txt, int n, unsigned state)
 	int ctrl = state & ControlMask, alt = state & Mod1Mask;
 	int shift = state & ShiftMask;
 
+	if (menu_on) {
+		menu_key(ks);
+		return;
+	}
 	if (editing) {
 		edit_key(ks, txt, n, ctrl);
 		return;
@@ -2859,12 +3182,7 @@ static void key(KeySym ks, const char *txt, int n, unsigned state)
 	if (ctrl) {
 		switch (ks) {
 		case XK_q: case XK_w: exit(0);
-		case XK_h:
-			show_hidden = !show_hidden;
-			reload();
-			set_status(0, "hidden files %s",
-				show_hidden ? "shown" : "hidden");
-			break;
+		case XK_h: toggle_hidden(); break;
 		case XK_r: reload(); break;
 		case XK_l: edit_begin(); break;
 		case XK_t: open_terminal(); break;
@@ -2968,6 +3286,36 @@ static void on_key(XKeyEvent *ev)
 	free(heap);
 }
 
+/* The entry at window height y in the list, or -1. */
+static int row_at(int y)
+{
+	int i = top + (y - (r_list.y + BEV + 2)) / rowh;
+	if (y < r_list.y + BEV + 2 || i >= nents || i >= top + rows_vis())
+		return -1;
+	return i;
+}
+
+/* Right click in the list. A marked entry keeps the marks, so the menu
+ * works on all of them; any other entry is selected alone. Not while the
+ * left button drags the scrollbar or holds the up button. */
+static void list_menu(XButtonEvent *ev)
+{
+	int i = row_at(ev->y);
+	if (!in(r_list, ev->x, ev->y) ||
+	    (ev->state & (Button1Mask | Button2Mask)))
+		return;
+	search[0] = 0;
+	clear_status();
+	if (i >= 0) {
+		if (!ents[i].mark)
+			unmark_all();
+		sel = i;
+		last_idx = -1;
+		dirty = 1;
+	}
+	menu_open(ev->x_root, ev->y_root, ev->time, i);
+}
+
 static void on_button(XButtonEvent *ev)
 {
 	int x = ev->x, y = ev->y;
@@ -2985,6 +3333,7 @@ static void on_button(XButtonEvent *ev)
 	case Button4: top -= 3; clamp_top(); dirty = 1; return;
 	case Button5: top += 3; clamp_top(); dirty = 1; return;
 	case 8: go_parent(); return;
+	case Button3: list_menu(ev); return;
 	case Button1: break;
 	default: return;
 	}
@@ -3006,9 +3355,8 @@ static void on_button(XButtonEvent *ev)
 		}
 		dirty = 1;
 	} else if (in(r_list, x, y)) {
-		int i = top + (y - (r_list.y + BEV + 2)) / rowh;
-		if (y < r_list.y + BEV + 2 || i >= nents ||
-		    i >= top + rows_vis())
+		int i = row_at(y);
+		if (i < 0)
 			return;
 		search[0] = 0;
 		clear_status();
@@ -3031,7 +3379,7 @@ static void on_button(XButtonEvent *ev)
 			last_idx = i;
 			last_click = ev->time;
 		} else if (i == last_idx && i == sel &&
-		    ev->time - last_click < DCLICK_MS) {
+		    (uint32_t)(ev->time - last_click) < DCLICK_MS) {
 			last_idx = -1;
 			activate(i);
 		} else {
@@ -3072,10 +3420,26 @@ static void on_release(XButtonEvent *ev)
 
 static void handle(XEvent *ev)
 {
+	if (menu_on) {          /* the pointer belongs to the menu */
+		switch (ev->type) {
+		case ButtonPress: menu_press(&ev->xbutton); return;
+		case ButtonRelease: menu_release(&ev->xbutton); return;
+		case MotionNotify:
+			while (XCheckTypedWindowEvent(dpy, mwin, MotionNotify,
+			    ev))
+				;
+			menu_motion(&ev->xmotion);
+			return;
+		}
+	}
 	switch (ev->type) {
 	case Expose:
-		if (ev->xexpose.count == 0)
+		if (ev->xexpose.window == mwin) {
+			if (ev->xexpose.count == 0)
+				menu_dirty = 1;
+		} else if (ev->xexpose.count == 0) {
 			dirty = 1;
+		}
 		break;
 	case ConfigureNotify:
 		if (ev->xconfigure.width != W || ev->xconfigure.height != H) {
@@ -3093,14 +3457,19 @@ static void handle(XEvent *ev)
 		on_motion(&ev->xmotion);
 		break;
 	case FocusIn:
+	case FocusOut:
+		/* our own keyboard grab for the menu moves no focus */
+		if (menu_on && ev->xfocus.mode != NotifyNormal)
+			break;
+		if (ev->type == FocusOut) {
+			focused = 0;
+			if (xic)
+				XUnsetICFocus(xic);
+			break;
+		}
 		focused = 1;
 		if (xic)
 			XSetICFocus(xic);
-		break;
-	case FocusOut:
-		focused = 0;
-		if (xic)
-			XUnsetICFocus(xic);
 		break;
 	case MappingNotify: XRefreshKeyboardMapping(&ev->xmapping); break;
 	case ClientMessage:
@@ -3224,6 +3593,10 @@ int main(int argc, char **argv)
 		if (dirty && !XPending(dpy)) {
 			draw();
 			dirty = 0;
+		}
+		if (menu_on && menu_dirty && !XPending(dpy)) {
+			menu_draw();
+			menu_dirty = 0;
 		}
 		if (!XPending(dpy)) {
 			uint64_t wake = next_poll;
