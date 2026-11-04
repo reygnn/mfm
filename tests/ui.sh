@@ -1,113 +1,22 @@
 #!/bin/bash
-# Black-box test of mfm under a headless mwc: simulated mouse and keyboard from
-# mwc's tests/vinput, checked through the file system (a command that worked
-# leaves files behind) and through pixels in screenshots.
-#
-# Needs a built mwc with build/vinput and build/pngtool in MWC_DIR (default
-# ../mwm), and grim. It has its own runtime directory and Wayland socket, so it
-# does not touch a running session. Output goes to build/ui.log, and mfm's own
-# to build/ui-mfm.log; MFM_DEBUG=1 adds its Wayland protocol there.
-MFM_DIR=$(cd "$(dirname "$0")/.." && pwd)
-MFM=$MFM_DIR/mfm
-MWC_DIR=${MWC_DIR:-$MFM_DIR/../mwm}
-LOG=$MFM_DIR/build/ui.log
-MFM_LOG=$MFM_DIR/build/ui-mfm.log
+# Black-box test of mfm under a headless mwc: simulated mouse and keyboard, checked
+# through the file system (a command that worked leaves files behind) and through
+# pixels in screenshots. See common.sh for what it needs. Output goes to build/ui.log,
+# and mfm's own to build/ui-mfm.log; MFM_DEBUG=1 adds its Wayland protocol there.
+LOG=$(cd "$(dirname "$0")/.." && pwd)/build/ui.log
+MFM_LOG=${LOG%.log}-mfm.log
+. "$(dirname "$0")/common.sh"
 
-[ -x "$MFM" ] || { echo "FAIL: $MFM not built"; exit 1; }
-[ -d "$MWC_DIR" ] || { echo "FAIL: no mwc in $MWC_DIR (set MWC_DIR)"; exit 1; }
-cd "$MWC_DIR" || exit 1
-. tests/lib.sh
-
-require_tools grim
-for tool in build/vinput build/pngtool; do
-	[ -x "$tool" ] || { echo "FAIL: $MWC_DIR/$tool not built (make $tool)"; exit 1; }
-done
-
-export MWC_TEST_STATE=$SMOKE_DIR/state
-export XDG_DATA_HOME=$SMOKE_DIR/data
-export LC_ALL=C.UTF-8
-unset MFM_OPEN MFM_TERMINAL MFM_FONT
-SHOT=$SMOKE_DIR/ui.png
-MFM_PID=
-: >"$MFM_LOG"
-
-start_mwc 'exec sleep 600'
+# The socket comes before the test hooks, the startup command after them.
+start_mwc 'touch "$SMOKE_DIR/up"; exec sleep 600'
+wait_for "mwc is up" test -e "$SMOKE_DIR/up"
 start_vinput
 refresh
 B=$(global theme border)
 T=$(global theme title)
 echo "theme: border=$B title=$T"
 
-BG=aeb2c3
-SEL=7387ad
-TROUGH=999dac
-
-# ---- helpers ---------------------------------------------------------------
-
-# file_appears <description> <path>
-file_appears() { wait_for "$1" test -e "$2"; }
-
-# Top-left corner of the window's content, on the screen, in CX and CY.
-content_origin() {
-	refresh
-	CX=$(($(get mfm x) + B))
-	CY=$(($(get mfm y) + T + B))
-}
-
-# mfm_start <directory>: run mfm there and wait until its window is up.
-mfm_start() {
-	WAYLAND_DEBUG=${MFM_DEBUG:-} WAYLAND_DISPLAY=wayland-0 MFM_OPEN="touch $SMOKE_DIR/opened" \
-		MFM_TERMINAL="touch $SMOKE_DIR/term-ran" "$MFM" "$1" >>"$MFM_LOG" 2>&1 &
-	MFM_PID=$!
-	check "mfm has a focused window" '[ "$(get mfm kbfocus)" = 1 ]'
-	content_origin
-	wait_shot_pixel "the window is drawn" $((CX + 1)) $((CY + 1)) "$BG"
-	find_rows
-}
-
-# mfm_quit: Ctrl+Q must end it with status 0.
-mfm_quit() {
-	do_input key ctrl+q
-	wait "$MFM_PID"
-	local status=$?
-	[ "$status" = 0 ] || fail "mfm exited with status $status"
-	check "the window is gone" '[ -z "$(get mfm w)" ]'
-	MFM_PID=
-}
-
-shoot() { WAYLAND_DISPLAY=wayland-0 grim "$SHOT" 2>/dev/null; }
-
-pixel() { build/pngtool pixel "$SHOT" "$1" "$2"; }
-
-# wait_shot_pixel <description> <x> <y> <rrggbb>: screen coordinates.
-wait_shot_pixel() { pixel_is "$1" "$2" "$3" "$4"; }
-
-# Find the selected row, which starts as the first one: ROW0 is its top on the
-# screen, ROWH its height, LISTX a column inside the list.
-find_rows() {
-	local y end
-	LISTX=$((CX + 80))
-	shoot
-	for ((y = CY; y < CY + 200; y++)); do
-		[ "$(pixel "$LISTX" "$y")" = "$SEL" ] && break
-	done
-	[ "$y" -lt $((CY + 200)) ] || fail "no selected row found"
-	ROW0=$y
-	for ((end = y; end < y + 60; end++)); do
-		[ "$(pixel "$LISTX" "$end")" = "$SEL" ] || break
-	done
-	ROWH=$((end - y))
-	[ "$ROWH" -ge 10 ] && [ "$ROWH" -lt 50 ] || fail "odd row height $ROWH"
-	echo "ok: rows start at $ROW0, $ROWH high"
-}
-
-row_y() { echo $((ROW0 + $1 * ROWH + ROWH / 2)); }
-
-# Make a directory with entries for one scenario.
-fresh_dir() {
-	D=$SMOKE_DIR/tree/$1
-	mkdir -p "$D"
-}
+LIST=c6c9d5
 
 # ---- rendering and frame ---------------------------------------------------
 
@@ -159,7 +68,9 @@ do_input hold shift
 do_input key a
 do_input release shift
 do_input key Return
-file_appears "Shift+a finds alpha.txt, Enter opens it" "$SMOKE_DIR/opened"
+file_appears "Shift+a and Enter open something" "$SMOKE_DIR/opened"
+[ "$(cat "$SMOKE_DIR/opened")" = "$D/alpha.txt" ] || fail "opened $(cat "$SMOKE_DIR/opened")"
+echo "ok: and that is alpha.txt"
 rm -f "$SMOKE_DIR/opened"
 
 mfm_quit
@@ -228,13 +139,16 @@ for k in a b; do do_input key "$k"; done
 do_input key Return
 file_appears "Esc closes the menu" "$D/ab"
 
-# A click on our own window closes it and does nothing else there.
+# A click on our own window closes it and does nothing else there: the row above
+# the menu does not get selected.
 do_input move "$X" "$Y"
 do_input click right
 sleep 0.4
-do_input move $((CX + 20)) $((CY + 300))
+do_input move "$LISTX" "$(row_y 0)"
 do_input click left
-sleep 0.2
+sleep 0.3
+shoot
+[ "$(pixel "$LISTX" "$ROW0")" != "$SEL" ] || fail "the click selected a row"
 do_input key F7
 for k in c d; do do_input key "$k"; done
 do_input key Return
@@ -323,15 +237,47 @@ kill -0 "$MFM_PID" 2>/dev/null || fail "mfm died on a long path"
 echo "ok: a path of ${#P} bytes as a title"
 mfm_quit
 
+# A newline in a name must not make a second line, which would show on the empty
+# rows below it.
 fresh_dir odd
-touch "$D/$(printf 'line\nbreak')" "$D/$(printf 'latin\xe9')" "$D/ütf ☃ 日本語.txt"
+touch "$D/$(printf 'first\nsecond\nthird')"
 mfm_start "$D"
 do_input key F5
 sleep 0.3
 kill -0 "$MFM_PID" 2>/dev/null || fail "mfm died on odd names"
 shoot
-[ "$(pixel "$LISTX" "$ROW0")" = "$SEL" ] || fail "rows moved: a newline made a second line"
+for ((x = LISTX - 60; x < LISTX + 100; x += 3)); do
+	[ "$(pixel "$x" "$(row_y 2)")" = "$LIST" ] || fail "text on the empty row at x=$x"
+done
+echo "ok: a newline stays on its line"
+mfm_quit
+
+fresh_dir odd2
+touch "$D/$(printf 'latin\xe9')" "$D/ütf ☃ 日本語.txt" "$D/$(printf 'zz\xe2\x80\xaefdp.exe')"
+mfm_start "$D"
+do_input key F5
+sleep 0.3
+kill -0 "$MFM_PID" 2>/dev/null || fail "mfm died on odd names"
 echo "ok: odd names"
+mfm_quit
+
+# ---- settings --------------------------------------------------------------
+
+# A font name without a size has no metrics of its own: find_rows checks the height.
+fresh_dir font
+MFM_FONT=Monospace mfm_start "$D"
+mfm_quit
+echo "ok: a font without a size"
+
+# mfm has to read mwmrc as mwc does.
+fresh_dir rc
+mkdir -p "$XDG_CONFIG_HOME/mwc"
+printf 'mwm.Background : #336699\n' >"$XDG_CONFIG_HOME/mwc/mwmrc"
+BG=336699
+mfm_start "$D"
+BG=aeb2c3
+rm "$XDG_CONFIG_HOME/mwc/mwmrc"
+echo "ok: mwmrc in another spelling"
 mfm_quit
 
 # ---- the end ---------------------------------------------------------------

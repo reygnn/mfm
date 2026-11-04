@@ -13,15 +13,17 @@ PROTO_H = build/xdg-shell-client-protocol.h \
 	build/xdg-decoration-unstable-v1-client-protocol.h
 PROTO_C = build/xdg-shell-protocol.c build/xdg-decoration-unstable-v1-protocol.c
 
+# CFLAGS and LDLIBS stay the user's, also on the command line: `make CFLAGS=-O0`
+# must not lose the include paths.
 CFLAGS ?= -O2 -g
-CFLAGS += -std=c11 -Wall -Wextra -Wno-unused-parameter -Ibuild \
+MFM_CFLAGS = -std=c11 -Wall -Wextra -Wno-unused-parameter -Ibuild \
 	$(shell $(PKG_CONFIG) --cflags $(PKGS))
-LDLIBS += $(shell $(PKG_CONFIG) --libs $(PKGS))
+MFM_LIBS = $(shell $(PKG_CONFIG) --libs $(PKGS))
 
 all: mfm
 
 mfm: mfm.c $(PROTO_H) $(PROTO_C)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ mfm.c $(PROTO_C) $(LDLIBS)
+	$(CC) $(MFM_CFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ mfm.c $(PROTO_C) $(MFM_LIBS) $(LDLIBS)
 
 build:
 	mkdir -p build
@@ -40,16 +42,19 @@ build/xdg-decoration-unstable-v1-protocol.c: | build
 
 install: mfm
 	install -Dm755 mfm $(DESTDIR)$(PREFIX)/bin/mfm
-	install -Dm644 data/mfm.desktop \
-		$(DESTDIR)$(PREFIX)/share/applications/mfm.desktop
+	mkdir -p $(DESTDIR)$(PREFIX)/share/applications
+	sed 's|^Exec=mfm |Exec=$(PREFIX)/bin/mfm |' data/mfm.desktop \
+		>$(DESTDIR)$(PREFIX)/share/applications/mfm.desktop
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/mfm \
 		$(DESTDIR)$(PREFIX)/share/applications/mfm.desktop
 
-# Needs a built mwc next to this directory, or in MWC_DIR, and grim.
+# Needs a built mwc next to this directory, or in MWC_DIR, and grim. files.sh also
+# needs unprivileged user namespaces, and is skipped without them.
 test: mfm
 	tests/ui.sh
+	tests/files.sh
 
 clean:
 	rm -rf mfm build

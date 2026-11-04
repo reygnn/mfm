@@ -90,7 +90,8 @@ Hintergrundprozess, das Fenster bleibt bedienbar; eine weitere Aktion
 (auch F2/F7) wartet, bis die laufende fertig ist. Beendet man mfm
 vorher, läuft sie zu Ende. Das Ergebnis, bei Fehlern der erste davon,
 steht in der Statuszeile. Nach Ctrl+X bleibt die Zwischenablage stehen,
-bis das Verschieben ganz geklappt hat.
+bis das Verschieben ganz geklappt hat. Stirbt der Hintergrundprozess, meldet
+mfm das und lässt die Zwischenablage ebenfalls stehen.
 
 Überschrieben wird nie. Verschoben wird innerhalb eines Dateisystems per
 `rename`, das keinen vorhandenen Namen ersetzt. Kopien (`cp -a`) und
@@ -106,9 +107,16 @@ zu verschieben lehnt mfm ab. Auch Umbenennen überschreibt nichts; ist der
 neue Name vergeben, meldet mfm das. (Einzige Lücke: Dateisysteme ohne
 atomares „umbenennen ohne zu ersetzen“, z. B. NFS, bei Ordnern.)
 
-Endgültiges Löschen ist `rm -rf --one-file-system`: Eingehängte
-Dateisysteme darunter bleiben unberührt, und einen Einhängepunkt selbst
-löscht mfm nicht.
+Scheitert ein Verschieben über Dateisystemgrenzen, z. B. weil das Ziel voll
+ist, bleibt das Angekommene im versteckten `.mfm-XXXXXX`, und die Statuszeile
+nennt den Ordner. Nach dem Fehlschlag ist die Quelle in aller Regel noch
+vollständig. Eine gescheiterte Kopie räumt mfm weg.
+
+Endgültiges Löschen ist `rm -rf --one-file-system`. Einen Einhängepunkt selbst
+und einen Ordner, in dem etwas eingehängt ist, löscht mfm nicht, auch nicht
+Bind-Mounts vom selben Dateisystem, deren Inhalt `rm` sonst leeren würde. Auch
+verschieben lässt sich ein Einhängepunkt nicht, und über Dateisystemgrenzen auch
+kein Ordner, in dem etwas eingehängt ist; kopieren geht.
 
 Der Papierkorb folgt der freedesktop.org-Spezifikation, Dateien lassen
 sich also mit jedem Dateimanager wiederherstellen, der sie kennt (oder per
@@ -123,7 +131,8 @@ Papierkorb liegt, wird nicht noch einmal hineingelegt. Geht es nicht
 
 Der Ordner wird jede Sekunde auf Änderungen geprüft und neu eingelesen,
 wobei Auswahl und Scrollposition erhalten bleiben. Verschwindet er oder wird
-er unlesbar, springt mfm zum nächsten lesbaren Elternordner.
+er unlesbar, springt mfm zum nächsten lesbaren Elternordner. Geänderte Größen
+oder Rechte einer Datei ändern den Ordner nicht: Die zeigt erst Ctrl+R.
 
 Pfade sind logisch wie bei `cd` in der Shell: Nach dem Betreten eines
 verlinkten Ordners führt `..` zurück in den Ordner, in dem der Link liegt,
@@ -136,7 +145,13 @@ Texteingabe kann Compose und tote Tasten, nach den Regeln der Locale
 es `text-input-v3`, das mwc nicht anbietet.
 
 Dateinamen, die kein gültiges UTF-8 sind (z. B. Latin-1 von alten Platten
-oder Netzlaufwerken), werden als Latin-1 angezeigt.
+oder Netzlaufwerken), werden als Latin-1 angezeigt. Steuerzeichen für die
+Schreibrichtung erscheinen als `�`, damit `zz\u202Efdp.exe` nicht wie
+`zzexe.pdf` aussieht.
+
+Gehalten wiederholen nur Bewegen und Tippen, keine Befehle: Entf, Enter und
+Tastenkombinationen wirken einmal je Druck, Entf und Backspace in Eingabefeldern
+wiederholen.
 
 ## Umgebung
 
@@ -144,7 +159,7 @@ oder Netzlaufwerken), werden als Latin-1 angezeigt.
 |---|---|---|
 | `MFM_OPEN` | `xdg-open` | Programm zum Öffnen von Dateien, z. B. `feh` oder `"mimeopen -n"`; die Datei wird als letztes Argument angehängt |
 | `MFM_TERMINAL` | `$MWC_TERMINAL`, sonst das erste gefundene von foot, xterm, uxterm, x-terminal-emulator, urxvt, alacritty, konsole, kitty, xfce4-terminal, gnome-terminal | für Ctrl+T |
-| `MFM_FONT` | `Sans 10` | Pango-Name, z. B. `Sans Bold 11`; fontconfig-Muster wie in mfm-x11 (`Sans:size=10`) werden abgelehnt |
+| `MFM_FONT` | `Sans 10` | Pango-Name, z. B. `Sans Bold 11` (ohne Größe: 10); fontconfig-Muster wie in mfm-x11 (`Sans:size=10`) werden abgelehnt |
 | `MWC_INACTIVE`, `MWC_ACTIVE` | `#aeb2c3`, `#7387ad` | Hintergrund, Auswahl |
 
 `MFM_OPEN` und `MFM_TERMINAL` werden an Leerzeichen in Wörter zerlegt.
@@ -175,10 +190,11 @@ offen, ein Klick auf den Befehl geht weiter.
     make test
 
 fährt mfm unter einem headless laufenden mwc mit simulierter Maus und
-Tastatur und prüft Dateien und Screenshots (`tests/ui.sh`). Es braucht einen
-gebauten mwc samt `build/vinput` und `build/pngtool` neben diesem Ordner oder
-in `MWC_DIR` sowie `grim`. Der Test hat einen eigenen Socket und fasst eine
-laufende Sitzung nicht an.
+Tastatur und prüft Dateien und Screenshots (`tests/ui.sh`), dazu Dateioperationen
+mit echten Mounts in einem privaten Namespace (`tests/files.sh`; ohne User-Namespaces
+übersprungen). Es braucht einen gebauten mwc samt `build/vinput` und
+`build/pngtool` in `MWC_DIR` (sonst `../mwc` oder `../mwm`) sowie `grim`. Die Tests
+haben einen eigenen Socket und fassen eine laufende Sitzung nicht an.
 
 ## Lizenz
 

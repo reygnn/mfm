@@ -138,6 +138,7 @@ static const char *const op_ing[] = { "copying", "moving", "deleting" };
 static const char *const op_ed[] = { "copied", "moved", "deleted" };
 static struct {
 	int fd, op, n, fails;
+	int finished;           /* the worker said it got to its end */
 	unsigned clip_gen;      /* the clipboard a move started from */
 	char dir[PATH_MAX], first[NAME_MAX + 1];
 	char out[512];
@@ -187,6 +188,8 @@ static struct xdg_toplevel *toplevel;
 static int configured;          /* the first configure has arrived */
 static int need_commit;         /* a configure waits for its commit */
 static int pend_w, pend_h;      /* size of the configure in progress */
+static int pend_bound;          /* ... which is maximized, tiled or the like */
+static int float_w = 680, float_h = 480; /* the size of its own to go back to */
 
 static struct wl_pointer *pointer;
 static struct wl_surface *ptr_surface;
@@ -388,8 +391,16 @@ static size_t u8_prev(const char *s, size_t len)
 	return last - s;
 }
 
+/* Characters that only reorder what is drawn: a name with U+202E shows
+ * "fdp.exe" as "exe.pdf". */
+static int is_bidi_control(uint32_t c)
+{
+	return c == 0x61c || c == 0x200e || c == 0x200f ||
+		(c >= 0x202a && c <= 0x202e) || (c >= 0x2066 && c <= 0x2069);
+}
+
 /* A valid UTF-8 copy of s for drawing (static buffer): Latin-1 bytes are
- * converted, C1 control bytes become U+FFFD. */
+ * converted, C1 control bytes and bidi controls become U+FFFD. */
 static const char *disp(const char *s)
 {
 	static char out[3 * PATH_MAX + 8];
@@ -397,6 +408,12 @@ static const char *disp(const char *s)
 	while (*s && o + 4 < sizeof out) {
 		uint32_t cp;
 		int n = u8_len((const unsigned char *)s, &cp);
+		if (n && is_bidi_control(cp)) {
+			memcpy(out + o, "\xef\xbf\xbd", 3);
+			o += 3;
+			s += n;
+			continue;
+		}
 		if (n) {
 			memcpy(out + o, s, n);
 			o += n;
@@ -522,10 +539,17 @@ static char *mwmrc_get(const char *key, char *val, size_t n)
 		char *p = line;
 		while (isspace((unsigned char)*p))
 			p++;
-		if (strncmp(p, "Mwm*", 4) || strncmp(p + 4, key, kl) ||
-		    p[4 + kl] != ':')
+		/* As mwc reads it: any case, "." or "*", blanks before the ":". */
+		char *colon = strchr(p, ':');
+		if (!colon)
 			continue;
-		p += 5 + kl;
+		char *ke = colon;
+		while (ke > p && isspace((unsigned char)ke[-1]))
+			ke--;
+		if (strncasecmp(p, "mwm", 3) || (p[3] != '*' && p[3] != '.') ||
+		    (size_t)(ke - (p + 4)) != kl || strncasecmp(p + 4, key, kl))
+			continue;
+		p = colon + 1;
 		while (isspace((unsigned char)*p))
 			p++;
 		char *e = p + strlen(p);
@@ -580,9 +604,16 @@ static void theme_init(void)
 	}
 	PangoFontDescription *desc =
 		pango_font_description_from_string(f && *f ? f : "Sans 10");
+	/* "Monospace" has no size, and metrics without one are all zero. */
+	if (pango_font_description_get_size(desc) <= 0)
+		pango_font_description_set_size(desc, 10 * PANGO_SCALE);
 	PangoContext *ctx = pango_font_map_create_context(
 		pango_cairo_font_map_get_default());
+	/* Left to right as a whole, or a Hebrew name shows its extension in
+	 * front of it. */
+	pango_context_set_base_dir(ctx, PANGO_DIRECTION_LTR);
 	plo = pango_layout_new(ctx);
+	pango_layout_set_auto_dir(plo, FALSE);
 	pango_layout_set_font_description(plo, desc);
 	/* A newline in a file name must not make a second line. */
 	pango_layout_set_single_paragraph_mode(plo, TRUE);
@@ -1241,6 +1272,49 @@ static int is_mount(const char *path)
 		a != b;
 }
 
+/* Is anything mounted below the directory path? -1 if that cannot be told.
+ * rm --one-file-system only compares devices, so it walks into a bind mount of
+ * the same file system and empties what that shows. */
+static int mount_below(const char *path)
+{
+	char real[PATH_MAX];
+	char *line = NULL;
+	size_t cap = 0;
+	int found = 0;
+	if (!realpath(path, real))
+		return -1;
+	FILE *f = fopen("/proc/self/mountinfo", "r");
+	if (!f)
+		return -1;
+	size_t n = strlen(real);
+	while (!found && getline(&line, &cap, f) > 0) {
+		/* The mount point is the fifth field, with blanks and the like
+		 * as \ooo. */
+		char *m = line;
+		for (int i = 0; i < 4 && m; i++)
+			if ((m = strchr(m, ' ')))
+				m++;
+		if (!m)
+			continue;
+		char *o = m;
+		for (const char *r = m; *r && *r != ' ' && *r != '\n'; r++) {
+			if (r[0] == '\\' && r[1] >= '0' && r[1] <= '3' && r[2] &&
+			    r[3]) {
+				*o++ = (r[1] - '0') << 6 | (r[2] - '0') << 3 |
+					(r[3] - '0');
+				r += 3;
+			} else {
+				*o++ = *r;
+			}
+		}
+		*o = 0;
+		found = !strncmp(m, real, n) && m[n] == '/';
+	}
+	free(line);
+	fclose(f);
+	return found;
+}
+
 static int same_dir(const char *a, const char *b)
 {
 	struct stat x, y;
@@ -1345,6 +1419,29 @@ static int place(const char *from, const char *dir, const char *name,
 	}
 	errno = EEXIST;
 	return -1;
+}
+
+/* place() for what may be a directory without write permission for its owner:
+ * cp -a keeps that, and renaming a directory to another parent has to update its
+ * "..". It gets its mode back in either case. */
+static int place_any(const char *from, const char *dir, const char *name,
+	int isdir, int move, char *out)
+{
+	struct stat st;
+	int unlock = isdir && lstat(from, &st) == 0 && S_ISDIR(st.st_mode) &&
+		!(st.st_mode & S_IWUSR);
+	if (unlock && chmod(from, (st.st_mode & 07777) | S_IWUSR) < 0)
+		unlock = 0;
+	int r = place(from, dir, name, isdir, move, out), e = errno;
+	if (unlock) {
+		char to[PATH_MAX];
+		const char *now = from;
+		if (r == 0 && join(to, dir, out) == 0)
+			now = to;
+		chmod(now, st.st_mode & 07777);
+	}
+	errno = e;
+	return r;
 }
 
 /* ---- trash (freedesktop.org Trash specification) ------------------------ */
@@ -1633,13 +1730,13 @@ static void report(int out, const char *fmt, ...)
 	dprintf(out, "%s\n", b);
 }
 
-/* Run cp, mv or rm (looked up once) with up to four arguments. */
+/* Run cp, mv, rm or chmod (looked up once) with up to four arguments. */
 static int tool(int which, const char *a1, const char *a2, const char *a3,
 	const char *a4, char *msg, size_t msz)
 {
-	static const char *const names[] = { "cp", "mv", "rm" };
-	static char path[3][PATH_MAX];
-	static int err[3] = { -1, -1, -1 };
+	static const char *const names[] = { "cp", "mv", "rm", "chmod" };
+	static char path[4][PATH_MAX];
+	static int err[4] = { -1, -1, -1, -1 };
 	if (err[which] < 0)
 		err[which] = find_prog(names[which], path[which]);
 	if (err[which]) {
@@ -1659,7 +1756,8 @@ static int tool(int which, const char *a1, const char *a2, const char *a3,
  * into place from there, so a partial copy never shows under the real name
  * and the final name is picked only when it is used: nothing is ever
  * overwritten, not even on a case-insensitive file system. Delete is
- * rm -rf, which neither enters nor removes other mounts.
+ * rm -rf, after making sure there is no mount in the way. A NUL byte at the end
+ * tells mfm that the job ran to its end.
  */
 static void worker(int op, const char *sdir, char **names, int n,
 	const char *ddir, int out)
@@ -1677,21 +1775,38 @@ static void worker(int op, const char *sdir, char **names, int n,
 			continue;
 		}
 		int isdir = S_ISDIR(st.st_mode);
+		if (isdir && op != OP_COPY && is_mount(src)) {
+			report(out, "%s is a mount point, not %s", nm, op_ed[op]);
+			continue;
+		}
 		if (op == OP_DELETE) {
-			if (isdir && is_mount(src))
-				report(out, "%s is a mount point, not deleted",
+			int below = isdir ? mount_below(src) : 0;
+			if (below > 0)
+				report(out, "%s has a mount point in it, not deleted",
 					nm);
+			else if (below < 0)
+				report(out, "%s: cannot check for mount points: %s",
+					nm, strerror(errno));
 			else if (tool(2, "-rf", "--one-file-system", "--", src,
 			    msg, sizeof msg) < 0)
 				report(out, "%s", msg);
 			continue;
 		}
 		if (op == OP_MOVE) {
-			if (place(src, ddir, nm, isdir, 1, final) == 0)
+			if (place_any(src, ddir, nm, isdir, 1, final) == 0)
 				continue;
 			/* EINVAL: into itself, which paste() rules out */
 			if (errno != EXDEV) {
 				report(out, "%s: %s", nm, strerror(errno));
+				continue;
+			}
+			/* mv's removal after the copy would empty what is mounted. */
+			int below = isdir ? mount_below(src) : 0;
+			if (below != 0) {
+				report(out, below > 0 ?
+					"%s has a mount point in it, not moved" :
+					"%s: cannot check for mount points, not moved",
+					nm);
 				continue;
 			}
 		}
@@ -1703,26 +1818,40 @@ static void worker(int op, const char *sdir, char **names, int n,
 		int ok = op == OP_COPY ?
 			tool(0, "-a", "--", src, t, msg, sizeof msg) == 0 :
 			tool(1, "--", src, t, NULL, msg, sizeof msg) == 0;
-		/* A failed mv may have removed part of the source already:
-		 * whatever arrived is kept. A failed copy is cleaned up. */
-		if (op == OP_MOVE && !ok && lstat(t, &st) < 0) {
-			report(out, "%s", msg);
-			rmdir(tmp);
+		/* A failed mv may have removed part of the source already, so
+		 * whatever arrived is kept, but not under the real name: it may
+		 * be half a file. A failed copy is cleaned up, also from the
+		 * read-only directories cp -a made. */
+		if (op == OP_MOVE && !ok) {
+			if (lstat(t, &st) < 0) {
+				report(out, "%s", msg);
+				rmdir(tmp);
+			} else {
+				report(out, "%s (what arrived is in %s)", msg,
+					strrchr(tmp, '/') + 1);
+			}
 			continue;
 		}
 		if (op == OP_COPY && !ok) {
-			report(out, "%s", msg);
-			tool(2, "-rf", "--", tmp, NULL, msg, sizeof msg);
+			char why[sizeof msg];
+			snprintf(why, sizeof why, "%s", msg);
+			tool(3, "-R", "u+w", "--", tmp, msg, sizeof msg);
+			if (tool(2, "-rf", "--", tmp, NULL, msg, sizeof msg) < 0)
+				report(out, "%s (the rest is in %s)", why,
+					strrchr(tmp, '/') + 1);
+			else
+				report(out, "%s", why);
 			continue;
 		}
-		if (place(t, ddir, nm, isdir, op == OP_MOVE, final) < 0) {
+		if (place_any(t, ddir, nm, isdir, op == OP_MOVE, final) < 0) {
 			report(out, "%s: %s (left in %s)", nm, strerror(errno),
 				strrchr(tmp, '/') + 1);
 			continue;
 		}
 		rmdir(tmp);
-		if (!ok)
-			report(out, "%s (moved only partly)", msg);
+	}
+	if (write(out, "", 1) < 0) {
+		/* mfm has quit: nobody to tell */
 	}
 	_exit(0);
 }
@@ -1767,6 +1896,7 @@ static void start_job(int op, const char *sdir, char **names, int n,
 	job.op = op;
 	job.n = n;
 	job.fails = 0;
+	job.finished = 0;
 	job.outlen = 0;
 	job.clip_gen = clip_gen;
 	snprintf(job.dir, sizeof job.dir, "%s", ddir);
@@ -1802,12 +1932,16 @@ static void job_done(void)
 	job.out[strcspn(job.out, "\n")] = 0;
 	/* A move that worked used up the clipboard, unless it was replaced
 	 * in the meantime. */
-	if (job.op == OP_MOVE && !job.fails && job.clip_gen == clip_gen)
+	if (job.op == OP_MOVE && job.finished && !job.fails &&
+	    job.clip_gen == clip_gen)
 		clip_clear();
 	if (reload() == 0 && job.first[0] && !strcmp(cwd, job.dir))
 		select_name(job.first);
 	int ok = job.n - job.fails;
-	if (job.fails)
+	if (!job.finished)
+		set_status(1, "%s stopped unexpectedly, the result may be "
+			"incomplete", op_ing[job.op]);
+	else if (job.fails)
 		set_status(1, "%d of %d failed: %s", job.fails, job.n, job.out);
 	else
 		set_status(0, "%s %d item%s%s", op_ed[job.op], ok,
@@ -1830,6 +1964,10 @@ static void job_poll(void)
 			return;
 		}
 		for (ssize_t i = 0; i < r; i++) {
+			if (!b[i]) {
+				job.finished = 1;
+				continue;
+			}
 			if (job.outlen < sizeof job.out - 1)
 				job.out[job.outlen++] = b[i];
 			job.fails += b[i] == '\n';
@@ -2067,6 +2205,8 @@ static void move_sel(int d)
 	dirty = 1;
 }
 
+static char climb_failed[PATH_MAX];
+
 /* cwd vanished or became unreadable: go to the nearest listable ancestor. */
 static void climb(void)
 {
@@ -2083,6 +2223,7 @@ static void climb(void)
 		}
 	}
 	/* Nothing can be listed. Don't retry until the directory changes. */
+	snprintf(climb_failed, sizeof climb_failed, "%s", cwd);
 	if (stat(cwd, &st) == 0)
 		cwd_mtime = st.st_mtim;
 	cwd_unsure = 0;
@@ -2093,12 +2234,15 @@ static void climb(void)
 static int gone(int e)
 {
 	return e == ENOENT || e == ENOTDIR || e == EACCES || e == EPERM ||
-		e == ELOOP;
+		e == ELOOP || e == ENOTCONN || e == ESTALE;
 }
 
 static void poll_dir(void)
 {
 	struct stat st;
+	/* Nothing above could be listed either: climb() stays put, and would
+	 * try that again every second. */
+	int stuck = !strcmp(cwd, climb_failed);
 	if (stat(cwd, &st) != 0) {
 		if (gone(errno))
 			climb();
@@ -2106,6 +2250,12 @@ static void poll_dir(void)
 	}
 	if (!S_ISDIR(st.st_mode)) {
 		climb();
+		return;
+	}
+	/* chmod does not change the mtime that is checked below. */
+	if (access(cwd, R_OK | X_OK) != 0) {
+		if (gone(errno) && !stuck)
+			climb();
 		return;
 	}
 	if (!cwd_unsure && st.st_mtim.tv_sec == cwd_mtime.tv_sec &&
@@ -2581,16 +2731,36 @@ static void draw_input(struct rect r, const char *b, size_t cur,
 		end = start + fit_prefix(d + start, n - start,
 			maxw - (x - r.x) - ew);
 	}
-	int wsel = textw(d + start, dc - start);
-	if (selected && dc > start)
-		fill(px_sel, x, r.y + 2, wsel, r.h - 4);
-	text(selected ? xc_sel : xc_fg, x, r.y, r.h, d + start, dc - start);
-	if (end > dc)
-		text(xc_fg, x + wsel, r.y, r.h, d + dc, end - dc);
+	/* One layout for all that shows: cut at the cursor, right-to-left text
+	 * would come apart. */
+	int seg = end - start, c = dc - start;
+	PangoRectangle at;
+	pango_layout_set_text(plo, d + start, seg);
+	pango_layout_get_cursor_pos(plo, c, &at, NULL);
+	if (selected && c > 0) {
+		int *ranges, nr;
+		pango_layout_line_get_x_ranges(pango_layout_get_line_readonly(plo, 0),
+			0, c, &ranges, &nr);
+		for (int i = 0; i < nr; i++)
+			fill(px_sel, x + PANGO_PIXELS(ranges[2 * i]), r.y + 2,
+				PANGO_PIXELS(ranges[2 * i + 1] - ranges[2 * i]),
+				r.h - 4);
+		g_free(ranges);
+		PangoAttrList *attrs = pango_attr_list_new();
+		PangoAttribute *fg = pango_attr_foreground_new(
+			((xc_sel >> 16) & 0xff) * 257, ((xc_sel >> 8) & 0xff) * 257,
+			(xc_sel & 0xff) * 257);
+		fg->start_index = 0;
+		fg->end_index = c;
+		pango_attr_list_insert(attrs, fg);
+		pango_layout_set_attributes(plo, attrs);
+		pango_attr_list_unref(attrs);
+	}
+	text(xc_fg, x, r.y, r.h, d + start, seg);
+	pango_layout_set_attributes(plo, NULL);
 	if (end < n)
-		text(xc_fg, x + textw(d + start, end - start), r.y, r.h,
-			"...", 3);
-	fill(px_fg, x + wsel, r.y + 3, 1, r.h - 6);
+		text(xc_fg, x + textw(d + start, seg), r.y, r.h, "...", 3);
+	fill(px_fg, x + PANGO_PIXELS(at.x), r.y + 3, 1, r.h - 6);
 }
 
 static void draw_icon(int x, int y, const struct ent *e)
@@ -3423,6 +3593,35 @@ static unsigned current_state(void)
 	return s;
 }
 
+/* A held key moves and types, but runs no command again: Delete would empty
+ * the folder into the trash, Return would open a file 25 times a second. */
+static int key_repeats(uint32_t kc)
+{
+	xkb_keysym_t ks = xkb_state_key_get_one_sym(kb_state, kc);
+	unsigned state = current_state();
+	if (pend)
+		return 0;
+	switch (ks) {
+	case XKB_KEY_Up: case XKB_KEY_KP_Up:
+	case XKB_KEY_Down: case XKB_KEY_KP_Down:
+		return !(state & (MOD_CTRL | MOD_ALT));
+	}
+	if (menu_on || (state & (MOD_CTRL | MOD_ALT)))
+		return 0;
+	switch (ks) {
+	case XKB_KEY_Prior: case XKB_KEY_KP_Prior:
+	case XKB_KEY_Next: case XKB_KEY_KP_Next:
+	case XKB_KEY_Left: case XKB_KEY_KP_Left:
+	case XKB_KEY_Right: case XKB_KEY_KP_Right:
+	case XKB_KEY_BackSpace:
+		return 1;
+	case XKB_KEY_Delete: case XKB_KEY_KP_Delete:
+		return editing || prompt;
+	}
+	uint32_t c = xkb_keysym_to_utf32(ks);
+	return c >= 0x20 && c != 0x7f;
+}
+
 /* One key press or repeat, with kc an xkb keycode. Compose and dead keys come
  * from xkbcommon; a key that is only part of a sequence does nothing else. */
 static void key_press(uint32_t kc)
@@ -3491,6 +3690,12 @@ static void kb_leave(void *data, struct wl_keyboard *k, uint32_t serial,
 	repeat_kc = 0;
 	if (compose)
 		xkb_compose_state_reset(compose);
+	/* What is held now is unknown, and a click can come before the next
+	 * enter, which brings the real state. */
+	if (kb_state)
+		xkb_state_update_mask(kb_state, 0, 0, 0, 0, 0,
+			xkb_state_serialize_layout(kb_state,
+				XKB_STATE_LAYOUT_EFFECTIVE));
 }
 
 static void kb_key(void *data, struct wl_keyboard *k, uint32_t serial,
@@ -3504,9 +3709,12 @@ static void kb_key(void *data, struct wl_keyboard *k, uint32_t serial,
 			repeat_kc = 0;
 		return;
 	}
-	repeat_kc = 0;
+	/* A modifier does not stop a key that is repeating. */
+	int repeats = xkb_keymap_key_repeats(kb_map, kc);
+	if (repeats)
+		repeat_kc = 0;
 	key_press(kc);
-	if (repeat_rate > 0 && xkb_keymap_key_repeats(kb_map, kc)) {
+	if (repeats && repeat_rate > 0 && key_repeats(kc)) {
 		repeat_kc = kc;
 		repeat_next = now_ms() + repeat_delay;
 	}
@@ -3582,6 +3790,8 @@ static void ptr_leave(void *data, struct wl_pointer *p, uint32_t serial,
 	ptr_surface = NULL;
 	btn_mask = 0;
 	dragging = 0;
+	if (menu_on)            /* or Return would run what it left */
+		menu_motion(-1, -1);
 	if (up_pressed) {
 		up_pressed = 0;
 		dirty = 1;
@@ -3766,10 +3976,15 @@ static void main_xdg_configure(void *data, struct xdg_surface *s,
 	uint32_t serial)
 {
 	xdg_surface_ack_configure(s, serial);
-	if (pend_w > 0 && pend_h > 0 && (pend_w != W || pend_h != H)) {
-		W = pend_w;
-		H = pend_h;
+	int w = pend_w > 0 ? pend_w : float_w, h = pend_h > 0 ? pend_h : float_h;
+	if (w != W || h != H) {
+		W = w;
+		H = h;
 		on_resize();
+	}
+	if (!pend_bound) {
+		float_w = W;
+		float_h = H;
 	}
 	configured = 1;
 	need_commit = 1;
@@ -3780,12 +3995,18 @@ static const struct xdg_surface_listener main_xdg_listener = {
 	main_xdg_configure,
 };
 
-/* 0 by 0 leaves the size to us. */
+/* 0 leaves the size to us, which after maximizing is the size from before. */
 static void top_configure(void *data, struct xdg_toplevel *t, int32_t w,
 	int32_t h, struct wl_array *states)
 {
+	uint32_t *st;
 	pend_w = w;
 	pend_h = h;
+	pend_bound = 0;
+	wl_array_for_each(st, states)
+		if (*st != XDG_TOPLEVEL_STATE_ACTIVATED &&
+		    *st != XDG_TOPLEVEL_STATE_RESIZING)
+			pend_bound = 1;
 }
 
 static void top_close(void *data, struct xdg_toplevel *t)
@@ -3967,7 +4188,11 @@ int main(int argc, char **argv)
 			dirty = 1;
 		}
 		if (repeat_kc && now >= repeat_next) {
-			key_press(repeat_kc);
+			/* The key may mean something else by now. */
+			if (key_repeats(repeat_kc))
+				key_press(repeat_kc);
+			else
+				repeat_kc = 0;
 			repeat_next = now_ms() + MAX(1000 / MAX(repeat_rate, 1), 1);
 		}
 		/* A frame at a time, except that a configure wants its commit
