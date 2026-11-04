@@ -105,7 +105,8 @@ Groß-/Kleinschreibung auf FAT-Laufwerken), heißt die Kopie
 selben Ordner ein Duplikat. Einen Ordner in sich selbst zu kopieren oder
 zu verschieben lehnt mfm ab. Auch Umbenennen überschreibt nichts; ist der
 neue Name vergeben, meldet mfm das. (Einzige Lücke: Dateisysteme ohne
-atomares „umbenennen ohne zu ersetzen“, z. B. NFS, bei Ordnern.)
+atomares „umbenennen ohne zu ersetzen“, z. B. NFS, bei Ordnern, und bei
+Dateien, wenn sie auch keine Hardlinks können.)
 
 Scheitert ein Verschieben über Dateisystemgrenzen, z. B. weil das Ziel voll
 ist, bleibt das Angekommene im versteckten `.mfm-XXXXXX`, und die Statuszeile

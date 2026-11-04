@@ -433,6 +433,13 @@ static const char *disp(const char *s)
 	return out;
 }
 
+static int is_combining(uint32_t c)
+{
+	return (c >= 0x300 && c <= 0x36f) || (c >= 0x1ab0 && c <= 0x1aff) ||
+		(c >= 0x1dc0 && c <= 0x1dff) || (c >= 0x20d0 && c <= 0x20ff) ||
+		(c >= 0xfe20 && c <= 0xfe2f);
+}
+
 /* Lower case for type-ahead. towlower() only knows non-ASCII letters in a
  * UTF-8 locale, so the common European ranges are folded by hand too. */
 static uint32_t fold(uint32_t c)
@@ -1810,9 +1817,13 @@ static void worker(int op, const char *sdir, char **names, int n,
 				continue;
 			}
 		}
-		if (join(tmp, ddir, ".mfm-XXXXXX") < 0 || !mkdtemp(tmp) ||
-		    join(t, tmp, nm) < 0) {
+		if (join(tmp, ddir, ".mfm-XXXXXX") < 0 || !mkdtemp(tmp)) {
 			report(out, "%s: %s", nm, strerror(errno));
+			continue;
+		}
+		if (join(t, tmp, nm) < 0) {
+			report(out, "%s: %s", nm, strerror(errno));
+			rmdir(tmp);
 			continue;
 		}
 		int ok = op == OP_COPY ?
@@ -2312,14 +2323,21 @@ static int line_key(char *b, size_t sz, size_t *cur, int *fresh, int sel,
 		return 1;
 	case XKB_KEY_Escape:
 		return -1;
+	/* The cursor stays out of a letter and its combining marks. */
 	case XKB_KEY_Left: case XKB_KEY_KP_Left:
-		if (c)
+		while (c) {
 			c = u8_prev(b, c);
+			p = b + c;
+			if (!is_combining(u8_next(&p)))
+				break;
+		}
 		break;
 	case XKB_KEY_Right: case XKB_KEY_KP_Right:
 		if (c < len) {
 			p = b + c;
 			u8_next(&p);
+			for (const char *q = p; *q && is_combining(u8_next(&q));)
+				p = q;
 			c = p - b;
 		}
 		break;
@@ -2447,6 +2465,8 @@ static int listed(const char *dir, const char *name)
 	return found;
 }
 
+static int rename_lost;         /* the status line says where the file went */
+
 /* Rename p to q in cwd by way of a temporary name. */
 static int rename_via_tmp(const char *p, const char *q)
 {
@@ -2468,8 +2488,12 @@ static int rename_via_tmp(const char *p, const char *q)
 	if (rename_new(t, q) == 0)
 		return 0;
 	int e = errno;
-	if (rename(t, p) < 0)   /* put it back; failing that, say where */
+	/* Put it back, which must not replace what came up under the old name
+	 * meanwhile. Failing that, say where it is. */
+	if (rename_new(t, p) < 0) {
+		rename_lost = 1;
 		set_status(1, "%s is now %s", strrchr(p, '/') + 1, nm);
+	}
 	errno = e;
 	return -1;
 }
@@ -2554,7 +2578,9 @@ static void prompt_commit(void)
 		r = rename_new(p, q);
 	}
 	if (r < 0) {
-		set_status(1, "cannot rename %s: %s", pold, strerror(errno));
+		if (!rename_lost)
+			set_status(1, "cannot rename %s: %s", pold, strerror(errno));
+		rename_lost = 0;
 		return;
 	}
 	reload();

@@ -261,6 +261,19 @@ kill -0 "$MFM_PID" 2>/dev/null || fail "mfm died on odd names"
 echo "ok: odd names"
 mfm_quit
 
+# The cursor does not stop between a letter and its accent: F2 puts it behind the
+# stem, Left in front of the e with its accent, so Backspace takes the f.
+fresh_dir comb
+touch "$D/$(printf 'cafe\xcc\x81.txt')"
+mfm_start "$D"
+do_input key Down
+do_input key F2
+do_input key Left
+do_input key BackSpace
+do_input key Return
+file_appears "Left steps over a combining accent" "$D/$(printf 'cae\xcc\x81.txt')"
+mfm_quit
+
 # ---- settings --------------------------------------------------------------
 
 # A font name without a size has no metrics of its own: find_rows checks the height.
