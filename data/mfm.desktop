@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=mfm
+Comment=Minimal file manager in the Motif look
+Exec=mfm %f
+Icon=system-file-manager
+Terminal=false
+Categories=System;FileManager;

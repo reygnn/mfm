@@ -1,10 +1,11 @@
 /*
- * mfm - a minimal file manager for X11, in the Motif look of mwm
- * (https://github.com/reygnn/mwm-x11).
+ * mfm - a minimal file manager for Wayland, in the Motif look of mwc
+ * (https://github.com/reygnn/mwc). The X11 version is mfm-x11.
  *
- * Plain Xlib + Xft, one file, no toolkit. It reads the same colours as mwm:
- * MWM_INACTIVE / MWM_ACTIVE from the environment, else Mwm*background and
- * Mwm*activeBackground from ~/.config/mwm/mwmrc, else the Motif defaults.
+ * libwayland, Pango and Cairo, one file, no toolkit. It reads the same
+ * colours as mwc: MWC_INACTIVE / MWC_ACTIVE from the environment, else
+ * Mwm*background and Mwm*activeBackground from ~/.config/mwc/mwmrc, else the
+ * Motif defaults.
  *
  * Keys:   Up/Down/PgUp/PgDn/Home/End  move      Return / Right  open
  *         Backspace / Left / Alt+Up   parent    Alt+Home        home dir
@@ -31,35 +32,42 @@
  * symlinked directory, ".." leads back to where the link is.
  *
  * Files open with $MFM_OPEN (default xdg-open); the terminal is
- * $MFM_TERMINAL, else $MWM_TERMINAL, else the first one found of xterm,
- * uxterm, x-terminal-emulator, ... Both commands are split at blanks
+ * $MFM_TERMINAL, else $MWC_TERMINAL, else the first one found of foot,
+ * xterm, uxterm, x-terminal-emulator, ... Both commands are split at blanks
  * (quotes group words; no other shell syntax), and the program is looked
  * up in $PATH, never in the directory being browsed.
  */
 #define _GNU_SOURCE
-#include <X11/Xlib.h>
-#include <X11/Xatom.h>
-#include <X11/Xutil.h>
-#include <X11/keysym.h>
-#include <X11/Xft/Xft.h>
+#include <cairo.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/input-event-codes.h>
 #include <locale.h>
+#include <pango/pangocairo.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
+#include <strings.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <wayland-client.h>
+#include <wayland-cursor.h>
 #include <wctype.h>
+#include <xkbcommon/xkbcommon-compose.h>
+#include <xkbcommon/xkbcommon.h>
+
+#include "xdg-decoration-unstable-v1-client-protocol.h"
+#include "xdg-shell-client-protocol.h"
 
 #define BEV 2           /* bevel width, as in mwm */
 #define PAD 6
@@ -68,8 +76,10 @@
 #define TYPEAHEAD_MS 1000
 #define POLL_MS 1000
 #define MENU_CLICK_MS 300       /* a quicker click leaves the menu open */
+#ifndef MAX            /* glib has them too */
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
+#endif
 
 struct ent {
 	char *name;
@@ -107,7 +117,7 @@ static int prompt, pfresh;
 static char pbuf[NAME_MAX + 1], pold[NAME_MAX + 1], pdir[PATH_MAX];
 static size_t pcur;
 static int up_pressed, dragging, drag_off;
-static Time last_click;
+static uint32_t last_click;
 static int last_idx = -1;
 static int dirty = 1;
 
@@ -134,30 +144,75 @@ static struct {
 	size_t outlen;
 } job = { .fd = -1 };
 
-/* ---- X ------------------------------------------------------------------ */
+/* ---- Wayland ------------------------------------------------------------ */
 
-static const long EVENT_MASK = ExposureMask | KeyPressMask | ButtonPressMask |
-	ButtonReleaseMask | Button1MotionMask | StructureNotifyMask |
-	FocusChangeMask;
+/* One wl_shm buffer with a Cairo context on it. */
+struct shmbuf {
+	struct wl_buffer *wl;
+	cairo_surface_t *cs;
+	cairo_t *cr;
+	void *data;
+	size_t size;
+	int w, h;
+	int busy;       /* the compositor still reads it */
+	int stale;      /* wrong size: free it as soon as it is released */
+};
 
-static Display *dpy;
-static int scr, depth;
-static Window root, win;
-static Visual *vis;
-static Colormap cmap;
-static GC gc;
-static Pixmap buf;
-static XftDraw *xd;
-static XftFont *font;
-static XIM xim;
-static XIC xic;
-static int focused;
+struct wsurf {
+	struct wl_surface *wl;
+	struct wl_callback *frame;      /* a frame is on its way */
+	struct shmbuf *b[2];
+};
+
+/* Modifiers and held buttons, in the state of a pointer event. */
+enum { MOD_SHIFT = 1, MOD_CTRL = 2, MOD_ALT = 4, BTN1_HELD = 8, BTN2_HELD = 16 };
+enum { B_LEFT = 1, B_MIDDLE = 2, B_RIGHT = 3, B_WHEEL_UP = 4, B_WHEEL_DOWN = 5,
+	B_BACK = 8 };
+
+struct pev {
+	int button, x, y;
+	uint32_t serial, time;
+	unsigned state;
+};
+
+static struct wl_display *dpy;
+static struct wl_compositor *compositor;
+static struct wl_shm *shm;
+static struct wl_seat *seat;
+static struct xdg_wm_base *wm_base;
+static struct zxdg_decoration_manager_v1 *deco_mgr;
+static struct wsurf main_s;
+static struct xdg_surface *main_xdg;
+static struct xdg_toplevel *toplevel;
+static int configured;          /* the first configure has arrived */
+static int need_commit;         /* a configure waits for its commit */
+static int pend_w, pend_h;      /* size of the configure in progress */
+
+static struct wl_pointer *pointer;
+static struct wl_surface *ptr_surface;
+static int ptr_x, ptr_y;
+static unsigned btn_mask;
+static double axis_acc;
+static int axis_steps;
+static struct wl_surface *cursor_surf;
+static struct wl_cursor_image *cursor_img;
+
+static struct wl_keyboard *keyboard;
+static struct xkb_context *xkb;
+static struct xkb_keymap *kb_map;
+static struct xkb_state *kb_state;
+static struct xkb_compose_state *compose;
+static uint32_t repeat_kc;      /* xkb keycode of the repeating key, or 0 */
+static uint64_t repeat_next;
+static int repeat_rate = 25, repeat_delay = 600;
+
 static int W = 680, H = 480;
-static Atom a_protocols, a_delete, a_ping, a_name, a_icon_name, a_utf8,
-	a_icon, a_pid;
-static unsigned long px_bg, px_top, px_bot, px_list, px_sel, px_trough,
+static uint32_t px_bg, px_top, px_bot, px_list, px_sel, px_trough,
 	px_fg, px_folder, px_paper, px_mark;
-static XftColor xc_fg, xc_sel, xc_dim, xc_err;
+static uint32_t xc_fg, xc_sel, xc_dim, xc_err;
+static cairo_t *cr;             /* what fill, bevel and text draw on */
+static PangoLayout *plo;
+static int font_asc, font_desc;
 static int rowh, barh;
 static struct rect r_up, r_path, r_list, r_sb, r_status;
 
@@ -166,6 +221,114 @@ static uint64_t now_ms(void)
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* ---- buffers ------------------------------------------------------------ */
+
+static void buf_free(struct shmbuf *b)
+{
+	cairo_destroy(b->cr);
+	cairo_surface_destroy(b->cs);
+	wl_buffer_destroy(b->wl);
+	munmap(b->data, b->size);
+	free(b);
+}
+
+static void buf_release(void *data, struct wl_buffer *wl)
+{
+	struct shmbuf *b = data;
+	b->busy = 0;
+	if (b->stale)
+		buf_free(b);
+}
+
+static const struct wl_buffer_listener buf_listener = { buf_release };
+
+static struct shmbuf *buf_new(int w, int h)
+{
+	int stride = cairo_format_stride_for_width(CAIRO_FORMAT_RGB24, w);
+	size_t size = (size_t)stride * h;
+	struct shmbuf *b = calloc(1, sizeof *b);
+	int fd = memfd_create("mfm", MFD_CLOEXEC);
+	void *data = MAP_FAILED;
+	if (b && fd >= 0 && ftruncate(fd, size) == 0)
+		data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (data == MAP_FAILED) {
+		fprintf(stderr, "mfm: no memory for a %dx%d buffer: %s\n", w, h,
+			strerror(errno));
+		exit(1);
+	}
+	struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, size);
+	b->wl = wl_shm_pool_create_buffer(pool, 0, w, h, stride,
+		WL_SHM_FORMAT_XRGB8888);
+	wl_shm_pool_destroy(pool);
+	close(fd);
+	wl_buffer_add_listener(b->wl, &buf_listener, b);
+	b->data = data;
+	b->size = size;
+	b->w = w;
+	b->h = h;
+	b->cs = cairo_image_surface_create_for_data(data, CAIRO_FORMAT_RGB24, w, h,
+		stride);
+	b->cr = cairo_create(b->cs);
+	cairo_set_antialias(b->cr, CAIRO_ANTIALIAS_NONE);       /* not the text */
+	return b;
+}
+
+/* A buffer of this size to draw on, or NULL while the compositor holds both;
+ * its release wakes the main loop. */
+static struct shmbuf *wsurf_buffer(struct wsurf *s, int w, int h)
+{
+	for (int i = 0; i < 2; i++) {
+		struct shmbuf *b = s->b[i];
+		if (!b || (b->w == w && b->h == h))
+			continue;
+		if (b->busy)
+			b->stale = 1;
+		else
+			buf_free(b);
+		s->b[i] = NULL;
+	}
+	for (int i = 0; i < 2; i++)
+		if (s->b[i] && !s->b[i]->busy)
+			return s->b[i];
+	for (int i = 0; i < 2; i++)
+		if (!s->b[i])
+			return s->b[i] = buf_new(w, h);
+	return NULL;
+}
+
+static void frame_done(void *data, struct wl_callback *cb, uint32_t time)
+{
+	struct wsurf *s = data;
+	wl_callback_destroy(cb);
+	s->frame = NULL;
+}
+
+static const struct wl_callback_listener frame_listener = { frame_done };
+
+static void wsurf_present(struct wsurf *s, struct shmbuf *b)
+{
+	cairo_surface_flush(b->cs);
+	if (s->frame)
+		wl_callback_destroy(s->frame);
+	s->frame = wl_surface_frame(s->wl);
+	wl_callback_add_listener(s->frame, &frame_listener, s);
+	wl_surface_attach(s->wl, b->wl, 0, 0);
+	wl_surface_damage_buffer(s->wl, 0, 0, b->w, b->h);
+	wl_surface_commit(s->wl);
+	b->busy = 1;
+}
+
+static void wsurf_destroy(struct wsurf *s)
+{
+	if (s->frame)
+		wl_callback_destroy(s->frame);
+	wl_surface_destroy(s->wl);
+	for (int i = 0; i < 2; i++)
+		if (s->b[i])
+			buf_free(s->b[i]);
+	memset(s, 0, sizeof *s);
 }
 
 /* ---- UTF-8 -------------------------------------------------------------- */
@@ -308,25 +471,45 @@ static uint32_t contrast(uint32_t bg)
 	return is_light(bg) ? 0x000000 : 0xffffff;
 }
 
+/* What mwc reads: "#rrggbb", names like "gold", and rgb:r/g/b with 1 to 4 hex
+ * digits per channel. */
 static int parse_color(const char *s, uint32_t *out)
 {
-	XColor c;
-	if (!s || !*s || !XParseColor(dpy, cmap, s, &c))
+	PangoColor c;
+	if (!s || !*s)
 		return 0;
-	*out = (c.red >> 8) << 16 | (c.green >> 8) << 8 | (c.blue >> 8);
+	if (!strncasecmp(s, "rgb:", 4)) {
+		uint32_t rgb = 0;
+		s += 4;
+		for (int i = 0; i < 3; i++) {
+			char *end;
+			unsigned long v = strtoul(s, &end, 16);
+			int digits = end - s;
+			if (digits < 1 || digits > 4 || *end != (i < 2 ? '/' : '\0'))
+				return 0;
+			unsigned long max = (1ul << (4 * digits)) - 1;
+			rgb = rgb << 8 | (v * 255 + max / 2) / max;
+			s = end + 1;
+		}
+		*out = rgb;
+		return 1;
+	}
+	if (!pango_color_parse(&c, s))
+		return 0;
+	*out = (uint32_t)(c.red >> 8) << 16 | (c.green >> 8) << 8 | (c.blue >> 8);
 	return 1;
 }
 
-/* Last global "Mwm*key: value" line of ~/.config/mwm/mwmrc. */
+/* Last global "Mwm*key: value" line of ~/.config/mwc/mwmrc. */
 static char *mwmrc_get(const char *key, char *val, size_t n)
 {
 	char path[PATH_MAX], line[512];
 	const char *home = getenv("HOME"), *xdg = getenv("XDG_CONFIG_HOME");
 	int len;
 	if (xdg && *xdg)
-		len = snprintf(path, sizeof path, "%s/mwm/mwmrc", xdg);
+		len = snprintf(path, sizeof path, "%s/mwc/mwmrc", xdg);
 	else
-		len = snprintf(path, sizeof path, "%s/.config/mwm/mwmrc",
+		len = snprintf(path, sizeof path, "%s/.config/mwc/mwmrc",
 			home ? home : "");
 	if (len < 0 || (size_t)len >= sizeof path)
 		return NULL;
@@ -366,63 +549,49 @@ static uint32_t setting(const char *env, const char *res, uint32_t def)
 	return def;
 }
 
-/* If the colormap is full, fall back to black or white, whichever is
- * closer, so text keeps its contrast. */
-static unsigned long pixel(uint32_t rgb)
-{
-	XColor c = {
-		.red = ((rgb >> 16) & 0xff) * 257,
-		.green = ((rgb >> 8) & 0xff) * 257,
-		.blue = (rgb & 0xff) * 257,
-		.flags = DoRed | DoGreen | DoBlue,
-	};
-	if (XAllocColor(dpy, cmap, &c))
-		return c.pixel;
-	return is_light(rgb) ? WhitePixel(dpy, scr) : BlackPixel(dpy, scr);
-}
-
-static void xftcolor(XftColor *out, uint32_t rgb)
-{
-	XRenderColor rc = { ((rgb >> 16) & 0xff) * 257,
-		((rgb >> 8) & 0xff) * 257, (rgb & 0xff) * 257, 0xffff };
-	if (!XftColorAllocValue(dpy, vis, cmap, &rc, out) &&
-	    !XftColorAllocName(dpy, vis, cmap,
-		    is_light(rgb) ? "white" : "black", out)) {
-		fprintf(stderr, "mfm: cannot allocate colours\n");
-		exit(1);
-	}
-}
-
 static void theme_init(void)
 {
-	uint32_t bg = setting("MWM_INACTIVE", "background", 0xaeb2c3);
-	uint32_t act = setting("MWM_ACTIVE", "activeBackground", 0x7387ad);
+	uint32_t bg = setting("MWC_INACTIVE", "background", 0xaeb2c3);
+	uint32_t act = setting("MWC_ACTIVE", "activeBackground", 0x7387ad);
 	uint32_t fg = contrast(bg);
 
-	px_bg = pixel(bg);
-	px_top = pixel(mix(bg, 0xffffff, 0.55f));
-	px_bot = pixel(mix(bg, 0x000000, 0.5f));
-	px_list = pixel(mix(bg, 0xffffff, 0.3f));
-	px_trough = pixel(mix(bg, 0x000000, 0.12f));
-	px_sel = pixel(act);
-	px_mark = pixel(mix(mix(bg, 0xffffff, 0.3f), act, 0.4f));
-	px_fg = pixel(fg);
-	px_folder = pixel(0xc9a85c);
-	px_paper = pixel(0xf6f6f6);
-	xftcolor(&xc_fg, fg);
-	xftcolor(&xc_sel, contrast(act));
-	xftcolor(&xc_dim, mix(bg, fg, 0.6f));
-	xftcolor(&xc_err, 0x8a0303);
+	px_bg = bg;
+	px_top = mix(bg, 0xffffff, 0.55f);
+	px_bot = mix(bg, 0x000000, 0.5f);
+	px_list = mix(bg, 0xffffff, 0.3f);
+	px_trough = mix(bg, 0x000000, 0.12f);
+	px_sel = act;
+	px_mark = mix(mix(bg, 0xffffff, 0.3f), act, 0.4f);
+	px_fg = fg;
+	px_folder = 0xc9a85c;
+	px_paper = 0xf6f6f6;
+	xc_fg = fg;
+	xc_sel = contrast(act);
+	xc_dim = mix(bg, fg, 0.6f);
+	xc_err = 0x8a0303;
 
+	/* fontconfig patterns (Sans:bold:size=10, as mfm-x11 took them) mean
+	 * nothing to Pango, which would quietly pick some other font. */
 	const char *f = getenv("MFM_FONT");
-	font = XftFontOpenName(dpy, scr, f && *f ? f : "Sans:size=10");
-	if (!font)
-		font = XftFontOpenName(dpy, scr, "fixed");
-	if (!font) {
-		fprintf(stderr, "mfm: cannot open a font\n");
-		exit(1);
+	if (f && strchr(f, ':')) {
+		fprintf(stderr, "mfm: ignoring MFM_FONT \"%s\": it takes Pango "
+			"names like \"Sans Bold 10\"\n", f);
+		f = NULL;
 	}
-	rowh = font->ascent + font->descent + 4;
+	PangoFontDescription *desc =
+		pango_font_description_from_string(f && *f ? f : "Sans 10");
+	PangoContext *ctx = pango_font_map_create_context(
+		pango_cairo_font_map_get_default());
+	plo = pango_layout_new(ctx);
+	pango_layout_set_font_description(plo, desc);
+	/* A newline in a file name must not make a second line. */
+	pango_layout_set_single_paragraph_mode(plo, TRUE);
+	PangoFontMetrics *m = pango_context_get_metrics(ctx, desc, NULL);
+	font_asc = PANGO_PIXELS_CEIL(pango_font_metrics_get_ascent(m));
+	font_desc = PANGO_PIXELS_CEIL(pango_font_metrics_get_descent(m));
+	pango_font_metrics_unref(m);
+	pango_font_description_free(desc);
+	rowh = font_asc + font_desc + 4;
 	barh = rowh + 6;
 }
 
@@ -559,30 +728,21 @@ static void free_ents(struct ent *v, int n)
 	free(v);
 }
 
-/* WM_NAME as STRING or COMPOUND_TEXT, _NET_WM_NAME as UTF8_STRING. */
-static void set_name(int icon, Atom net, const char *utf8)
-{
-	XTextProperty tp;
-	char *list[] = { (char *)utf8 };
-	if (Xutf8TextListToTextProperty(dpy, list, 1, XStdICCTextStyle,
-	    &tp) >= Success) {
-		if (icon)
-			XSetWMIconName(dpy, win, &tp);
-		else
-			XSetWMName(dpy, win, &tp);
-		XFree(tp.value);
-	}
-	XChangeProperty(dpy, win, net, a_utf8, 8, PropModeReplace,
-		(const unsigned char *)utf8, strlen(utf8));
-}
-
+/* A Wayland message must fit in 4096 bytes and a path need not, so a very
+ * long one keeps its end. */
 static void set_title(void)
 {
-	static char t[sizeof "mfm: " + 3 * PATH_MAX + 8];
-	snprintf(t, sizeof t, "mfm: %s", disp(cwd));
-	set_name(0, a_name, t);
-	const char *base = strrchr(t, '/');
-	set_name(1, a_icon_name, base && base[1] ? base + 1 : t + 5);
+	enum { MAX_TITLE = 1024 };
+	static char t[sizeof "mfm: " + MAX_TITLE];
+	const char *d = disp(cwd);
+	size_t n = strlen(d);
+	if (n > MAX_TITLE) {
+		d += n - MAX_TITLE;
+		while ((*d & 0xc0) == 0x80)
+			d++;
+	}
+	snprintf(t, sizeof t, "mfm: %s", d);
+	xdg_toplevel_set_title(toplevel, t);
 }
 
 static int rows_vis(void)
@@ -732,7 +892,7 @@ static int load(const char *path, const char *select, int fallback)
 		}
 	top = 0;
 	show_sel();
-	if (win)
+	if (toplevel)
 		set_title();
 	if (rerr) {
 		set_status(1, "%s: listing incomplete: %s", path,
@@ -942,13 +1102,13 @@ static void open_file(const char *path)
 
 static void open_terminal(void)
 {
-	static const char *const terms[] = { "xterm", "uxterm",
+	static const char *const terms[] = { "foot", "xterm", "uxterm",
 		"x-terminal-emulator", "urxvt", "alacritty", "konsole",
 		"kitty", "xfce4-terminal", "gnome-terminal" };
 	const char *var = "MFM_TERMINAL", *t = getenv(var);
 	char p[PATH_MAX], name[256];
 	if (!t || !*t)
-		t = getenv(var = "MWM_TERMINAL");
+		t = getenv(var = "MWC_TERMINAL");
 	if (!t || !*t) {
 		t = terms[0];
 		for (size_t i = 0; i < sizeof terms / sizeof *terms; i++)
@@ -1593,7 +1753,7 @@ static void start_job(int op, const char *sdir, char **names, int n,
 		return;
 	}
 	if (pid == 0) {
-		/* Keep nothing of mfm but the pipe: holding on to the X
+		/* Keep nothing of mfm but the pipe: holding on to the Wayland
 		 * connection would keep the window up after mfm quits. */
 		if (p[1] != 3 && dup2(p[1], 3) < 0)
 			_exit(1);
@@ -1992,34 +2152,34 @@ static void typeahead(const char *txt, int n)
  * pressed on the way to "/" or "~" must not.
  */
 static int line_key(char *b, size_t sz, size_t *cur, int *fresh, int sel,
-	KeySym ks, const char *txt, int n, int ctrl)
+	xkb_keysym_t ks, const char *txt, int n, int ctrl)
 {
 	size_t len = strlen(b), c = MIN(*cur, len);
 	const char *p;
 	int cut = *fresh && sel && c > 0;       /* a selection to replace */
 	switch (ks) {
-	case XK_Return: case XK_KP_Enter:
+	case XKB_KEY_Return: case XKB_KEY_KP_Enter:
 		return 1;
-	case XK_Escape:
+	case XKB_KEY_Escape:
 		return -1;
-	case XK_Left: case XK_KP_Left:
+	case XKB_KEY_Left: case XKB_KEY_KP_Left:
 		if (c)
 			c = u8_prev(b, c);
 		break;
-	case XK_Right: case XK_KP_Right:
+	case XKB_KEY_Right: case XKB_KEY_KP_Right:
 		if (c < len) {
 			p = b + c;
 			u8_next(&p);
 			c = p - b;
 		}
 		break;
-	case XK_Home: case XK_KP_Home:
+	case XKB_KEY_Home: case XKB_KEY_KP_Home:
 		c = 0;
 		break;
-	case XK_End: case XK_KP_End:
+	case XKB_KEY_End: case XKB_KEY_KP_End:
 		c = len;
 		break;
-	case XK_BackSpace:
+	case XKB_KEY_BackSpace:
 		if (cut) {
 			memmove(b, b + c, len - c + 1);
 			c = 0;
@@ -2029,7 +2189,7 @@ static int line_key(char *b, size_t sz, size_t *cur, int *fresh, int sel,
 			c = q;
 		}
 		break;
-	case XK_Delete: case XK_KP_Delete:
+	case XKB_KEY_Delete: case XKB_KEY_KP_Delete:
 		if (cut) {
 			memmove(b, b + c, len - c + 1);
 			c = 0;
@@ -2040,7 +2200,7 @@ static int line_key(char *b, size_t sz, size_t *cur, int *fresh, int sel,
 		}
 		break;
 	default:
-		if (ctrl && ks == XK_u) {
+		if (ctrl && ks == XKB_KEY_u) {
 			b[0] = 0;
 			c = 0;
 			break;
@@ -2108,7 +2268,7 @@ static void edit_commit(void)
 	}
 }
 
-static void edit_key(KeySym ks, const char *txt, int n, int ctrl)
+static void edit_key(xkb_keysym_t ks, const char *txt, int n, int ctrl)
 {
 	int r = line_key(edit, sizeof edit, &edit_cur, &edit_fresh, 0, ks,
 		txt, n, ctrl);
@@ -2252,7 +2412,7 @@ static void prompt_commit(void)
 	set_status(0, "renamed %s to %s", pold, pbuf);
 }
 
-static void prompt_key(KeySym ks, const char *txt, int n, int ctrl)
+static void prompt_key(xkb_keysym_t ks, const char *txt, int n, int ctrl)
 {
 	int r = line_key(pbuf, sizeof pbuf, &pcur, &pfresh, 1, ks, txt, n,
 		ctrl);
@@ -2266,18 +2426,34 @@ static void prompt_key(KeySym ks, const char *txt, int n, int ctrl)
 
 /* ---- drawing ------------------------------------------------------------ */
 
-static void fill(unsigned long px, int x, int y, int w, int h)
+static void set_rgb(uint32_t c)
+{
+	cairo_set_source_rgb(cr, ((c >> 16) & 0xff) / 255.0,
+		((c >> 8) & 0xff) / 255.0, (c & 0xff) / 255.0);
+}
+
+static void fill(uint32_t px, int x, int y, int w, int h)
 {
 	if (w <= 0 || h <= 0)
 		return;
-	XSetForeground(dpy, gc, px);
-	XFillRectangle(dpy, buf, gc, x, y, w, h);
+	set_rgb(px);
+	cairo_rectangle(cr, x, y, w, h);
+	cairo_fill(cr);
+}
+
+/* The outline of a box from (x, y) to (x + w, y + h), both included. */
+static void outline(uint32_t px, int x, int y, int w, int h)
+{
+	fill(px, x, y, w + 1, 1);
+	fill(px, x, y + h, w + 1, 1);
+	fill(px, x, y, 1, h + 1);
+	fill(px, x + w, y, 1, h + 1);
 }
 
 static void bevel(struct rect r, int raised)
 {
-	unsigned long t = raised ? px_top : px_bot;
-	unsigned long b = raised ? px_bot : px_top;
+	uint32_t t = raised ? px_top : px_bot;
+	uint32_t b = raised ? px_bot : px_top;
 	for (int i = 0; i < BEV; i++) {
 		fill(t, r.x + i, r.y + i, r.w - 2 * i, 1);
 		fill(t, r.x + i, r.y + i, 1, r.h - 2 * i);
@@ -2289,52 +2465,73 @@ static void bevel(struct rect r, int raised)
 /* textw/text take valid UTF-8 only; text_fit converts with disp(). */
 static int textw(const char *s, int n)
 {
-	XGlyphInfo g;
-	XftTextExtentsUtf8(dpy, font, (const FcChar8 *)s, n, &g);
-	return g.xOff;
+	int w;
+	if (n <= 0)
+		return 0;
+	pango_layout_set_text(plo, s, n);
+	pango_layout_get_pixel_size(plo, &w, NULL);
+	return w;
 }
 
-static void text(XftColor *c, int x, int y, int h, const char *s, int n)
+static void text(uint32_t c, int x, int y, int h, const char *s, int n)
 {
-	int base = y + (h - (font->ascent + font->descent)) / 2 + font->ascent;
-	XftDrawStringUtf8(xd, c, font, x, base, (const FcChar8 *)s, n);
+	if (n <= 0)
+		return;
+	int base = y + (h - (font_asc + font_desc)) / 2 + font_asc;
+	pango_layout_set_text(plo, s, n);
+	set_rgb(c);
+	cairo_move_to(cr, x, base - pango_layout_get_baseline(plo) / PANGO_SCALE);
+	pango_cairo_show_layout(cr, plo);
+}
+
+/* A character boundary in s between lo and hi, not lo or hi themselves, near
+ * the middle; -1 if there is none. */
+static int mid_char(const char *s, int lo, int hi)
+{
+	int m = lo + (hi - lo) / 2;
+	while (m > lo && (s[m] & 0xc0) == 0x80)
+		m--;
+	if (m == lo)
+		for (m = lo + 1; m < hi && (s[m] & 0xc0) == 0x80; m++)
+			;
+	return m < hi ? m : -1;
 }
 
 /* Longest prefix of s[0..n) (in bytes, on a character boundary) that is
- * at most maxw wide. Measures only about as much text as fits: Xft
- * reports widths as 16-bit values, which a whole long path overflows. */
+ * at most maxw wide. Shaping is too slow to go through it by the character
+ * for every row. */
 static int fit_prefix(const char *s, int n, int maxw)
 {
-	int k = 0;
-	while (k < n) {
-		int next = k + 1;
-		while (next < n && (s[next] & 0xc0) == 0x80)
-			next++;
-		if (textw(s, next) > maxw)
-			break;
-		k = next;
+	if (textw(s, n) <= maxw)
+		return n;
+	int lo = 0, hi = n, m;
+	while ((m = mid_char(s, lo, hi)) >= 0) {
+		if (textw(s, m) <= maxw)
+			lo = m;
+		else
+			hi = m;
 	}
-	return k;
+	return lo;
 }
 
 /* Start of the longest suffix of s[0..n) that is at most maxw wide. */
 static int fit_suffix(const char *s, int n, int maxw)
 {
-	int j = n;
-	while (j > 0) {
-		int prev = j - 1;
-		while (prev > 0 && (s[prev] & 0xc0) == 0x80)
-			prev--;
-		if (textw(s + prev, n - prev) > maxw)
-			break;
-		j = prev;
+	if (textw(s, n) <= maxw)
+		return 0;
+	int lo = 0, hi = n, m;
+	while ((m = mid_char(s, lo, hi)) >= 0) {
+		if (textw(s + m, n - m) <= maxw)
+			hi = m;
+		else
+			lo = m;
 	}
-	return j;
+	return hi;
 }
 
 /* Draw s in at most maxw pixels, shortened with "..." at the end or front.
  * Returns the width drawn. */
-static int text_fit(XftColor *c, int x, int y, int h, int maxw,
+static int text_fit(uint32_t c, int x, int y, int h, int maxw,
 	const char *raw, int cut_front)
 {
 	const char *s = disp(raw);
@@ -2378,7 +2575,7 @@ static void draw_input(struct rect r, const char *b, size_t cur,
 	if (fit_prefix(d, n, maxw) < n) {
 		if (fit_prefix(d, dc, maxw - ew) < dc) {
 			start = fit_suffix(d, dc, maxw - 2 * ew);
-			text(&xc_fg, x, r.y, r.h, "...", 3);
+			text(xc_fg, x, r.y, r.h, "...", 3);
 			x += ew;
 		}
 		end = start + fit_prefix(d + start, n - start,
@@ -2387,11 +2584,11 @@ static void draw_input(struct rect r, const char *b, size_t cur,
 	int wsel = textw(d + start, dc - start);
 	if (selected && dc > start)
 		fill(px_sel, x, r.y + 2, wsel, r.h - 4);
-	text(selected ? &xc_sel : &xc_fg, x, r.y, r.h, d + start, dc - start);
+	text(selected ? xc_sel : xc_fg, x, r.y, r.h, d + start, dc - start);
 	if (end > dc)
-		text(&xc_fg, x + wsel, r.y, r.h, d + dc, end - dc);
+		text(xc_fg, x + wsel, r.y, r.h, d + dc, end - dc);
 	if (end < n)
-		text(&xc_fg, x + textw(d + start, end - start), r.y, r.h,
+		text(xc_fg, x + textw(d + start, end - start), r.y, r.h,
 			"...", 3);
 	fill(px_fg, x + wsel, r.y + 3, 1, r.h - 6);
 }
@@ -2402,12 +2599,10 @@ static void draw_icon(int x, int y, const struct ent *e)
 	if (e->dir) {
 		fill(px_folder, x, iy + 1, s / 2, 2);
 		fill(px_folder, x, iy + 3, s, s - 4);
-		XSetForeground(dpy, gc, px_bot);
-		XDrawRectangle(dpy, buf, gc, x, iy + 3, s - 1, s - 5);
+		outline(px_bot, x, iy + 3, s - 1, s - 5);
 	} else {
 		fill(px_paper, x + 2, iy, s - 4, s);
-		XSetForeground(dpy, gc, px_bot);
-		XDrawRectangle(dpy, buf, gc, x + 2, iy, s - 5, s - 1);
+		outline(px_bot, x + 2, iy, s - 5, s - 1);
 		if (!e->nostat && (e->mode & 0111))
 			fill(px_sel, x + 4, iy + 2, s - 8, 2);
 	}
@@ -2450,7 +2645,7 @@ static void format_date(time_t t, char *s, size_t n)
 		snprintf(s, n, "?");
 }
 
-static void draw(void)
+static void paint(void)
 {
 	char s[sizeof status_msg + 32];
 	fill(px_bg, 0, 0, W, H);
@@ -2459,10 +2654,12 @@ static void draw(void)
 	bevel(r_up, !up_pressed);
 	int cx = r_up.x + r_up.w / 2 + up_pressed, cy = r_up.y + r_up.h / 2;
 	int a = r_up.h / 4;
-	XPoint tri[3] = { { cx, cy - a }, { cx - a - 1, cy + a / 2 + 1 },
-		{ cx + a + 1, cy + a / 2 + 1 } };
-	XSetForeground(dpy, gc, px_fg);
-	XFillPolygon(dpy, buf, gc, tri, 3, Convex, CoordModeOrigin);
+	set_rgb(px_fg);
+	cairo_move_to(cr, cx, cy - a);
+	cairo_line_to(cr, cx - a - 1, cy + a / 2 + 1);
+	cairo_line_to(cr, cx + a + 1, cy + a / 2 + 1);
+	cairo_close_path(cr);
+	cairo_fill(cr);
 	fill(px_fg, cx - a / 3, cy + a / 2, 2 * (a / 3) + 1, a);
 
 	/* path field */
@@ -2474,7 +2671,7 @@ static void draw(void)
 		draw_input((struct rect){ in_p.x + 4, in_p.y, in_p.w - 8,
 			in_p.h }, edit, edit_cur, 0);
 	else
-		text_fit(&xc_fg, in_p.x + 4, in_p.y, in_p.h, in_p.w - 10, cwd,
+		text_fit(xc_fg, in_p.x + 4, in_p.y, in_p.h, in_p.w - 10, cwd,
 			1);
 
 	/* list */
@@ -2488,10 +2685,10 @@ static void draw(void)
 	for (int i = top; i < nents && i < top + vis; i++) {
 		const struct ent *e = &ents[i];
 		int y = ly + (i - top) * rowh;
-		XftColor *c = &xc_fg, *cd = &xc_dim;
+		uint32_t c = xc_fg, cd = xc_dim;
 		if (i == sel) {
 			fill(px_sel, lx + 1, y, lw - 2, rowh);
-			c = cd = &xc_sel;
+			c = cd = xc_sel;
 		} else if (e->mark) {
 			fill(px_mark, lx + 1, y, lw - 2, rowh);
 		}
@@ -2537,12 +2734,11 @@ static void draw(void)
 		const char *l = prompt == PR_RENAME ? "Rename to: " :
 			"New folder: ";
 		int lw = textw(l, strlen(l));
-		text(&xc_fg, in_s.x, in_s.y, in_s.h, l, strlen(l));
+		text(xc_fg, in_s.x, in_s.y, in_s.h, l, strlen(l));
 		fill(px_paper, in_s.x + lw, in_s.y + BEV + 1, in_s.w - lw,
 			in_s.h - 2 * BEV - 2);
 		draw_input((struct rect){ in_s.x + lw + 3, in_s.y,
 			in_s.w - lw - 3, in_s.h }, pbuf, pcur, pfresh);
-		XCopyArea(dpy, buf, win, gc, 0, 0, W, H, 0, 0);
 		return;
 	}
 	if (!pend && !status_msg[0] && !search[0] && sel < nents &&
@@ -2556,11 +2752,11 @@ static void draw(void)
 			snprintf(s, sizeof s, "%s   %s", p, sz);
 		}
 		rw = textw(s, strlen(s));
-		text(&xc_dim, in_s.x + in_s.w - rw, in_s.y, in_s.h, s,
+		text(xc_dim, in_s.x + in_s.w - rw, in_s.y, in_s.h, s,
 			strlen(s));
 		rw += 16;
 	}
-	XftColor *sc = &xc_fg;
+	uint32_t sc = xc_fg;
 	if (pend) {
 		if (npend == 1)
 			snprintf(s, sizeof s, "delete \"%s\" permanently? "
@@ -2568,11 +2764,11 @@ static void draw(void)
 		else
 			snprintf(s, sizeof s, "delete %d items permanently? "
 				"(y/n)", npend);
-		sc = &xc_err;
+		sc = xc_err;
 	} else if (status_msg[0]) {
 		snprintf(s, sizeof s, "%s", status_msg);
 		if (status_err)
-			sc = &xc_err;
+			sc = xc_err;
 	} else if (search[0]) {
 		snprintf(s, sizeof s, "Find: %s", search);
 	} else {
@@ -2591,19 +2787,23 @@ static void draw(void)
 				op_ing[job.op]);
 	}
 	text_fit(sc, in_s.x, in_s.y, in_s.h, in_s.w - rw, s, 0);
-
-	XCopyArea(dpy, buf, win, gc, 0, 0, W, H, 0, 0);
 }
 
-static void resize_buffer(void)
+/* 0 if the compositor holds both buffers: try again after a release. */
+static int draw(void)
+{
+	struct shmbuf *b = wsurf_buffer(&main_s, W, H);
+	if (!b)
+		return 0;
+	cr = b->cr;
+	paint();
+	wsurf_present(&main_s, b);
+	return 1;
+}
+
+static void on_resize(void)
 {
 	int was = sel_visible();
-	if (xd)
-		XftDrawDestroy(xd);
-	if (buf)
-		XFreePixmap(dpy, buf);
-	buf = XCreatePixmap(dpy, win, W, H, depth);
-	xd = XftDrawCreate(dpy, buf, vis, cmap);
 	layout();
 	if (was)
 		show_sel();
@@ -2612,231 +2812,14 @@ static void resize_buffer(void)
 	dirty = 1;
 }
 
-/* ---- input method ------------------------------------------------------- */
-
-/*
- * The IM named by XMODIFIERS (ibus, fcitx, ...) when it runs; otherwise
- * Xlib's built-in one ("@im=none", which still does compose and dead
- * keys) while we wait for the real one to appear.
- */
-static int xim_local;
-
-static void xim_instantiate(Display *d, XPointer client, XPointer call);
-
-static void xim_close(void)
-{
-	if (xic)
-		XDestroyIC(xic);
-	if (xim)
-		XCloseIM(xim);
-	xic = NULL;
-	xim = NULL;
-}
-
-static void xim_make_ic(void)
-{
-	static const XIMStyle want[] = {
-		XIMPreeditNothing | XIMStatusNothing,
-		XIMPreeditNothing | XIMStatusNone,
-		XIMPreeditNone | XIMStatusNothing,
-		XIMPreeditNone | XIMStatusNone,
-	};
-	XIMStyles *styles = NULL;
-	XIMStyle style = 0;
-	if (!XGetIMValues(xim, XNQueryInputStyle, &styles, NULL) && styles) {
-		for (size_t w = 0; w < sizeof want / sizeof *want && !style; w++)
-			for (int i = 0; i < styles->count_styles; i++)
-				if (styles->supported_styles[i] == want[w]) {
-					style = want[w];
-					break;
-				}
-		XFree(styles);
-	}
-	if (style)
-		xic = XCreateIC(xim, XNInputStyle, style, XNClientWindow, win,
-			XNFocusWindow, win, NULL);
-	long fev = 0;
-	if (xic)
-		XGetICValues(xic, XNFilterEvents, &fev, NULL);
-	XSelectInput(dpy, win, EVENT_MASK | fev);
-	if (xic && focused)
-		XSetICFocus(xic);
-}
-
-static void xim_open_local(void)
-{
-	XSetLocaleModifiers("@im=none");
-	if ((xim = XOpenIM(dpy, NULL, NULL, NULL))) {
-		xim_local = 1;
-		xim_make_ic();
-	}
-	XSetLocaleModifiers("");
-}
-
-static void xim_destroyed(XIM im, XPointer client, XPointer call)
-{
-	/* The IM server went away (e.g. ibus restarted); its ICs are gone
-	 * too. Ignore news about an IM we no longer use. */
-	if (im != xim)
-		return;
-	xim = NULL;
-	xic = NULL;
-	/* Registering runs xim_instantiate at once if the server is already
-	 * back; only fall back to the built-in IM if it is not. */
-	XRegisterIMInstantiateCallback(dpy, NULL, NULL, NULL,
-		xim_instantiate, NULL);
-	if (!xim)
-		xim_open_local();
-}
-
-static void xim_instantiate(Display *d, XPointer client, XPointer call)
-{
-	if (xim && !xim_local)
-		return;                 /* already on the real IM */
-	XSetLocaleModifiers("");
-	XIM im = XOpenIM(dpy, NULL, NULL, NULL);
-	if (!im)
-		return;
-	XUnregisterIMInstantiateCallback(dpy, NULL, NULL, NULL,
-		xim_instantiate, NULL);
-	xim_close();
-	xim = im;
-	xim_local = 0;
-	XIMCallback cb = { NULL, xim_destroyed };
-	XSetIMValues(xim, XNDestroyCallback, &cb, NULL);
-	xim_make_ic();
-}
-
-static void xim_init(void)
-{
-	xim_instantiate(dpy, NULL, NULL);
-	if (xim)
-		return;
-	XRegisterIMInstantiateCallback(dpy, NULL, NULL, NULL,
-		xim_instantiate, NULL);
-	if (!xim)
-		xim_open_local();
-}
-
-/* Text for a key without any IM, from the keysym rather than from
- * XLookupString, whose encoding depends on the locale. */
-static int keysym_utf8(KeySym ks, char *out)
-{
-	uint32_t c;
-	if ((ks >= 0x20 && ks <= 0x7e) || (ks >= 0xa0 && ks <= 0xff))
-		c = ks;
-	else if ((ks & 0xff000000) == 0x01000000)
-		c = ks & 0xffffff;
-	else if (ks >= XK_KP_0 && ks <= XK_KP_9)
-		c = '0' + (ks - XK_KP_0);
-	else if (ks >= 0x20a0 && ks <= 0x20ac)  /* currency, e.g. EuroSign */
-		c = ks;
-	else if (ks == XK_KP_Decimal || ks == XK_KP_Add ||
-		 ks == XK_KP_Subtract || ks == XK_KP_Multiply ||
-		 ks == XK_KP_Divide || ks == XK_KP_Equal || ks == XK_KP_Space)
-		c = ks == XK_KP_Space ? ' ' : (uint32_t)(ks - 0xff80);
-	else
-		return 0;
-	if (c < 0x80) {
-		out[0] = c;
-		return 1;
-	}
-	if (c < 0x800) {
-		out[0] = 0xc0 | c >> 6;
-		out[1] = 0x80 | (c & 0x3f);
-		return 2;
-	}
-	if (c >= 0xd800 && c <= 0xdfff)
-		return 0;
-	if (c < 0x10000) {
-		out[0] = 0xe0 | c >> 12;
-		out[1] = 0x80 | ((c >> 6) & 0x3f);
-		out[2] = 0x80 | (c & 0x3f);
-		return 3;
-	}
-	if (c > 0x10ffff)
-		return 0;
-	out[0] = 0xf0 | c >> 18;
-	out[1] = 0x80 | ((c >> 12) & 0x3f);
-	out[2] = 0x80 | ((c >> 6) & 0x3f);
-	out[3] = 0x80 | (c & 0x3f);
-	return 4;
-}
-
-/* ---- window setup ------------------------------------------------------- */
-
-/* A 32x32 folder for _NET_WM_ICON, which mwm shows on desktop icons. */
-static void set_icon(void)
-{
-	enum { S = 32 };
-	static unsigned long data[2 + S * S];
-	data[0] = S;
-	data[1] = S;
-	for (int y = 0; y < S; y++)
-		for (int x = 0; x < S; x++) {
-			unsigned long p = 0;
-			int tab = y >= 5 && y < 9 && x >= 3 && x < 15;
-			int body = y >= 8 && y < 28 && x >= 3 && x < 29;
-			if (tab || body)
-				p = 0xffc9a85c;
-			if (body && (y == 8 || y == 27 || x == 3 || x == 28))
-				p = 0xff5f4f2a;
-			if (tab && (y == 5 || x == 3 || x == 14))
-				p = 0xff5f4f2a;
-			data[2 + y * S + x] = p;
-		}
-	XChangeProperty(dpy, win, a_icon, XA_CARDINAL, 32, PropModeReplace,
-		(unsigned char *)data, 2 + S * S);
-}
-
-static void setup_window(void)
-{
-	XSetWindowAttributes wa = {
-		.background_pixel = px_bg,
-		.bit_gravity = NorthWestGravity,
-		.event_mask = EVENT_MASK,
-	};
-	win = XCreateWindow(dpy, root, 0, 0, W, H, 0, depth, InputOutput,
-		vis, CWBackPixel | CWBitGravity | CWEventMask, &wa);
-
-	XSizeHints *sh = XAllocSizeHints();
-	sh->flags = PMinSize;
-	sh->min_width = 300;
-	sh->min_height = 200;
-	XWMHints *wh = XAllocWMHints();
-	wh->flags = InputHint | StateHint;
-	wh->input = True;
-	wh->initial_state = NormalState;
-	XClassHint ch = { "mfm", "Mfm" };
-	XSetWMProperties(dpy, win, NULL, NULL, NULL, 0, sh, wh, &ch);
-	XFree(sh);
-	XFree(wh);
-
-	a_protocols = XInternAtom(dpy, "WM_PROTOCOLS", False);
-	a_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
-	a_ping = XInternAtom(dpy, "_NET_WM_PING", False);
-	a_name = XInternAtom(dpy, "_NET_WM_NAME", False);
-	a_icon_name = XInternAtom(dpy, "_NET_WM_ICON_NAME", False);
-	a_utf8 = XInternAtom(dpy, "UTF8_STRING", False);
-	a_icon = XInternAtom(dpy, "_NET_WM_ICON", False);
-	a_pid = XInternAtom(dpy, "_NET_WM_PID", False);
-	Atom prots[] = { a_delete, a_ping };
-	XSetWMProtocols(dpy, win, prots, 2);
-	long pid = getpid();
-	XChangeProperty(dpy, win, a_pid, XA_CARDINAL, 32, PropModeReplace,
-		(unsigned char *)&pid, 1);
-	set_icon();
-
-	gc = XCreateGC(dpy, win, 0, NULL);
-	xim_init();
-	resize_buffer();
-}
-
 /* ---- context menu ------------------------------------------------------- */
 
 /*
- * The right-button menu: an override-redirect window that holds the
- * pointer and keyboard grabs while it is up. Press, drag and release on
+ * The right-button menu: an xdg_popup that holds the grab while it is up.
+ * The compositor still sends what happens over our own main window: to it
+ * the menu is not special there, and one that keeps the pointer on the window
+ * a button was pressed in sends the whole drag that way. So the pointer
+ * handlers turn such positions into menu coordinates. Press, drag and release on
  * an item runs it; a quick click leaves the menu open for a second click.
  * Up/Down move through it, Return runs an item, Esc closes it.
  *
@@ -2863,13 +2846,15 @@ static const struct { int id; const char *label, *accel; } menu_items[] = {
 	{ M_RELOAD, "Reload", "F5" },
 };
 #define NMENU ((int)(sizeof menu_items / sizeof menu_items[0]))
-static Window mwin;
-static Pixmap mbuf;
-static XftDraw *mxd;
+static struct wsurf menu_s;
+static struct xdg_surface *menu_xdg;
+static struct xdg_popup *menu_popup;
+static int menu_configured;
+static int menu_px, menu_py;    /* where the menu is, in the main window */
 static int menu_on, menu_dirty, menu_hot = -1, menu_w, menu_h;
 static int menu_presses, menu_entered;
 static int menu_ok[NMENU], menu_y[NMENU + 1];  /* item i: y[i]..y[i+1] */
-static Time menu_time;
+static uint32_t menu_time;
 /* what the menu was opened on; menu_name is "" for the empty area */
 static char menu_dir[PATH_MAX], menu_name[NAME_MAX + 1];
 static int menu_nmarks;
@@ -2904,12 +2889,13 @@ static int menu_at(int x, int y)
 	return -1;
 }
 
-static void menu_draw(void)
+/* 0 if the compositor holds both buffers: try again after a release. */
+static int menu_draw(void)
 {
-	Pixmap keep_buf = buf;
-	XftDraw *keep_xd = xd;
-	buf = mbuf;             /* fill/bevel/text draw into buf and xd */
-	xd = mxd;
+	struct shmbuf *b = wsurf_buffer(&menu_s, menu_w, menu_h);
+	if (!b)
+		return 0;
+	cr = b->cr;
 	fill(px_bg, 0, 0, menu_w, menu_h);
 	bevel((struct rect){ 0, 0, menu_w, menu_h }, 1);
 	for (int i = 0; i < NMENU; i++) {
@@ -2919,35 +2905,66 @@ static void menu_draw(void)
 			fill(px_top, BEV + 2, y + 4, menu_w - 2 * BEV - 4, 1);
 			continue;
 		}
-		XftColor *c = menu_ok[i] ? &xc_fg : &xc_dim;
+		uint32_t c = menu_ok[i] ? xc_fg : xc_dim;
 		if (i == menu_hot) {
 			fill(px_sel, BEV, y, menu_w - 2 * BEV, h);
-			c = &xc_sel;
+			c = xc_sel;
 		}
 		const char *l = menu_label(i), *a = menu_items[i].accel;
 		text(c, BEV + 12, y, h, l, strlen(l));
 		text(c, menu_w - BEV - 12 - textw(a, strlen(a)), y, h, a,
 			strlen(a));
 	}
-	XCopyArea(dpy, buf, mwin, gc, 0, 0, menu_w, menu_h, 0, 0);
-	buf = keep_buf;
-	xd = keep_xd;
+	wsurf_present(&menu_s, b);
+	return 1;
 }
 
 static void menu_close(void)
 {
 	if (!menu_on)
 		return;
-	XUngrabPointer(dpy, CurrentTime);
-	XUngrabKeyboard(dpy, CurrentTime);
-	XUnmapWindow(dpy, mwin);
+	if (ptr_surface == menu_s.wl)
+		ptr_surface = NULL;
+	xdg_popup_destroy(menu_popup);
+	xdg_surface_destroy(menu_xdg);
+	wsurf_destroy(&menu_s);
 	/* The command that follows may block (a slow directory); the
 	 * desktop must not stay grabbed meanwhile. */
-	XFlush(dpy);
+	wl_display_flush(dpy);
 	menu_on = 0;
 	menu_hot = -1;
 	dirty = 1;
 }
+
+static void popup_configure(void *data, struct xdg_popup *p, int32_t x,
+	int32_t y, int32_t w, int32_t h)
+{
+	menu_px = x;
+	menu_py = y;
+}
+
+/* A click on another client, or the compositor refused the grab. */
+static void popup_done(void *data, struct xdg_popup *p)
+{
+	menu_close();
+}
+
+static const struct xdg_popup_listener popup_listener = {
+	.configure = popup_configure,
+	.popup_done = popup_done,
+};
+
+static void menu_xdg_configure(void *data, struct xdg_surface *s,
+	uint32_t serial)
+{
+	xdg_surface_ack_configure(s, serial);
+	menu_configured = 1;
+	menu_dirty = 1;
+}
+
+static const struct xdg_surface_listener menu_xdg_listener = {
+	menu_xdg_configure,
+};
 
 /* Which items work: `row` is the clicked entry, or -1 for the empty area
  * of the list. Commands on entries take the marks, else the selection. */
@@ -2970,9 +2987,9 @@ static void menu_enable(int row)
 	}
 }
 
-/* Open the menu at the root position (xr, yr) for list row `row` (-1:
- * the empty area). */
-static void menu_open(int xr, int yr, Time t, int row)
+/* Open the menu at the window position (px, py) for list row `row` (-1: the
+ * empty area), with the button press that asks for it. */
+static void menu_open(int px, int py, uint32_t serial, uint32_t t, int row)
 {
 	int ih = rowh + 4, aw = 0;
 	int lw = textw("Hide hidden files", strlen("Hide hidden files"));
@@ -2989,45 +3006,32 @@ static void menu_open(int xr, int yr, Time t, int row)
 	}
 	int w = 2 * (BEV + 12) + lw + 32 + aw, h = menu_y[NMENU] + BEV + 2;
 	menu_enable(row);
-	if (!mwin) {
-		XSetWindowAttributes wa = {
-			.override_redirect = True,
-			.save_under = True,
-			.background_pixel = px_bg,
-			.event_mask = ExposureMask,
-		};
-		mwin = XCreateWindow(dpy, root, 0, 0, 1, 1, 0, depth,
-			InputOutput, vis, CWOverrideRedirect | CWSaveUnder |
-			CWBackPixel | CWEventMask, &wa);
-	}
-	if (!mbuf || w != menu_w || h != menu_h) {
-		if (mxd)
-			XftDrawDestroy(mxd);
-		if (mbuf)
-			XFreePixmap(dpy, mbuf);
-		mbuf = XCreatePixmap(dpy, mwin, w, h, depth);
-		mxd = XftDrawCreate(dpy, mbuf, vis, cmap);
-	}
 	menu_w = w;
 	menu_h = h;
-	/* Below and right of the pointer, else above or left of it with
-	 * the pointer still on the corner, and always on the screen. */
-	int sw = DisplayWidth(dpy, scr), sh = DisplayHeight(dpy, scr);
-	int x = xr + w <= sw ? xr : xr - w + 1;
-	int y = yr + h <= sh ? yr : yr - h + 1;
-	x = MAX(0, MIN(x, sw - w));
-	y = MAX(0, MIN(y, sh - h));
-	XMoveResizeWindow(dpy, mwin, x, y, w, h);
-	XMapRaised(dpy, mwin);
-	if (XGrabPointer(dpy, mwin, False, ButtonPressMask |
-	    ButtonReleaseMask | PointerMotionMask, GrabModeAsync,
-	    GrabModeAsync, None, None, t) != GrabSuccess) {
-		XUnmapWindow(dpy, mwin);
-		return;
-	}
-	/* The keys come to win even if the focus follows the pointer onto
-	 * the menu. Without the grab they still work under click-to-focus. */
-	XGrabKeyboard(dpy, win, False, GrabModeAsync, GrabModeAsync, t);
+	/* Below and right of the pointer, else above or left of it with the
+	 * pointer still on the corner, and always on the screen. */
+	struct xdg_positioner *pos = xdg_wm_base_create_positioner(wm_base);
+	xdg_positioner_set_size(pos, w, h);
+	xdg_positioner_set_anchor_rect(pos, MAX(0, MIN(px, W - 1)),
+		MAX(0, MIN(py, H - 1)), 1, 1);
+	xdg_positioner_set_anchor(pos, XDG_POSITIONER_ANCHOR_TOP_LEFT);
+	xdg_positioner_set_gravity(pos, XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
+	xdg_positioner_set_constraint_adjustment(pos,
+		XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X |
+		XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y |
+		XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X |
+		XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y);
+	menu_s.wl = wl_compositor_create_surface(compositor);
+	menu_xdg = xdg_wm_base_get_xdg_surface(wm_base, menu_s.wl);
+	xdg_surface_add_listener(menu_xdg, &menu_xdg_listener, NULL);
+	menu_popup = xdg_surface_get_popup(menu_xdg, main_xdg, pos);
+	xdg_popup_add_listener(menu_popup, &popup_listener, NULL);
+	xdg_positioner_destroy(pos);
+	xdg_popup_grab(menu_popup, seat, serial);
+	wl_surface_commit(menu_s.wl);
+	menu_configured = 0;
+	menu_px = px;
+	menu_py = py;
 	snprintf(menu_dir, sizeof menu_dir, "%s", cwd);
 	snprintf(menu_name, sizeof menu_name, "%s",
 		row >= 0 ? ents[row].name : "");
@@ -3077,19 +3081,19 @@ static void menu_run(int i)
 	dirty = 1;
 }
 
-static void menu_key(KeySym ks)
+static void menu_key(xkb_keysym_t ks)
 {
 	int d;
 	switch (ks) {
-	case XK_Escape:
+	case XKB_KEY_Escape:
 		menu_close();
 		return;
-	case XK_Return: case XK_KP_Enter:
+	case XKB_KEY_Return: case XKB_KEY_KP_Enter:
 		if (menu_hot >= 0)
 			menu_run(menu_hot);
 		return;
-	case XK_Up: case XK_KP_Up: d = -1; break;
-	case XK_Down: case XK_KP_Down: d = 1; break;
+	case XKB_KEY_Up: case XKB_KEY_KP_Up: d = -1; break;
+	case XKB_KEY_Down: case XKB_KEY_KP_Down: d = 1; break;
 	default: return;
 	}
 	int i = menu_hot < 0 ? (d > 0 ? -1 : NMENU) : menu_hot;
@@ -3105,9 +3109,9 @@ static void menu_key(KeySym ks)
 
 /* The pointer highlights the enabled item under it. Until it first
  * reaches one, a nudge does not drop an item chosen with the keys. */
-static void menu_motion(XMotionEvent *ev)
+static void menu_motion(int x, int y)
 {
-	int i = menu_at(ev->x, ev->y);
+	int i = menu_at(x, y);
 	if (i >= 0 && !menu_ok[i])
 		i = -1;
 	if (i >= 0)
@@ -3120,9 +3124,9 @@ static void menu_motion(XMotionEvent *ev)
 	}
 }
 
-static void menu_press(XButtonEvent *ev)
+static void menu_press(const struct pev *ev)
 {
-	if (ev->button > Button3)
+	if (ev->button > B_RIGHT)
 		return;
 	if (menu_inside(ev->x, ev->y))
 		menu_presses++;
@@ -3132,12 +3136,12 @@ static void menu_press(XButtonEvent *ev)
 
 /* A release runs the highlighted item under the pointer: one that was
  * pointed at, not one the menu merely opened on top of. */
-static void menu_release(XButtonEvent *ev)
+static void menu_release(const struct pev *ev)
 {
-	if (ev->button > Button3)
+	if (ev->button > B_RIGHT)
 		return;
 	/* the release of a click that opened the menu: it stays (the
-	 * server's millisecond clock wraps at 32 bits) */
+	 * compositor's millisecond clock wraps at 32 bits) */
 	if (!menu_presses && (uint32_t)(ev->time - menu_time) < MENU_CLICK_MS)
 		return;
 	int i = menu_at(ev->x, ev->y);
@@ -3149,14 +3153,21 @@ static void menu_release(XButtonEvent *ev)
 
 /* ---- events ------------------------------------------------------------- */
 
-static void key(KeySym ks, const char *txt, int n, unsigned state)
+static int is_modifier(xkb_keysym_t ks)
 {
-	if (IsModifierKey(ks))
+	return (ks >= XKB_KEY_Shift_L && ks <= XKB_KEY_Hyper_R) ||
+		(ks >= XKB_KEY_ISO_Lock && ks <= XKB_KEY_ISO_Level5_Lock) ||
+		ks == XKB_KEY_Mode_switch || ks == XKB_KEY_Num_Lock;
+}
+
+static void key(xkb_keysym_t ks, const char *txt, int n, unsigned state)
+{
+	if (is_modifier(ks))
 		return;
-	if (ks >= XK_A && ks <= XK_Z)
-		ks += XK_a - XK_A;
-	int ctrl = state & ControlMask, alt = state & Mod1Mask;
-	int shift = state & ShiftMask;
+	if (ks >= XKB_KEY_A && ks <= XKB_KEY_Z)
+		ks += XKB_KEY_a - XKB_KEY_A;
+	int ctrl = state & MOD_CTRL, alt = state & MOD_ALT;
+	int shift = state & MOD_SHIFT;
 
 	if (menu_on) {
 		menu_key(ks);
@@ -3171,7 +3182,7 @@ static void key(KeySym ks, const char *txt, int n, unsigned state)
 		return;
 	}
 	if (pend) {
-		answer_delete(!ctrl && !alt && (ks == XK_y || ks == XK_j));
+		answer_delete(!ctrl && !alt && (ks == XKB_KEY_y || ks == XKB_KEY_j));
 		return;
 	}
 	/* A type-ahead that timed out is over: Backspace means "parent". */
@@ -3181,16 +3192,16 @@ static void key(KeySym ks, const char *txt, int n, unsigned state)
 	clear_status();
 	if (ctrl) {
 		switch (ks) {
-		case XK_q: case XK_w: exit(0);
-		case XK_h: toggle_hidden(); break;
-		case XK_r: reload(); break;
-		case XK_l: edit_begin(); break;
-		case XK_t: open_terminal(); break;
-		case XK_a: mark_all(); break;
-		case XK_c: clip_set(0); break;
-		case XK_x: clip_set(1); break;
-		case XK_v: paste(); break;
-		case XK_n:
+		case XKB_KEY_q: case XKB_KEY_w: exit(0);
+		case XKB_KEY_h: toggle_hidden(); break;
+		case XKB_KEY_r: reload(); break;
+		case XKB_KEY_l: edit_begin(); break;
+		case XKB_KEY_t: open_terminal(); break;
+		case XKB_KEY_a: mark_all(); break;
+		case XKB_KEY_c: clip_set(0); break;
+		case XKB_KEY_x: clip_set(1); break;
+		case XKB_KEY_v: paste(); break;
+		case XKB_KEY_n:
 			if (shift)
 				prompt_begin(PR_MKDIR);
 			break;
@@ -3198,29 +3209,29 @@ static void key(KeySym ks, const char *txt, int n, unsigned state)
 		return;
 	}
 	if (alt) {
-		if (ks == XK_Up || ks == XK_KP_Up)
+		if (ks == XKB_KEY_Up || ks == XKB_KEY_KP_Up)
 			go_parent();
-		else if (ks == XK_Home || ks == XK_KP_Home)
+		else if (ks == XKB_KEY_Home || ks == XKB_KEY_KP_Home)
 			go_home();
-		else if (ks == XK_F4)
+		else if (ks == XKB_KEY_F4)
 			exit(0);
 		return;
 	}
 	int vis = rows_vis();
 	switch (ks) {
-	case XK_Up: case XK_KP_Up: move_sel(-1); return;
-	case XK_Down: case XK_KP_Down: move_sel(1); return;
-	case XK_Prior: case XK_KP_Prior: move_sel(-vis); return;
-	case XK_Next: case XK_KP_Next: move_sel(vis); return;
-	case XK_Home: case XK_KP_Home: move_sel(-nents); return;
-	case XK_End: case XK_KP_End: move_sel(nents); return;
-	case XK_Return: case XK_KP_Enter: activate(sel); return;
-	case XK_Right: case XK_KP_Right:
+	case XKB_KEY_Up: case XKB_KEY_KP_Up: move_sel(-1); return;
+	case XKB_KEY_Down: case XKB_KEY_KP_Down: move_sel(1); return;
+	case XKB_KEY_Prior: case XKB_KEY_KP_Prior: move_sel(-vis); return;
+	case XKB_KEY_Next: case XKB_KEY_KP_Next: move_sel(vis); return;
+	case XKB_KEY_Home: case XKB_KEY_KP_Home: move_sel(-nents); return;
+	case XKB_KEY_End: case XKB_KEY_KP_End: move_sel(nents); return;
+	case XKB_KEY_Return: case XKB_KEY_KP_Enter: activate(sel); return;
+	case XKB_KEY_Right: case XKB_KEY_KP_Right:
 		if (sel < nents && ents[sel].dir)
 			activate(sel);
 		return;
-	case XK_Left: case XK_KP_Left: go_parent(); return;
-	case XK_BackSpace:
+	case XKB_KEY_Left: case XKB_KEY_KP_Left: go_parent(); return;
+	case XKB_KEY_BackSpace:
 		if (search[0]) {
 			search[u8_prev(search, strlen(search))] = 0;
 			search_ms = now_ms();
@@ -3229,27 +3240,27 @@ static void key(KeySym ks, const char *txt, int n, unsigned state)
 			go_parent();
 		}
 		return;
-	case XK_Escape:         /* one thing at a time */
+	case XKB_KEY_Escape:         /* one thing at a time */
 		if (search[0])
 			search[0] = 0;
 		else if (!had_msg)
 			unmark_all();
 		dirty = 1;
 		return;
-	case XK_F5: reload(); return;
-	case XK_F2: prompt_begin(PR_RENAME); return;
-	case XK_F7: prompt_begin(PR_MKDIR); return;
-	case XK_Insert: case XK_KP_Insert:
+	case XKB_KEY_F5: reload(); return;
+	case XKB_KEY_F2: prompt_begin(PR_RENAME); return;
+	case XKB_KEY_F7: prompt_begin(PR_MKDIR); return;
+	case XKB_KEY_Insert: case XKB_KEY_KP_Insert:
 		toggle_mark(sel);
 		move_sel(1);
 		return;
-	case XK_Delete: case XK_KP_Delete:
+	case XKB_KEY_Delete: case XKB_KEY_KP_Delete:
 		if (shift)
 			ask_delete();
 		else
 			trash();
 		return;
-	case XK_space:
+	case XKB_KEY_space:
 		if (!search[0]) {       /* else part of a type-ahead name */
 			toggle_mark(sel);
 			move_sel(1);
@@ -3259,31 +3270,6 @@ static void key(KeySym ks, const char *txt, int n, unsigned state)
 	}
 	if (n > 0 && (unsigned char)txt[0] >= 0x20 && txt[0] != 0x7f)
 		typeahead(txt, n);
-}
-
-static void on_key(XKeyEvent *ev)
-{
-	char sbuf[64], *txt = sbuf, *heap = NULL;
-	KeySym ks = NoSymbol;
-	int n = 0;
-	if (xic) {
-		Status st;
-		n = Xutf8LookupString(xic, ev, txt, sizeof sbuf - 1, &ks, &st);
-		if (st == XBufferOverflow && (heap = malloc(n + 1))) {
-			txt = heap;
-			n = Xutf8LookupString(xic, ev, txt, n, &ks, &st);
-		}
-		if (st != XLookupKeySym && st != XLookupBoth)
-			ks = NoSymbol;
-		if (st != XLookupChars && st != XLookupBoth)
-			n = 0;
-	} else {
-		char ignored[32];
-		XLookupString(ev, ignored, sizeof ignored, &ks, NULL);
-		n = keysym_utf8(ks, txt);
-	}
-	key(ks, txt, n, ev->state);
-	free(heap);
 }
 
 /* The entry at window height y in the list, or -1. */
@@ -3298,11 +3284,11 @@ static int row_at(int y)
 /* Right click in the list. A marked entry keeps the marks, so the menu
  * works on all of them; any other entry is selected alone. Not while the
  * left button drags the scrollbar or holds the up button. */
-static void list_menu(XButtonEvent *ev)
+static void list_menu(const struct pev *ev)
 {
 	int i = row_at(ev->y);
 	if (!in(r_list, ev->x, ev->y) ||
-	    (ev->state & (Button1Mask | Button2Mask)))
+	    (ev->state & (BTN1_HELD | BTN2_HELD)))
 		return;
 	search[0] = 0;
 	clear_status();
@@ -3313,10 +3299,10 @@ static void list_menu(XButtonEvent *ev)
 		last_idx = -1;
 		dirty = 1;
 	}
-	menu_open(ev->x_root, ev->y_root, ev->time, i);
+	menu_open(ev->x, ev->y, ev->serial, ev->time, i);
 }
 
-static void on_button(XButtonEvent *ev)
+static void on_button(const struct pev *ev)
 {
 	int x = ev->x, y = ev->y;
 	if (pend)
@@ -3330,11 +3316,11 @@ static void on_button(XButtonEvent *ev)
 		dirty = 1;
 	}
 	switch (ev->button) {
-	case Button4: top -= 3; clamp_top(); dirty = 1; return;
-	case Button5: top += 3; clamp_top(); dirty = 1; return;
-	case 8: go_parent(); return;
-	case Button3: list_menu(ev); return;
-	case Button1: break;
+	case B_WHEEL_UP: top -= 3; clamp_top(); dirty = 1; return;
+	case B_WHEEL_DOWN: top += 3; clamp_top(); dirty = 1; return;
+	case B_BACK: go_parent(); return;
+	case B_RIGHT: list_menu(ev); return;
+	case B_LEFT: break;
 	default: return;
 	}
 	if (in(r_up, x, y)) {
@@ -3360,11 +3346,11 @@ static void on_button(XButtonEvent *ev)
 			return;
 		search[0] = 0;
 		clear_status();
-		if (ev->state & ControlMask) {
+		if (ev->state & MOD_CTRL) {
 			toggle_mark(i);
 			sel = i;
 			last_idx = -1;
-		} else if (ev->state & ShiftMask) {
+		} else if (ev->state & MOD_SHIFT) {
 			for (int k = MIN(sel, i); k <= MAX(sel, i); k++)
 				if (!ents[k].up)
 					ents[k].mark = 1;
@@ -3391,23 +3377,23 @@ static void on_button(XButtonEvent *ev)
 	}
 }
 
-static void on_motion(XMotionEvent *ev)
+static void on_motion(int y)
 {
 	if (!dragging)
 		return;
 	int ty, th, sy, sh, vis = rows_vis();
 	sb_geom(&ty, &th, &sy, &sh);
 	if (th > sh && nents > vis) {
-		top = (int)((long)(ev->y - drag_off - ty) * (nents - vis) /
+		top = (int)((long)(y - drag_off - ty) * (nents - vis) /
 			(th - sh));
 		clamp_top();
 		dirty = 1;
 	}
 }
 
-static void on_release(XButtonEvent *ev)
+static void on_release(const struct pev *ev)
 {
-	if (ev->button != Button1)
+	if (ev->button != B_LEFT)
 		return;
 	dragging = 0;
 	if (up_pressed) {
@@ -3418,72 +3404,452 @@ static void on_release(XButtonEvent *ev)
 	}
 }
 
-static void handle(XEvent *ev)
+/* ---- Wayland input ------------------------------------------------------ */
+
+static unsigned current_state(void)
 {
-	if (menu_on) {          /* the pointer belongs to the menu */
-		switch (ev->type) {
-		case ButtonPress: menu_press(&ev->xbutton); return;
-		case ButtonRelease: menu_release(&ev->xbutton); return;
-		case MotionNotify:
-			while (XCheckTypedWindowEvent(dpy, mwin, MotionNotify,
-			    ev))
-				;
-			menu_motion(&ev->xmotion);
+	unsigned s = btn_mask;
+	if (kb_state) {
+		if (xkb_state_mod_name_is_active(kb_state, XKB_MOD_NAME_SHIFT,
+		    XKB_STATE_MODS_EFFECTIVE) > 0)
+			s |= MOD_SHIFT;
+		if (xkb_state_mod_name_is_active(kb_state, XKB_MOD_NAME_CTRL,
+		    XKB_STATE_MODS_EFFECTIVE) > 0)
+			s |= MOD_CTRL;
+		if (xkb_state_mod_name_is_active(kb_state, XKB_MOD_NAME_ALT,
+		    XKB_STATE_MODS_EFFECTIVE) > 0)
+			s |= MOD_ALT;
+	}
+	return s;
+}
+
+/* One key press or repeat, with kc an xkb keycode. Compose and dead keys come
+ * from xkbcommon; a key that is only part of a sequence does nothing else. */
+static void key_press(uint32_t kc)
+{
+	char txt[64];
+	int n = -1;
+	xkb_keysym_t ks = xkb_state_key_get_one_sym(kb_state, kc);
+	if (compose && xkb_compose_state_feed(compose, ks) ==
+	    XKB_COMPOSE_FEED_ACCEPTED) {
+		switch (xkb_compose_state_get_status(compose)) {
+		case XKB_COMPOSE_COMPOSING:
 			return;
+		case XKB_COMPOSE_CANCELLED:
+			xkb_compose_state_reset(compose);
+			return;
+		case XKB_COMPOSE_COMPOSED:
+			n = xkb_compose_state_get_utf8(compose, txt, sizeof txt);
+			ks = xkb_compose_state_get_one_sym(compose);
+			xkb_compose_state_reset(compose);
+			break;
+		case XKB_COMPOSE_NOTHING:
+			break;
 		}
 	}
-	switch (ev->type) {
-	case Expose:
-		if (ev->xexpose.window == mwin) {
-			if (ev->xexpose.count == 0)
-				menu_dirty = 1;
-		} else if (ev->xexpose.count == 0) {
-			dirty = 1;
-		}
-		break;
-	case ConfigureNotify:
-		if (ev->xconfigure.width != W || ev->xconfigure.height != H) {
-			W = ev->xconfigure.width;
-			H = ev->xconfigure.height;
-			resize_buffer();
-		}
-		break;
-	case KeyPress: on_key(&ev->xkey); break;
-	case ButtonPress: on_button(&ev->xbutton); break;
-	case ButtonRelease: on_release(&ev->xbutton); break;
-	case MotionNotify:
-		while (XCheckTypedWindowEvent(dpy, win, MotionNotify, ev))
-			;
-		on_motion(&ev->xmotion);
-		break;
-	case FocusIn:
-	case FocusOut:
-		/* our own keyboard grab for the menu moves no focus */
-		if (menu_on && ev->xfocus.mode != NotifyNormal)
-			break;
-		if (ev->type == FocusOut) {
-			focused = 0;
-			if (xic)
-				XUnsetICFocus(xic);
-			break;
-		}
-		focused = 1;
-		if (xic)
-			XSetICFocus(xic);
-		break;
-	case MappingNotify: XRefreshKeyboardMapping(&ev->xmapping); break;
-	case ClientMessage:
-		if (ev->xclient.message_type != a_protocols)
-			break;
-		if ((Atom)ev->xclient.data.l[0] == a_delete)
-			exit(0);
-		if ((Atom)ev->xclient.data.l[0] == a_ping) {
-			ev->xclient.window = root;
-			XSendEvent(dpy, root, False, SubstructureNotifyMask |
-				SubstructureRedirectMask, ev);
-		}
-		break;
+	if (n < 0)
+		n = xkb_state_key_get_utf8(kb_state, kc, txt, sizeof txt);
+	if (n >= (int)sizeof txt)
+		n = 0;
+	key(ks, txt, n, current_state());
+}
+
+static void kb_keymap(void *data, struct wl_keyboard *k, uint32_t format,
+	int32_t fd, uint32_t size)
+{
+	if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
+		close(fd);
+		return;
 	}
+	char *s = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+	close(fd);
+	if (s == MAP_FAILED)
+		return;
+	struct xkb_keymap *map = xkb_keymap_new_from_string(xkb, s,
+		XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
+	munmap(s, size);
+	struct xkb_state *state = map ? xkb_state_new(map) : NULL;
+	if (!state) {
+		xkb_keymap_unref(map);
+		return;
+	}
+	xkb_state_unref(kb_state);
+	xkb_keymap_unref(kb_map);
+	kb_state = state;
+	kb_map = map;
+	repeat_kc = 0;
+}
+
+static void kb_enter(void *data, struct wl_keyboard *k, uint32_t serial,
+	struct wl_surface *surface, struct wl_array *keys)
+{
+}
+
+static void kb_leave(void *data, struct wl_keyboard *k, uint32_t serial,
+	struct wl_surface *surface)
+{
+	repeat_kc = 0;
+	if (compose)
+		xkb_compose_state_reset(compose);
+}
+
+static void kb_key(void *data, struct wl_keyboard *k, uint32_t serial,
+	uint32_t time, uint32_t code, uint32_t state)
+{
+	uint32_t kc = code + 8;
+	if (!kb_state)
+		return;
+	if (state != WL_KEYBOARD_KEY_STATE_PRESSED) {
+		if (kc == repeat_kc)
+			repeat_kc = 0;
+		return;
+	}
+	repeat_kc = 0;
+	key_press(kc);
+	if (repeat_rate > 0 && xkb_keymap_key_repeats(kb_map, kc)) {
+		repeat_kc = kc;
+		repeat_next = now_ms() + repeat_delay;
+	}
+}
+
+static void kb_modifiers(void *data, struct wl_keyboard *k, uint32_t serial,
+	uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group)
+{
+	if (kb_state)
+		xkb_state_update_mask(kb_state, depressed, latched, locked, 0, 0,
+			group);
+}
+
+static void kb_repeat_info(void *data, struct wl_keyboard *k, int32_t rate,
+	int32_t delay)
+{
+	repeat_rate = rate;
+	repeat_delay = delay;
+}
+
+static const struct wl_keyboard_listener keyboard_listener = {
+	.keymap = kb_keymap,
+	.enter = kb_enter,
+	.leave = kb_leave,
+	.key = kb_key,
+	.modifiers = kb_modifiers,
+	.repeat_info = kb_repeat_info,
+};
+
+/* The pointer position in menu coordinates, wherever it is. */
+static void menu_pos(int *x, int *y)
+{
+	*x = ptr_x;
+	*y = ptr_y;
+	if (ptr_surface != menu_s.wl) {
+		*x -= menu_px;
+		*y -= menu_py;
+	}
+}
+
+static void menu_pointer_moved(void)
+{
+	int x, y;
+	menu_pos(&x, &y);
+	menu_motion(x, y);
+}
+
+static void ptr_enter(void *data, struct wl_pointer *p, uint32_t serial,
+	struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y)
+{
+	ptr_surface = surface;
+	ptr_x = wl_fixed_to_int(x);
+	ptr_y = wl_fixed_to_int(y);
+	/* An unchanged position gets no motion event after this. */
+	if (menu_on)
+		menu_pointer_moved();
+	if (cursor_img) {
+		wl_pointer_set_cursor(p, serial, cursor_surf, cursor_img->hotspot_x,
+			cursor_img->hotspot_y);
+		wl_surface_attach(cursor_surf,
+			wl_cursor_image_get_buffer(cursor_img), 0, 0);
+		wl_surface_damage_buffer(cursor_surf, 0, 0, cursor_img->width,
+			cursor_img->height);
+		wl_surface_commit(cursor_surf);
+	}
+}
+
+/* Not every compositor keeps the pointer on a window while a button is held,
+ * and then the release never reaches us: a drag ends at the window's edge. */
+static void ptr_leave(void *data, struct wl_pointer *p, uint32_t serial,
+	struct wl_surface *surface)
+{
+	ptr_surface = NULL;
+	btn_mask = 0;
+	dragging = 0;
+	if (up_pressed) {
+		up_pressed = 0;
+		dirty = 1;
+	}
+}
+
+static void ptr_motion(void *data, struct wl_pointer *p, uint32_t time,
+	wl_fixed_t x, wl_fixed_t y)
+{
+	ptr_x = wl_fixed_to_int(x);
+	ptr_y = wl_fixed_to_int(y);
+	if (menu_on)
+		menu_pointer_moved();
+	else
+		on_motion(ptr_y);
+}
+
+static void pointer_event(int button, int pressed, uint32_t serial,
+	uint32_t time)
+{
+	if (!ptr_surface)
+		return;
+	struct pev e = { button, ptr_x, ptr_y, serial, time, current_state() };
+	if (menu_on) {          /* the pointer belongs to the menu */
+		menu_pos(&e.x, &e.y);
+		if (pressed)
+			menu_press(&e);
+		else
+			menu_release(&e);
+	} else if (pressed) {
+		on_button(&e);
+	} else {
+		on_release(&e);
+	}
+}
+
+static void ptr_button(void *data, struct wl_pointer *p, uint32_t serial,
+	uint32_t time, uint32_t code, uint32_t state)
+{
+	int pressed = state == WL_POINTER_BUTTON_STATE_PRESSED, b;
+	unsigned held = 0;
+	switch (code) {
+	case BTN_LEFT: b = B_LEFT; held = BTN1_HELD; break;
+	case BTN_MIDDLE: b = B_MIDDLE; held = BTN2_HELD; break;
+	case BTN_RIGHT: b = B_RIGHT; break;
+	case BTN_SIDE: case BTN_BACK: b = B_BACK; break;
+	default: return;
+	}
+	pointer_event(b, pressed, serial, time);
+	/* A press sees the buttons held before it, as with any toolkit. */
+	if (pressed)
+		btn_mask |= held;
+	else
+		btn_mask &= ~held;
+}
+
+static void ptr_axis(void *data, struct wl_pointer *p, uint32_t time,
+	uint32_t axis, wl_fixed_t value)
+{
+	if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+		axis_acc += wl_fixed_to_double(value);
+}
+
+static void ptr_axis_source(void *data, struct wl_pointer *p, uint32_t source)
+{
+}
+
+static void ptr_axis_stop(void *data, struct wl_pointer *p, uint32_t time,
+	uint32_t axis)
+{
+	if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+		axis_acc = 0;
+}
+
+static void ptr_axis_discrete(void *data, struct wl_pointer *p, uint32_t axis,
+	int32_t steps)
+{
+	if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+		axis_steps += steps;
+}
+
+/* Wheels report steps; touchpads only a distance, of which AXIS_STEP makes
+ * one wheel step. */
+static void ptr_frame(void *data, struct wl_pointer *p)
+{
+	enum { AXIS_STEP = 15 };
+	int steps = axis_steps;
+	if (steps) {
+		axis_acc = 0;
+	} else {
+		steps = (int)(axis_acc / AXIS_STEP);
+		axis_acc -= steps * AXIS_STEP;
+	}
+	axis_steps = 0;
+	for (int i = 0; i < abs(steps); i++)
+		pointer_event(steps < 0 ? B_WHEEL_UP : B_WHEEL_DOWN, 1, 0, 0);
+}
+
+static const struct wl_pointer_listener pointer_listener = {
+	.enter = ptr_enter,
+	.leave = ptr_leave,
+	.motion = ptr_motion,
+	.button = ptr_button,
+	.axis = ptr_axis,
+	.frame = ptr_frame,
+	.axis_source = ptr_axis_source,
+	.axis_stop = ptr_axis_stop,
+	.axis_discrete = ptr_axis_discrete,
+};
+
+static void seat_capabilities(void *data, struct wl_seat *s, uint32_t caps)
+{
+	int want_ptr = caps & WL_SEAT_CAPABILITY_POINTER;
+	int want_kb = caps & WL_SEAT_CAPABILITY_KEYBOARD;
+	if (want_ptr && !pointer) {
+		pointer = wl_seat_get_pointer(s);
+		wl_pointer_add_listener(pointer, &pointer_listener, NULL);
+	} else if (!want_ptr && pointer) {
+		wl_pointer_release(pointer);
+		pointer = NULL;
+		ptr_surface = NULL;
+	}
+	if (want_kb && !keyboard) {
+		keyboard = wl_seat_get_keyboard(s);
+		wl_keyboard_add_listener(keyboard, &keyboard_listener, NULL);
+	} else if (!want_kb && keyboard) {
+		wl_keyboard_release(keyboard);
+		keyboard = NULL;
+		repeat_kc = 0;
+	}
+}
+
+static void seat_name(void *data, struct wl_seat *s, const char *name)
+{
+}
+
+static const struct wl_seat_listener seat_listener = {
+	.capabilities = seat_capabilities,
+	.name = seat_name,
+};
+
+/* ---- window setup ------------------------------------------------------- */
+
+static void wm_ping(void *data, struct xdg_wm_base *b, uint32_t serial)
+{
+	xdg_wm_base_pong(b, serial);
+}
+
+static const struct xdg_wm_base_listener wm_base_listener = { wm_ping };
+
+static void registry_global(void *data, struct wl_registry *r, uint32_t name,
+	const char *iface, uint32_t ver)
+{
+	if (!strcmp(iface, wl_compositor_interface.name)) {
+		compositor = wl_registry_bind(r, name, &wl_compositor_interface,
+			MIN(ver, 4));
+	} else if (!strcmp(iface, wl_shm_interface.name)) {
+		shm = wl_registry_bind(r, name, &wl_shm_interface, 1);
+	} else if (!strcmp(iface, wl_seat_interface.name) && !seat) {
+		seat = wl_registry_bind(r, name, &wl_seat_interface, MIN(ver, 7));
+		wl_seat_add_listener(seat, &seat_listener, NULL);
+	} else if (!strcmp(iface, xdg_wm_base_interface.name)) {
+		wm_base = wl_registry_bind(r, name, &xdg_wm_base_interface,
+			MIN(ver, 2));
+		xdg_wm_base_add_listener(wm_base, &wm_base_listener, NULL);
+	} else if (!strcmp(iface, zxdg_decoration_manager_v1_interface.name)) {
+		deco_mgr = wl_registry_bind(r, name,
+			&zxdg_decoration_manager_v1_interface, 1);
+	}
+}
+
+static void registry_remove(void *data, struct wl_registry *r, uint32_t name)
+{
+}
+
+static const struct wl_registry_listener registry_listener = {
+	.global = registry_global,
+	.global_remove = registry_remove,
+};
+
+static void main_xdg_configure(void *data, struct xdg_surface *s,
+	uint32_t serial)
+{
+	xdg_surface_ack_configure(s, serial);
+	if (pend_w > 0 && pend_h > 0 && (pend_w != W || pend_h != H)) {
+		W = pend_w;
+		H = pend_h;
+		on_resize();
+	}
+	configured = 1;
+	need_commit = 1;
+	dirty = 1;
+}
+
+static const struct xdg_surface_listener main_xdg_listener = {
+	main_xdg_configure,
+};
+
+/* 0 by 0 leaves the size to us. */
+static void top_configure(void *data, struct xdg_toplevel *t, int32_t w,
+	int32_t h, struct wl_array *states)
+{
+	pend_w = w;
+	pend_h = h;
+}
+
+static void top_close(void *data, struct xdg_toplevel *t)
+{
+	exit(0);
+}
+
+static const struct xdg_toplevel_listener toplevel_listener = {
+	.configure = top_configure,
+	.close = top_close,
+};
+
+static void cursor_init(void)
+{
+	const char *s = getenv("XCURSOR_SIZE");
+	int size = s && atoi(s) > 0 ? atoi(s) : 24;
+	struct wl_cursor_theme *theme =
+		wl_cursor_theme_load(getenv("XCURSOR_THEME"), size, shm);
+	if (!theme)
+		return;
+	struct wl_cursor *c = wl_cursor_theme_get_cursor(theme, "default");
+	if (!c)
+		c = wl_cursor_theme_get_cursor(theme, "left_ptr");
+	if (!c)
+		return;
+	cursor_img = c->images[0];
+	cursor_surf = wl_compositor_create_surface(compositor);
+}
+
+/* The locale compose sequences follow, in the order of xkbcommon's docs. */
+static void compose_init(void)
+{
+	const char *loc = getenv("LC_ALL");
+	if (!loc || !*loc)
+		loc = getenv("LC_CTYPE");
+	if (!loc || !*loc)
+		loc = getenv("LANG");
+	if (!loc || !*loc)
+		loc = "C";
+	struct xkb_compose_table *table = xkb_compose_table_new_from_locale(xkb,
+		loc, XKB_COMPOSE_COMPILE_NO_FLAGS);
+	if (!table)
+		return;
+	compose = xkb_compose_state_new(table, XKB_COMPOSE_STATE_NO_FLAGS);
+	xkb_compose_table_unref(table);
+}
+
+static void setup_window(void)
+{
+	main_s.wl = wl_compositor_create_surface(compositor);
+	main_xdg = xdg_wm_base_get_xdg_surface(wm_base, main_s.wl);
+	xdg_surface_add_listener(main_xdg, &main_xdg_listener, NULL);
+	toplevel = xdg_surface_get_toplevel(main_xdg);
+	xdg_toplevel_add_listener(toplevel, &toplevel_listener, NULL);
+	xdg_toplevel_set_app_id(toplevel, "mfm");
+	xdg_toplevel_set_min_size(toplevel, 300, 200);
+	if (deco_mgr) {
+		struct zxdg_toplevel_decoration_v1 *d =
+			zxdg_decoration_manager_v1_get_toplevel_decoration(deco_mgr,
+				toplevel);
+		zxdg_toplevel_decoration_v1_set_mode(d,
+			ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+	}
+	layout();
 }
 
 /* Where to start: the argument (a file is shown selected in its
@@ -3538,46 +3904,56 @@ static void start(const char *arg)
 		set_status(1, "%s", err);
 }
 
+static void lost_connection(void)
+{
+	fprintf(stderr, "mfm: lost the connection to the compositor: %s\n",
+		strerror(wl_display_get_error(dpy)));
+	exit(1);
+}
+
 int main(int argc, char **argv)
 {
 	if (argc > 2 || (argc == 2 && (!strcmp(argv[1], "-h") ||
 	    !strcmp(argv[1], "--help")))) {
 		fprintf(stderr, "usage: mfm [directory or file]\n"
 			"Environment: MFM_OPEN (default xdg-open), "
-			"MFM_TERMINAL / MWM_TERMINAL,\n"
-			"MFM_FONT (default \"Sans:size=10\"), "
-			"MWM_INACTIVE, MWM_ACTIVE.\n");
+			"MFM_TERMINAL / MWC_TERMINAL,\n"
+			"MFM_FONT (default \"Sans 10\"), "
+			"MWC_INACTIVE, MWC_ACTIVE.\n");
 		return argc == 2 ? 0 : 1;
 	}
 	setlocale(LC_ALL, "");
-	/* A locale glibc has but Xlib does not know leaves us without any
-	 * input method; C.UTF-8 for LC_CTYPE alone (collation and dates
-	 * stay) gives Xlib a locale it supports. */
-	if (!XSupportsLocale() && !setlocale(LC_CTYPE, "C.UTF-8"))
-		setlocale(LC_CTYPE, "C");
-	if (XSupportsLocale())
-		XSetLocaleModifiers("");
 	signal(SIGCHLD, SIG_IGN);
 
-	if (!(dpy = XOpenDisplay(NULL))) {
-		fprintf(stderr, "mfm: cannot open display\n");
+	if (!(dpy = wl_display_connect(NULL))) {
+		fprintf(stderr, "mfm: cannot connect to a Wayland compositor\n");
 		return 1;
 	}
-	scr = DefaultScreen(dpy);
-	root = RootWindow(dpy, scr);
-	vis = DefaultVisual(dpy, scr);
-	cmap = DefaultColormap(dpy, scr);
-	depth = DefaultDepth(dpy, scr);
+	if (!(xkb = xkb_context_new(XKB_CONTEXT_NO_FLAGS))) {
+		fprintf(stderr, "mfm: cannot set up xkbcommon\n");
+		return 1;
+	}
+	compose_init();
+	struct wl_registry *registry = wl_display_get_registry(dpy);
+	wl_registry_add_listener(registry, &registry_listener, NULL);
+	wl_display_roundtrip(dpy);
+	if (!compositor || !shm || !wm_base) {
+		fprintf(stderr, "mfm: the compositor lacks wl_compositor, wl_shm "
+			"or xdg_wm_base\n");
+		return 1;
+	}
+	cursor_init();
 	theme_init();
-	layout();
 	setup_window();
 	start(argc == 2 ? argv[1] : NULL);
 	set_title();
-	XMapWindow(dpy, win);
+	wl_surface_commit(main_s.wl);
 
-	int xfd = ConnectionNumber(dpy);
+	int dfd = wl_display_get_fd(dpy);
 	uint64_t next_poll = now_ms() + POLL_MS;
 	for (;;) {
+		if (wl_display_dispatch_pending(dpy) < 0)
+			lost_connection();
 		/* Timers run on every pass, so a steady stream of events
 		 * (held keys, scrolling) cannot starve them. */
 		uint64_t now = now_ms();
@@ -3590,34 +3966,46 @@ int main(int argc, char **argv)
 			search[0] = 0;
 			dirty = 1;
 		}
-		if (dirty && !XPending(dpy)) {
-			draw();
+		if (repeat_kc && now >= repeat_next) {
+			key_press(repeat_kc);
+			repeat_next = now_ms() + MAX(1000 / MAX(repeat_rate, 1), 1);
+		}
+		/* A frame at a time, except that a configure wants its commit
+		 * even if the window is hidden and gets no frames. */
+		if (dirty && configured && (!main_s.frame || need_commit) && draw()) {
 			dirty = 0;
+			need_commit = 0;
 		}
-		if (menu_on && menu_dirty && !XPending(dpy)) {
-			menu_draw();
+		if (menu_on && menu_dirty && menu_configured && !menu_s.frame &&
+		    menu_draw())
 			menu_dirty = 0;
+
+		if (wl_display_prepare_read(dpy) != 0)
+			continue;       /* events arrived in the meantime */
+		short dev = POLLIN;
+		if (wl_display_flush(dpy) < 0) {
+			if (errno != EAGAIN) {
+				wl_display_cancel_read(dpy);
+				lost_connection();
+			}
+			dev |= POLLOUT;
 		}
-		if (!XPending(dpy)) {
-			uint64_t wake = next_poll;
-			if (search[0])
-				wake = MIN(wake, search_ms + TYPEAHEAD_MS);
-			now = now_ms();
-			uint64_t ms = wake > now ? wake - now : 0;
-			struct timeval tv = { ms / 1000, (ms % 1000) * 1000 };
-			fd_set fds;
-			XFlush(dpy);
-			FD_ZERO(&fds);
-			FD_SET(xfd, &fds);
-			if (job.fd >= 0)
-				FD_SET(job.fd, &fds);
-			select(MAX(xfd, job.fd) + 1, &fds, NULL, NULL, &tv);
-			continue;
+		uint64_t wake = next_poll;
+		if (search[0])
+			wake = MIN(wake, search_ms + TYPEAHEAD_MS);
+		if (repeat_kc)
+			wake = MIN(wake, repeat_next);
+		now = now_ms();
+		struct pollfd fds[2] = {
+			{ .fd = dfd, .events = dev },
+			{ .fd = job.fd, .events = POLLIN },     /* -1: ignored */
+		};
+		poll(fds, 2, wake > now ? (int)MIN(wake - now, INT_MAX) : 0);
+		if (fds[0].revents & (POLLIN | POLLERR | POLLHUP)) {
+			if (wl_display_read_events(dpy) < 0)
+				lost_connection();
+		} else {
+			wl_display_cancel_read(dpy);
 		}
-		XEvent ev;
-		XNextEvent(dpy, &ev);
-		if (XFilterEvent(&ev, None))
-			continue;
-		handle(&ev);
 	}
 }

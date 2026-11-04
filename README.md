@@ -1,13 +1,16 @@
-# mfm – minimaler Dateibrowser für X11 (passend zu mwm)
+# mfm – minimaler Dateibrowser für Wayland (passend zu mwc)
 
-Eine C-Datei, nur Xlib + Xft, kein Toolkit. Motif-Look mit denselben Farben
-wie [mwm-x11](https://github.com/reygnn/mwm-x11): `MWM_INACTIVE` / `MWM_ACTIVE`
-aus der Umgebung, sonst `Mwm*background` / `Mwm*activeBackground` aus
-`~/.config/mwm/mwmrc`.
+Eine C-Datei, nur libwayland, xkbcommon, Cairo und Pango, kein Toolkit.
+Motif-Look mit denselben Farben wie [mwc](https://github.com/reygnn/mwc):
+`MWC_INACTIVE` / `MWC_ACTIVE` aus der Umgebung, sonst `Mwm*background` /
+`Mwm*activeBackground` aus `~/.config/mwc/mwmrc`.
+
+Die Version für X11 ist [mfm-x11](https://github.com/reygnn/mfm-x11).
 
 ## Bauen
 
-    sudo apt install build-essential pkg-config libx11-dev libxft-dev
+    sudo apt install build-essential pkg-config libwayland-dev wayland-protocols \
+        libxkbcommon-dev libcairo2-dev libpango1.0-dev
     make
     sudo make install        # -> /usr/local/bin/mfm
 
@@ -21,7 +24,7 @@ Mit einer Datei öffnet mfm deren Ordner und wählt sie aus. Ohne Argument
 startet er im aktuellen Verzeichnis. Lässt sich das Startverzeichnis nicht
 öffnen, zeigt er `$HOME` und meldet den Grund in der Statuszeile.
 
-Beim Start von mwm, z. B. in `~/.config/mwm/autostart`:
+Beim Start von mwc, z. B. in `~/.config/mwc/autostart`:
 
     #!/bin/sh
     mfm "$HOME" &
@@ -41,7 +44,7 @@ Beim Start von mwm, z. B. in `~/.config/mwm/autostart`:
 | Ctrl+H | versteckte Dateien ein/aus |
 | Ctrl+R / F5 | neu laden |
 | Ctrl+T | Terminal im aktuellen Ordner |
-| Ctrl+Q / Ctrl+W / Alt+F4 | beenden (Alt+F4 fängt unter mwm der Window Manager ab und schließt das Fenster) |
+| Ctrl+Q / Ctrl+W / Alt+F4 | beenden (Alt+F4 fängt unter mwc der Compositor ab und schließt das Fenster) |
 | Leertaste / Einfg | markieren bzw. Markierung aufheben, weiter zur nächsten Zeile (Leertaste während einer Namenssuche gehört zum Namen) |
 | Ctrl+A | alles markieren bzw. alle Markierungen aufheben |
 | Ctrl+C / Ctrl+X | Markierte (sonst die Auswahl) zum Kopieren bzw. Verschieben merken |
@@ -128,9 +131,9 @@ und ein mit Ctrl+T geöffnetes Terminal bekommt diesen Pfad als `$PWD`.
 Ein Elternordner, den man durchqueren, aber nicht auflisten darf, wird
 bei Backspace übersprungen.
 
-Texteingabe läuft über das in `XMODIFIERS` eingestellte Eingabesystem
-(ibus, fcitx, …). Läuft es nicht, nimmt mfm das in Xlib eingebaute (mit
-Compose und toten Tasten) und wechselt, sobald das eigentliche startet.
+Texteingabe kann Compose und tote Tasten, nach den Regeln der Locale
+(xkbcommon). Eingabesysteme wie ibus oder fcitx gehen nicht: Dafür bräuchte
+es `text-input-v3`, das mwc nicht anbietet.
 
 Dateinamen, die kein gültiges UTF-8 sind (z. B. Latin-1 von alten Platten
 oder Netzlaufwerken), werden als Latin-1 angezeigt.
@@ -140,9 +143,9 @@ oder Netzlaufwerken), werden als Latin-1 angezeigt.
 | Variable | Standard | |
 |---|---|---|
 | `MFM_OPEN` | `xdg-open` | Programm zum Öffnen von Dateien, z. B. `feh` oder `"mimeopen -n"`; die Datei wird als letztes Argument angehängt |
-| `MFM_TERMINAL` | `$MWM_TERMINAL`, sonst das erste gefundene von xterm, uxterm, x-terminal-emulator, urxvt, alacritty, konsole, kitty, xfce4-terminal, gnome-terminal | für Ctrl+T |
-| `MFM_FONT` | `Sans:size=10` | fontconfig-Muster |
-| `MWM_INACTIVE`, `MWM_ACTIVE` | `#aeb2c3`, `#7387ad` | Hintergrund, Auswahl |
+| `MFM_TERMINAL` | `$MWC_TERMINAL`, sonst das erste gefundene von foot, xterm, uxterm, x-terminal-emulator, urxvt, alacritty, konsole, kitty, xfce4-terminal, gnome-terminal | für Ctrl+T |
+| `MFM_FONT` | `Sans 10` | Pango-Name, z. B. `Sans Bold 11`; fontconfig-Muster wie in mfm-x11 (`Sans:size=10`) werden abgelehnt |
+| `MWC_INACTIVE`, `MWC_ACTIVE` | `#aeb2c3`, `#7387ad` | Hintergrund, Auswahl |
 
 `MFM_OPEN` und `MFM_TERMINAL` werden an Leerzeichen in Wörter zerlegt.
 Anführungszeichen fassen Wörter zusammen (`xterm -fa 'DejaVu Sans Mono'`),
@@ -152,6 +155,30 @@ absoluten Einträgen von `$PATH` gesucht, nie im gerade angezeigten Ordner.
 Fehlt es, steht das in der Statuszeile.
 
 Alles darüber hinaus (Rechte, Links, Archive, …): Ctrl+T und die Shell.
+
+## Compositor
+
+mfm braucht `xdg-shell` und fragt per `xdg-decoration` nach einem Rahmen vom
+Compositor. Wer das nicht anbietet (etwa GNOME/Mutter), zeigt mfm ohne Rahmen.
+Ein Fenstersymbol wie in mfm-x11 gibt es nicht: Wayland kennt `_NET_WM_ICON`
+nicht, der Compositor sieht nur die `app_id` `mfm`.
+
+Zeigerbewegungen mit gedrückter Taste brauchen vom Compositor einen impliziten
+Grab: Der Zeiger gehört der Oberfläche, auf der die Taste gedrückt wurde.
+Ohne ihn erfährt mfm nicht, wenn die Taste woanders losgelassen wird. Dann
+endet das Ziehen der Scrollbar am Fensterrand, und beim Kontextmenü führt
+„gedrückt halten, ziehen, loslassen“ den Befehl nicht aus: Das Menü bleibt
+offen, ein Klick auf den Befehl geht weiter.
+
+## Tests
+
+    make test
+
+fährt mfm unter einem headless laufenden mwc mit simulierter Maus und
+Tastatur und prüft Dateien und Screenshots (`tests/ui.sh`). Es braucht einen
+gebauten mwc samt `build/vinput` und `build/pngtool` neben diesem Ordner oder
+in `MWC_DIR` sowie `grim`. Der Test hat einen eigenen Socket und fasst eine
+laufende Sitzung nicht an.
 
 ## Lizenz
 
