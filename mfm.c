@@ -538,23 +538,26 @@ static int parse_color(const char *s, uint32_t *out)
 }
 
 /* Last global "Mwm*key: value" line of ~/.config/mwc/mwmrc. */
-static char *mwmrc_get(const char *key, char *val, size_t n)
+/* `key` from $XDG_CONFIG_HOME/`file` (default ~/.config/`file`), resource
+ * style: "Prefix*key: value" or "Prefix.key: value". The last one wins. */
+static char *rc_get(const char *file, const char *prefix, const char *key,
+	char *val, size_t n)
 {
-	char path[PATH_MAX], line[512];
+	char path[PATH_MAX], line[1024];
 	const char *home = getenv("HOME"), *xdg = getenv("XDG_CONFIG_HOME");
 	int len;
 	if (xdg && *xdg)
-		len = snprintf(path, sizeof path, "%s/mwc/mwmrc", xdg);
+		len = snprintf(path, sizeof path, "%s/%s", xdg, file);
 	else
-		len = snprintf(path, sizeof path, "%s/.config/mwc/mwmrc",
-			home ? home : "");
+		len = snprintf(path, sizeof path, "%s/.config/%s",
+			home ? home : "", file);
 	if (len < 0 || (size_t)len >= sizeof path)
 		return NULL;
 	FILE *f = fopen(path, "r");
 	if (!f)
 		return NULL;
 	char *found = NULL;
-	size_t kl = strlen(key);
+	size_t kl = strlen(key), pl = strlen(prefix);
 	while (fgets(line, sizeof line, f)) {
 		char *p = line;
 		while (isspace((unsigned char)*p))
@@ -566,8 +569,10 @@ static char *mwmrc_get(const char *key, char *val, size_t n)
 		char *ke = colon;
 		while (ke > p && isspace((unsigned char)ke[-1]))
 			ke--;
-		if (strncasecmp(p, "mwm", 3) || (p[3] != '*' && p[3] != '.') ||
-		    (size_t)(ke - (p + 4)) != kl || strncasecmp(p + 4, key, kl))
+		if (strncasecmp(p, prefix, pl) ||
+		    (p[pl] != '*' && p[pl] != '.') ||
+		    (size_t)(ke - (p + pl + 1)) != kl ||
+		    strncasecmp(p + pl + 1, key, kl))
 			continue;
 		p = colon + 1;
 		while (isspace((unsigned char)*p))
@@ -582,11 +587,53 @@ static char *mwmrc_get(const char *key, char *val, size_t n)
 	return found;
 }
 
+/* mwc's colors: ~/.config/mwc/mwmrc, as mwc reads it */
+static char *mwmrc_get(const char *key, char *val, size_t n)
+{
+	return rc_get("mwc/mwmrc", "mwm", key, val, n);
+}
+
+/* mfm's own settings: ~/.config/mfm/mfmrc, read whenever one is needed, so
+ * an edit takes effect without a restart (font, colors, sorting and hidden
+ * files only at startup). mfm never writes it. */
+static char *mfmrc_get(const char *key, char *val, size_t n)
+{
+	char *v = rc_get("mfm/mfmrc", "mfm", key, val, n);
+	return v && *v ? v : NULL;
+}
+
+/* The environment variable if set, else the mfmrc entry, else NULL; `src`
+ * names where it came from, for messages. */
+static const char *conf(const char *env, const char *res, char *buf,
+	size_t n, const char **src)
+{
+	static char name[64];
+	const char *v = getenv(env);
+	if (v && *v) {
+		*src = env;
+		return v;
+	}
+	snprintf(name, sizeof name, "Mfm*%s", res);
+	*src = name;
+	return mfmrc_get(res, buf, n);
+}
+
+static int rc_bool(const char *key)
+{
+	char v[64];
+	if (!mfmrc_get(key, v, sizeof v))
+		return 0;
+	return !strcasecmp(v, "true") || !strcasecmp(v, "yes") ||
+		!strcasecmp(v, "on") || !strcmp(v, "1");
+}
+
 static uint32_t setting(const char *env, const char *res, uint32_t def)
 {
 	uint32_t rgb;
 	char v[256];
 	if (parse_color(getenv(env), &rgb))
+		return rgb;
+	if (parse_color(mfmrc_get(res, v, sizeof v), &rgb))
 		return rgb;
 	if (parse_color(mwmrc_get(res, v, sizeof v), &rgb))
 		return rgb;
@@ -616,10 +663,11 @@ static void theme_init(void)
 
 	/* fontconfig patterns (Sans:bold:size=10, as mfm-x11 took them) mean
 	 * nothing to Pango, which would quietly pick some other font. */
-	const char *f = getenv("MFM_FONT");
+	char fb[256];
+	const char *fsrc, *f = conf("MFM_FONT", "font", fb, sizeof fb, &fsrc);
 	if (f && strchr(f, ':')) {
-		fprintf(stderr, "mfm: ignoring MFM_FONT \"%s\": it takes Pango "
-			"names like \"Sans Bold 10\"\n", f);
+		fprintf(stderr, "mfm: ignoring %s \"%s\": it takes Pango "
+			"names like \"Sans Bold 10\"\n", fsrc, f);
 		f = NULL;
 	}
 	PangoFontDescription *desc =
@@ -1147,16 +1195,16 @@ static int run(const char *cmd, const char *arg, char *name, size_t nsz)
 
 static void open_file(const char *path)
 {
-	const char *op = getenv("MFM_OPEN");
-	char name[256];
-	int custom = op && *op;
+	char ob[1024], name[256];
+	const char *src, *op = conf("MFM_OPEN", "open", ob, sizeof ob, &src);
+	int custom = op != NULL;
 	if (!custom)
 		op = "xdg-open";
 	int e = run(op, path, name, sizeof name);
 	const char *base = strrchr(path, '/');
 	base = base ? base + 1 : path;
 	if (e < 0)
-		set_status(1, "MFM_OPEN: cannot parse the command");
+		set_status(1, "%s: cannot parse the command", src);
 	else if (e)
 		set_status(1, "cannot run %s: %s%s", name, strerror(e),
 			e == ENOENT && !custom ?
@@ -1170,8 +1218,9 @@ static void open_terminal(void)
 	static const char *const terms[] = { "foot", "xterm", "uxterm",
 		"x-terminal-emulator", "urxvt", "alacritty", "konsole",
 		"kitty", "xfce4-terminal", "gnome-terminal" };
-	const char *var = "MFM_TERMINAL", *t = getenv(var);
-	char p[PATH_MAX], name[256];
+	char p[PATH_MAX], name[256], tb[1024];
+	const char *var, *t = conf("MFM_TERMINAL", "terminal", tb, sizeof tb,
+		&var);
 	if (!t || !*t)
 		t = getenv(var = "MWC_TERMINAL");
 	if (!t || !*t) {
@@ -2080,18 +2129,18 @@ static void paste(void)
  * first error line in the status line. */
 static void send_files(void)
 {
-	const char *cmd = getenv("MFM_SEND");
-	char b[2048], *av[34], name[256];
-	if (!cmd || !*cmd) {
-		set_status(1, "nothing to send with: set MFM_SEND, e.g. "
-			"MFM_SEND=adb-push-download");
+	char b[2048], *av[34], name[256], cb[1024];
+	const char *src, *cmd = conf("MFM_SEND", "send", cb, sizeof cb, &src);
+	if (!cmd) {
+		set_status(1, "nothing to send with: set Mfm*send in "
+			"~/.config/mfm/mfmrc or MFM_SEND");
 		return;
 	}
 	if (busy())
 		return;
 	int ac = split_cmd(cmd, b, sizeof b, av, 33);
 	if (ac <= 0) {
-		set_status(1, "MFM_SEND: cannot parse the command");
+		set_status(1, "%s: cannot parse the command", src);
 		return;
 	}
 	snprintf(name, sizeof name, "%s", av[0]);
@@ -3270,8 +3319,9 @@ static const struct xdg_surface_listener menu_xdg_listener = {
  * of the list. Commands on entries take the marks, else the selection. */
 static int has_send(void)
 {
-	const char *s = getenv("MFM_SEND");
-	return s && *s;
+	char b[1024];
+	const char *src;
+	return conf("MFM_SEND", "send", b, sizeof b, &src) != NULL;
 }
 
 static void menu_enable(int row)
@@ -4228,6 +4278,20 @@ static void start(const char *arg)
 	const char *pwd = getenv("PWD");
 	int ok = 0;
 
+	/* where mfmrc says to begin; Ctrl+H and Ctrl+1/2/3 change it from there */
+	char sv[32];
+	show_hidden = rc_bool("showHidden");
+	if (mfmrc_get("sort", sv, sizeof sv)) {
+		if (!strcasecmp(sv, "size"))
+			sort_by = SORT_SIZE;
+		else if (!strcasecmp(sv, "date"))
+			sort_by = SORT_DATE;
+		else if (strcasecmp(sv, "name"))
+			fprintf(stderr, "mfm: ignoring Mfm*sort \"%s\": it takes "
+				"name, size or date\n", sv);
+	}
+	sort_rev = rc_bool("sortReverse");
+
 	if (pwd && pwd[0] == '/' && strlen(pwd) < sizeof cwd &&
 	    normalize(pwd, p) == 0 && !strcmp(p, pwd) &&
 	    stat(pwd, &a) == 0 && stat(".", &b) == 0 &&
@@ -4287,7 +4351,8 @@ int main(int argc, char **argv)
 			"Environment: MFM_OPEN (default xdg-open), MFM_SEND, "
 			"MFM_TERMINAL / MWC_TERMINAL,\n"
 			"MFM_FONT (default \"Sans 10\"), "
-			"MWC_INACTIVE, MWC_ACTIVE.\n");
+			"MWC_INACTIVE, MWC_ACTIVE;\n"
+			"or the same in ~/.config/mfm/mfmrc (see the README).\n");
 		return argc == 2 ? 0 : 1;
 	}
 	setlocale(LC_ALL, "");

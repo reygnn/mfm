@@ -331,6 +331,28 @@ file_appears "the menu sends the clicked entry" "$SENT"
 [ "$(cat "$SENT")" = "$D/a.txt" ] || fail "MFM_SEND got: $(cat "$SENT")"
 mfm_quit
 
+# ~/.config/mfm/mfmrc: Mfm*send for Ctrl+S, and where sorting and hidden files
+# begin. By size with hidden files shown, the hidden one-byte file is last.
+fresh_dir mfmrc
+head -c 300 /dev/zero >"$D/big.txt"
+head -c 100 /dev/zero >"$D/small.txt"
+head -c 1 /dev/zero >"$D/.hid"
+mkdir -p "$XDG_CONFIG_HOME/mfm"
+{
+	printf '! comment\n'
+	printf '%s\n' "Mfm*send: sh -c 'printf \"%s\\n\" \"\$@\" > \"\$0.tmp\" && mv \"\$0.tmp\" \"\$0\"' $SENT"
+	printf 'mfm.sort:  size\n'
+	printf 'Mfm*showHidden: true\n'
+} >"$XDG_CONFIG_HOME/mfm/mfmrc"
+rm -f "$SENT"
+mfm_start "$D"
+for _ in 1 2 3; do do_input key Down; done
+do_input key ctrl+s
+file_appears "mfmrc: send, sort and hidden files" "$SENT"
+[ "$(cat "$SENT")" = "$D/.hid" ] || fail "Mfm*send got: $(cat "$SENT")"
+rm "$SENT" "$XDG_CONFIG_HOME/mfm/mfmrc"
+mfm_quit
+
 # ---- settings --------------------------------------------------------------
 
 # A font name without a size has no metrics of its own: find_rows checks the height.

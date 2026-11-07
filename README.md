@@ -3,7 +3,9 @@
 One C file, only libwayland, xkbcommon, Cairo and Pango, no toolkit. Motif
 look with the same colors as [mwc](https://github.com/reygnn/mwc):
 `MWC_INACTIVE` / `MWC_ACTIVE` from the environment, otherwise
-`Mwm*background` / `Mwm*activeBackground` from `~/.config/mwc/mwmrc`.
+`Mfm*background` / `Mfm*activeBackground` from `~/.config/mfm/mfmrc`,
+otherwise `Mwm*background` / `Mwm*activeBackground` from
+`~/.config/mwc/mwmrc`.
 
 The X11 version is [mfm-x11](https://github.com/reygnn/mfm-x11).
 
@@ -148,17 +150,40 @@ Only moving and typing repeat when held, not commands: Delete, Enter and
 key combinations act once per press; Delete and Backspace in input fields
 repeat.
 
-## Environment
+## Settings
+
+Settings come from the environment or from `~/.config/mfm/mfmrc`
+(`$XDG_CONFIG_HOME/mfm/mfmrc`), written like mwc's mwmrc: one
+`Mfm*key: value` per line (`Mfm.key` and any case work too), `!` starts a
+comment line, and of two lines for the same key the last one counts. A set
+environment variable takes precedence over its entry. mfm never writes the
+file. `open`, `send` and `terminal` are read on each use, so an edit takes
+effect at once; the rest is read at startup.
+
+    ! ~/.config/mfm/mfmrc
+    Mfm*send:        adb-push-download
+    Mfm*terminal:    mwt
+    Mfm*sort:        date
+    Mfm*showHidden:  true
+
+| mfmrc | Default | |
+|---|---|---|
+| `Mfm*open`, `Mfm*send`, `Mfm*terminal`, `Mfm*font` | as below | the same as `MFM_OPEN`, `MFM_SEND`, `MFM_TERMINAL`, `MFM_FONT` |
+| `Mfm*background`, `Mfm*activeBackground` | from mwc's mwmrc | background, selection |
+| `Mfm*sort` | `name` | `name`, `size` or `date`: the order mfm starts with |
+| `Mfm*sortReverse` | `false` | `true`: start with that order reversed |
+| `Mfm*showHidden` | `false` | `true`: start with hidden files shown |
 
 | Variable | Default | |
 |---|---|---|
 | `MFM_OPEN` | `xdg-open` | program to open files with, e.g. `feh` or `"mimeopen -n"`; the file is appended as the last argument |
 | `MFM_SEND` | – | program for Ctrl+S, e.g. `adb-push-download`; it gets all paths at once as its last arguments and runs in the background like a copy; the status line reports success or its first error line |
-| `MFM_TERMINAL` | `$MWC_TERMINAL`, else the first one found of foot, xterm, uxterm, x-terminal-emulator, urxvt, alacritty, konsole, kitty, xfce4-terminal, gnome-terminal | for Ctrl+T |
+| `MFM_TERMINAL` | `Mfm*terminal`, else `$MWC_TERMINAL`, else the first one found of foot, xterm, uxterm, x-terminal-emulator, urxvt, alacritty, konsole, kitty, xfce4-terminal, gnome-terminal | for Ctrl+T |
 | `MFM_FONT` | `Sans 10` | Pango name, e.g. `Sans Bold 11` (without a size: 10); fontconfig patterns as in mfm-x11 (`Sans:size=10`) are rejected |
 | `MWC_INACTIVE`, `MWC_ACTIVE` | `#aeb2c3`, `#7387ad` | background, selection |
 
-`MFM_OPEN`, `MFM_SEND` and `MFM_TERMINAL` are split into words at spaces.
+`MFM_OPEN`, `MFM_SEND` and `MFM_TERMINAL` (and their mfmrc entries) are
+split into words at spaces.
 Quotes group words (`xterm -fa 'DejaVu Sans Mono'`); beyond that there is
 no shell syntax (no `$VAR`, no `;`, no pipes) – for that, put in a small
 script. The program is only looked up in the absolute entries of `$PATH`,
