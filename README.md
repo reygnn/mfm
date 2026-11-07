@@ -42,6 +42,7 @@ Beim Start von mwc, z. B. in `~/.config/mwc/autostart`:
 | F2 | umbenennen (der Name ohne Endung ist ausgewählt: Tippen ersetzt ihn, ← → setzen den Cursor) |
 | F7 / Ctrl+Shift+N | neuer Ordner |
 | Ctrl+H | versteckte Dateien ein/aus |
+| Ctrl+1 / Ctrl+2 / Ctrl+3 | nach Name / Größe (größte zuerst) / Datum (neueste zuerst) sortieren, dieselbe Taste noch einmal kehrt die Reihenfolge um; Ordner bleiben oben, untereinander bei Größe nach Name |
 | Ctrl+R / F5 | neu laden |
 | Ctrl+T | Terminal im aktuellen Ordner |
 | Ctrl+Q / Ctrl+W / Alt+F4 | beenden (Alt+F4 fängt unter mwc der Compositor ab und schließt das Fenster) |

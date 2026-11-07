@@ -101,6 +101,15 @@ static char cwd[PATH_MAX];      /* logical, absolute, never empty once up */
 static struct timespec cwd_mtime;
 static int cwd_unsure;        /* changed within the timestamp granularity */
 static int show_hidden;
+/* Ctrl+1/2/3; the same key again reverses. Folders always stay on top. */
+enum { SORT_NAME, SORT_SIZE, SORT_DATE };
+static int sort_by, sort_rev;
+static const char *const sort_desc[3][2] = {
+	{ "by name", "by name, reversed" },
+	{ "by size, largest first", "by size, smallest first" },
+	{ "by date, newest first", "by date, oldest first" },
+};
+
 static char status_msg[PATH_MAX + 128];
 static int status_err;
 /* The last error load() put in the status line, and for which directory;
@@ -756,7 +765,21 @@ static int ent_cmp(const void *a, const void *b)
 		return y->up - x->up;
 	if (x->dir != y->dir)
 		return y->dir - x->dir;
-	return strcoll(x->name, y->name);
+	int r = 0;
+	/* Unknown sizes and dates go last; folder sizes say nothing, so
+	 * folders stay by name when sorting by size. Largest and newest
+	 * come first. */
+	if (sort_by != SORT_NAME && x->nostat != y->nostat)
+		return x->nostat - y->nostat;
+	if (sort_by == SORT_SIZE && !x->dir && x->size != y->size)
+		r = x->size > y->size ? -1 : 1;
+	else if (sort_by == SORT_DATE && x->mtime != y->mtime)
+		r = x->mtime > y->mtime ? -1 : 1;
+	if (!r)
+		r = strcoll(x->name, y->name);
+	if (!r)
+		r = strcmp(x->name, y->name);
+	return sort_rev ? -r : r;
 }
 
 static void free_ents(struct ent *v, int n)
@@ -2973,6 +2996,9 @@ static void paint(void)
 			n == 1 ? "" : "s");
 		if (m)
 			l += snprintf(s + l, sizeof s - l, ", %d marked", m);
+		if (sort_by || sort_rev)
+			l += snprintf(s + l, sizeof s - l, ", %s",
+				sort_desc[sort_by][sort_rev]);
 		if (show_hidden)
 			l += snprintf(s + l, sizeof s - l, ", hidden shown");
 		if (nclip)
@@ -3060,6 +3086,16 @@ static void toggle_hidden(void)
 	show_hidden = !show_hidden;
 	reload();
 	set_status(0, "hidden files %s", show_hidden ? "shown" : "hidden");
+}
+
+static void set_sort(int by)
+{
+	sort_rev = by == sort_by ? !sort_rev : 0;
+	sort_by = by;
+	if (reload() < 0)
+		return;         /* the old order stays, the error is shown */
+	show_sel();
+	set_status(0, "sorted %s", sort_desc[sort_by][sort_rev]);
 }
 
 static const char *menu_label(int i)
@@ -3390,6 +3426,9 @@ static void key(xkb_keysym_t ks, const char *txt, int n, unsigned state)
 		switch (ks) {
 		case XKB_KEY_q: case XKB_KEY_w: exit(0);
 		case XKB_KEY_h: toggle_hidden(); break;
+		case XKB_KEY_1: case XKB_KEY_KP_1: set_sort(SORT_NAME); break;
+		case XKB_KEY_2: case XKB_KEY_KP_2: set_sort(SORT_SIZE); break;
+		case XKB_KEY_3: case XKB_KEY_KP_3: set_sort(SORT_DATE); break;
 		case XKB_KEY_r: reload(); break;
 		case XKB_KEY_l: edit_begin(); break;
 		case XKB_KEY_t: open_terminal(); break;

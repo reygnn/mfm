@@ -274,6 +274,32 @@ do_input key Return
 file_appears "Left steps over a combining accent" "$D/$(printf 'cae\xcc\x81.txt')"
 mfm_quit
 
+# Ctrl+1/2/3 sort by name, size and date, the same key again reverses; folders
+# stay on top (the last row would be the folder in the reversed size order
+# otherwise). vinput has no End: up to "..", then down to the fifth row.
+fresh_dir sort
+mkdir "$D/folder"
+head -c 300 /dev/zero >"$D/a.txt"; touch -d 2020-01-01 "$D/a.txt"
+head -c 100 /dev/zero >"$D/b.txt"; touch -d 2024-01-01 "$D/b.txt"
+head -c 200 /dev/zero >"$D/c.txt"; touch -d 2022-01-01 "$D/c.txt"
+mfm_start "$D"
+sort_rename() {
+	do_input key "$1"
+	for _ in 1 2 3 4; do do_input key Up; done
+	for _ in 1 2 3 4; do do_input key Down; done
+	do_input key F2
+	do_input key "$2"
+	do_input key Return
+	file_appears "$3" "$D/$2.txt"
+}
+sort_rename ctrl+2 s "by size, the smallest last"
+sort_rename ctrl+2 l "by size reversed, the largest last"
+sort_rename ctrl+3 o "by date, the oldest last"
+sort_rename ctrl+3 n "by date reversed, the newest last"
+sort_rename ctrl+1 z "back by name"
+[ -d "$D/folder" ] || fail "the folder was renamed"
+mfm_quit
+
 # ---- settings --------------------------------------------------------------
 
 # A font name without a size has no metrics of its own: find_rows checks the height.
