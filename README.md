@@ -1,213 +1,205 @@
-# mfm – minimaler Dateibrowser für Wayland (passend zu mwc)
+# mfm – a minimal file browser for Wayland (to go with mwc)
 
-Eine C-Datei, nur libwayland, xkbcommon, Cairo und Pango, kein Toolkit.
-Motif-Look mit denselben Farben wie [mwc](https://github.com/reygnn/mwc):
-`MWC_INACTIVE` / `MWC_ACTIVE` aus der Umgebung, sonst `Mwm*background` /
-`Mwm*activeBackground` aus `~/.config/mwc/mwmrc`.
+One C file, only libwayland, xkbcommon, Cairo and Pango, no toolkit. Motif
+look with the same colors as [mwc](https://github.com/reygnn/mwc):
+`MWC_INACTIVE` / `MWC_ACTIVE` from the environment, otherwise
+`Mwm*background` / `Mwm*activeBackground` from `~/.config/mwc/mwmrc`.
 
-Die Version für X11 ist [mfm-x11](https://github.com/reygnn/mfm-x11).
+The X11 version is [mfm-x11](https://github.com/reygnn/mfm-x11).
 
-## Bauen
+## Building
 
     sudo apt install build-essential pkg-config libwayland-dev wayland-protocols \
         libxkbcommon-dev libcairo2-dev libpango1.0-dev
     make
     sudo make install        # -> /usr/local/bin/mfm
 
-Zum Öffnen von Dateien optional: `sudo apt install xdg-utils`.
+To open files, optionally: `sudo apt install xdg-utils`.
 
-## Starten
+## Running
 
-    mfm [verzeichnis | datei]
+    mfm [directory | file]
 
-Mit einer Datei öffnet mfm deren Ordner und wählt sie aus. Ohne Argument
-startet er im aktuellen Verzeichnis. Lässt sich das Startverzeichnis nicht
-öffnen, zeigt er `$HOME` und meldet den Grund in der Statuszeile.
+Given a file, mfm opens its folder and selects it. Without an argument it
+starts in the current directory. If the start directory cannot be opened,
+it shows `$HOME` and gives the reason in the status line.
 
-Beim Start von mwc, z. B. in `~/.config/mwc/autostart`:
+To start it with mwc, e.g. in `~/.config/mwc/autostart`:
 
     #!/bin/sh
     mfm "$HOME" &
 
-## Tasten
+## Keys
 
-| Taste | Aktion |
+| Key | Action |
 |---|---|
-| ↑ ↓ Bild↑ Bild↓ Pos1 Ende (auch Ziffernblock) | bewegen |
-| Enter / → | Ordner öffnen bzw. Datei öffnen |
-| Backspace / ← / Alt+↑ | übergeordneter Ordner |
-| Alt+Pos1 | Home-Verzeichnis |
-| Buchstaben tippen | zum Namen springen (Groß/klein egal, auch bei Umlauten; nach 1 s beginnt die Suche neu) |
-| Ctrl+L | Pfad eingeben (`/…` oder `~…` beginnt neu, Ctrl+U leert) |
-| F2 | umbenennen (der Name ohne Endung ist ausgewählt: Tippen ersetzt ihn, ← → setzen den Cursor) |
-| F7 / Ctrl+Shift+N | neuer Ordner |
-| Ctrl+H | versteckte Dateien ein/aus |
-| Ctrl+1 / Ctrl+2 / Ctrl+3 | nach Name / Größe (größte zuerst) / Datum (neueste zuerst) sortieren, dieselbe Taste noch einmal kehrt die Reihenfolge um; Ordner bleiben oben, untereinander bei Größe nach Name |
-| Ctrl+R / F5 | neu laden |
-| Ctrl+T | Terminal im aktuellen Ordner |
-| Ctrl+Q / Ctrl+W / Alt+F4 | beenden (Alt+F4 fängt unter mwc der Compositor ab und schließt das Fenster) |
-| Leertaste / Einfg | markieren bzw. Markierung aufheben, weiter zur nächsten Zeile (Leertaste während einer Namenssuche gehört zum Namen) |
-| Ctrl+A | alles markieren bzw. alle Markierungen aufheben |
-| Ctrl+C / Ctrl+X | Markierte (sonst die Auswahl) zum Kopieren bzw. Verschieben merken |
-| Ctrl+V | im aktuellen Ordner einfügen |
-| Ctrl+S | Markierte (sonst die Auswahl) mit `MFM_SEND` senden, z. B. aufs Handy |
-| Entf | in den Papierkorb |
-| Shift+Entf | endgültig löschen, nach Rückfrage (`y`/`j` bestätigt, jede andere Taste bricht ab) |
-| Esc | der Reihe nach: Suche löschen, sonst Meldung löschen, sonst Markierungen aufheben |
+| ↑ ↓ PgUp PgDn Home End (keypad too) | move |
+| Enter / → | open a folder or a file |
+| Backspace / ← / Alt+↑ | parent folder |
+| Alt+Home | home directory |
+| typing letters | jump to a name (case-insensitive, umlauts included; after 1 s the search starts over) |
+| Ctrl+L | enter a path (`/…` or `~…` starts over, Ctrl+U clears) |
+| F2 | rename (the name without its extension is selected: typing replaces it, ← → place the cursor) |
+| F7 / Ctrl+Shift+N | new folder |
+| Ctrl+H | show/hide hidden files |
+| Ctrl+1 / Ctrl+2 / Ctrl+3 | sort by name / size (largest first) / date (newest first); the same key again reverses the order; folders stay on top, by name among themselves when sorting by size |
+| Ctrl+R / F5 | reload |
+| Ctrl+T | terminal in the current folder |
+| Ctrl+Q / Ctrl+W / Alt+F4 | quit (under mwc the compositor takes Alt+F4 and closes the window) |
+| Space / Insert | mark or unmark, then move to the next row (during a name search, Space is part of the name) |
+| Ctrl+A | mark all, or unmark all |
+| Ctrl+C / Ctrl+X | remember the marked entries (else the selection) for copying or moving |
+| Ctrl+V | paste into the current folder |
+| Ctrl+S | send the marked entries (else the selection) with `MFM_SEND`, e.g. to a phone |
+| Delete | move to the trash |
+| Shift+Delete | delete permanently, after asking (`y`/`j` confirms, any other key cancels) |
+| Esc | one at a time: clear the search, else clear the message, else unmark all |
 
-In Eingabefeldern (Pfad, Umbenennen, neuer Ordner): ← → Pos1 Ende bewegen
-den Cursor, Backspace/Entf löschen, Ctrl+U leert, Enter bestätigt, Esc
-bricht ab.
+In input fields (path, rename, new folder): ← → Home End move the cursor,
+Backspace/Delete delete, Ctrl+U clears, Enter confirms, Esc cancels.
 
-Maus: Klick wählt, Doppelklick öffnet, Mausrad scrollt, Scrollbar ziehen
-oder in die Leiste klicken, Pfeil-Button oder Maus-Zurück-Taste (8) für
-„nach oben“, Klick in die Pfadzeile zum Bearbeiten, Ctrl+Klick markiert,
-Shift+Klick markiert den Bereich bis zur Auswahl, ein einfacher Klick hebt
-alle Markierungen auf.
+Mouse: click selects, double-click opens, the wheel scrolls, drag the
+scrollbar or click into its trough, the arrow button or the mouse back
+button (8) goes up, click into the path field to edit it, Ctrl+click marks,
+Shift+click marks the range up to the selection, a plain click unmarks
+everything.
 
-Rechtsklick in die Liste öffnet ein Kontextmenü mit den Befehlen von oben
-(Öffnen, Ausschneiden, Kopieren, Einfügen, Senden – nur mit `MFM_SEND` –, Umbenennen, Papierkorb,
-endgültig löschen, neuer Ordner, Terminal, versteckte Dateien, neu laden).
-Ein Rechtsklick auf einen markierten Eintrag behält die Markierungen:
-Ausschneiden, Kopieren, Senden, Papierkorb und Löschen wirken dann auf alle
-markierten, Öffnen und Umbenennen gibt es nur bei höchstens einer
-Markierung. Ein Rechtsklick auf einen anderen Eintrag wählt nur diesen
-aus. Auf freier Fläche wirkt das Menü auf die Markierungen, sonst nur auf
-den Ordner. Solange kopiert oder verschoben wird, sind Einfügen,
-Umbenennen, Papierkorb, Löschen und neuer Ordner gesperrt. Gedrückt
-halten, auf einen Befehl ziehen und loslassen führt ihn aus, ebenso ein
-Klick darauf; ↑ ↓ und Enter gehen auch, Esc oder ein Klick daneben
-schließt das Menü. Hat sich die Liste geändert, während das Menü offen war
-(Eintrag verschwunden, anderer Ordner), passiert nichts.
+A right-click into the list opens a context menu with the commands from
+above (Open, Cut, Copy, Paste, Send – only with `MFM_SEND` –, Rename, Move
+to trash, Delete permanently, New folder, Terminal, hidden files, Reload).
+A right-click on a marked entry keeps the marks: Cut, Copy, Send, Move to
+trash and Delete then act on all marked entries, while Open and Rename are
+only offered with at most one mark. A right-click on any other entry
+selects just that one. On empty space the menu acts on the marks, else only
+on the folder. While a copy or move is running, Paste, Rename, Move to
+trash, Delete and New folder are disabled. Press and hold, drag onto a
+command and release to run it, or click it; ↑ ↓ and Enter work too, Esc or
+a click elsewhere closes the menu. If the listing changed while the menu
+was open (the entry disappeared, a different folder), nothing happens.
 
-## Dateien verwalten
+## Managing files
 
-Die Markierungen gelten im aktuellen Ordner und bleiben beim automatischen
-Neuladen erhalten; beim Ordnerwechsel, nach Ctrl+C/Ctrl+X und bei einem
-einfachen Klick verfallen sie. Ohne Markierung wirkt jede Aktion auf die
-ausgewählte Zeile.
+Marks belong to the current folder and survive the automatic reload; they
+are dropped on changing folders, after Ctrl+C/Ctrl+X and on a plain click.
+Without marks, every action works on the selected row.
 
-Kopieren, Verschieben und endgültiges Löschen laufen in einem
-Hintergrundprozess, das Fenster bleibt bedienbar; eine weitere Aktion
-(auch F2/F7) wartet, bis die laufende fertig ist. Beendet man mfm
-vorher, läuft sie zu Ende. Das Ergebnis, bei Fehlern der erste davon,
-steht in der Statuszeile. Nach Ctrl+X bleibt die Zwischenablage stehen,
-bis das Verschieben ganz geklappt hat. Stirbt der Hintergrundprozess, meldet
-mfm das und lässt die Zwischenablage ebenfalls stehen.
+Copying, moving and permanent deletion run in a background process, so the
+window stays usable; another action (F2/F7 included) waits until the
+running one is done. If you quit mfm before that, it still runs to the
+end. The result, or the first error, appears in the status line. After
+Ctrl+X the clipboard stays until the move has fully succeeded. If the
+background process dies, mfm says so and keeps the clipboard as well.
 
-Überschrieben wird nie. Verschoben wird innerhalb eines Dateisystems per
-`rename`, das keinen vorhandenen Namen ersetzt. Kopien (`cp -a`) und
-Verschiebungen über Dateisystemgrenzen (`mv`) landen zuerst in einem
-versteckten Ordner `.mfm-XXXXXX` im Ziel und werden von dort umbenannt:
-Eine halbe Kopie erscheint nie unter dem echten Namen, und der Name wird
-erst in diesem Moment gewählt. Ist er vergeben (auch nur in anderer
-Groß-/Kleinschreibung auf FAT-Laufwerken), heißt die Kopie
-`name (copy).txt`, `name (copy 2).txt` usw., ein verschobener Eintrag
-`name (2).txt`, `name (3).txt`. So erzeugt auch Ctrl+C, Ctrl+V im
-selben Ordner ein Duplikat. Einen Ordner in sich selbst zu kopieren oder
-zu verschieben lehnt mfm ab. Auch Umbenennen überschreibt nichts; ist der
-neue Name vergeben, meldet mfm das. (Einzige Lücke: Dateisysteme ohne
-atomares „umbenennen ohne zu ersetzen“, z. B. NFS, bei Ordnern, und bei
-Dateien, wenn sie auch keine Hardlinks können.)
+Nothing is ever overwritten. Within a file system, moving is a `rename`
+that never replaces an existing name. Copies (`cp -a`) and moves across
+file systems (`mv`) first land in a hidden folder `.mfm-XXXXXX` in the
+target and are renamed from there: half a copy never shows up under the
+real name, and the name is only chosen at that moment. If it is taken
+(even just in different case on FAT drives), the copy is called
+`name (copy).txt`, `name (copy 2).txt` and so on, a moved entry
+`name (2).txt`, `name (3).txt`. That is also how Ctrl+C, Ctrl+V in the
+same folder makes a duplicate. mfm refuses to copy or move a folder into
+itself. Renaming does not overwrite either; if the new name is taken, mfm
+says so. (The one gap: file systems without an atomic "rename without
+replacing", e.g. NFS, for folders, and for files if they cannot do hard
+links either.)
 
-Scheitert ein Verschieben über Dateisystemgrenzen, z. B. weil das Ziel voll
-ist, bleibt das Angekommene im versteckten `.mfm-XXXXXX`, und die Statuszeile
-nennt den Ordner. Nach dem Fehlschlag ist die Quelle in aller Regel noch
-vollständig. Eine gescheiterte Kopie räumt mfm weg.
+If a move across file systems fails, e.g. because the target is full, what
+arrived stays in the hidden `.mfm-XXXXXX`, and the status line names that
+folder. After such a failure the source is, as a rule, still complete. mfm
+cleans up after a failed copy.
 
-Endgültiges Löschen ist `rm -rf --one-file-system`. Einen Einhängepunkt selbst
-und einen Ordner, in dem etwas eingehängt ist, löscht mfm nicht, auch nicht
-Bind-Mounts vom selben Dateisystem, deren Inhalt `rm` sonst leeren würde. Auch
-verschieben lässt sich ein Einhängepunkt nicht, und über Dateisystemgrenzen auch
-kein Ordner, in dem etwas eingehängt ist; kopieren geht.
+Permanent deletion is `rm -rf --one-file-system`. mfm does not delete a
+mount point itself or a folder with something mounted in it, bind mounts
+from the same file system included, whose contents `rm` would otherwise
+empty. A mount point cannot be moved either, nor, across file systems, a
+folder with something mounted in it; copying works.
 
-Der Papierkorb folgt der freedesktop.org-Spezifikation, Dateien lassen
-sich also mit jedem Dateimanager wiederherstellen, der sie kennt (oder per
-Hand aus `files/`, der Originalpfad steht in `info/*.trashinfo`). Er liegt
-in `$XDG_DATA_HOME/Trash` (Standard `~/.local/share/Trash`), für Dateien
-auf anderen Dateisystemen an deren Wurzel in `.Trash/$UID` (wenn der
-Administrator einen gemeinsamen `.Trash` eingerichtet hat), sonst in
-`.Trash-$UID`; dort steht der Originalpfad relativ zur Wurzel, damit er
-auch stimmt, wenn der Datenträger woanders eingehängt wird. Was schon im
-Papierkorb liegt, wird nicht noch einmal hineingelegt. Geht es nicht
-(z. B. schreibgeschützt), bleibt Shift+Entf.
+The trash follows the freedesktop.org specification, so files can be
+restored with any file manager that knows it (or by hand from `files/`; the
+original path is in `info/*.trashinfo`). It lives in `$XDG_DATA_HOME/Trash`
+(default `~/.local/share/Trash`); for files on other file systems, at their
+root in `.Trash/$UID` (if the administrator has set up a shared `.Trash`),
+else in `.Trash-$UID`. There the original path is relative to the root, so
+it stays correct when the drive is mounted somewhere else. What is already
+in the trash is not put there again. If trashing does not work (e.g.
+read-only), Shift+Delete is left.
 
-Der Ordner wird jede Sekunde auf Änderungen geprüft und neu eingelesen,
-wobei Auswahl und Scrollposition erhalten bleiben. Verschwindet er oder wird
-er unlesbar, springt mfm zum nächsten lesbaren Elternordner. Geänderte Größen
-oder Rechte einer Datei ändern den Ordner nicht: Die zeigt erst Ctrl+R.
+The folder is checked for changes every second and read again, keeping the
+selection and the scroll position. If it disappears or becomes unreadable,
+mfm moves to the nearest readable parent. A file's changed size or
+permissions do not change the folder: Ctrl+R shows them.
 
-Pfade sind logisch wie bei `cd` in der Shell: Nach dem Betreten eines
-verlinkten Ordners führt `..` zurück in den Ordner, in dem der Link liegt,
-und ein mit Ctrl+T geöffnetes Terminal bekommt diesen Pfad als `$PWD`.
-Ein Elternordner, den man durchqueren, aber nicht auflisten darf, wird
-bei Backspace übersprungen.
+Paths are logical, as with `cd` in the shell: after entering a linked
+folder, `..` leads back to the folder the link is in, and a terminal opened
+with Ctrl+T gets that path as `$PWD`. A parent folder you may traverse but
+not list is skipped by Backspace.
 
-Texteingabe kann Compose und tote Tasten, nach den Regeln der Locale
-(xkbcommon). Eingabesysteme wie ibus oder fcitx gehen nicht: Dafür bräuchte
-es `text-input-v3`, das mwc nicht anbietet.
+Text input handles Compose and dead keys, following the locale's rules
+(xkbcommon). Input methods such as ibus or fcitx do not work: they would
+need `text-input-v3`, which mwc does not offer.
 
-Dateinamen, die kein gültiges UTF-8 sind (z. B. Latin-1 von alten Platten
-oder Netzlaufwerken), werden als Latin-1 angezeigt. Steuerzeichen für die
-Schreibrichtung erscheinen als `�`, damit `zz\u202Efdp.exe` nicht wie
-`zzexe.pdf` aussieht.
+File names that are not valid UTF-8 (e.g. Latin-1 from old disks or network
+drives) are shown as Latin-1. Bidirectional control characters show as `�`,
+so that `zz‮fdp.exe` does not look like `zzexe.pdf`.
 
-Gehalten wiederholen nur Bewegen und Tippen, keine Befehle: Entf, Enter und
-Tastenkombinationen wirken einmal je Druck, Entf und Backspace in Eingabefeldern
-wiederholen.
+Only moving and typing repeat when held, not commands: Delete, Enter and
+key combinations act once per press; Delete and Backspace in input fields
+repeat.
 
-## Umgebung
+## Environment
 
-| Variable | Standard | |
+| Variable | Default | |
 |---|---|---|
-| `MFM_OPEN` | `xdg-open` | Programm zum Öffnen von Dateien, z. B. `feh` oder `"mimeopen -n"`; die Datei wird als letztes Argument angehängt |
-| `MFM_SEND` | – | Programm für Ctrl+S, z. B. `adb-push-download`; es bekommt alle Pfade auf einmal als letzte Argumente und läuft im Hintergrund wie Kopieren, die Statuszeile meldet Erfolg oder seine erste Fehlerzeile |
-| `MFM_TERMINAL` | `$MWC_TERMINAL`, sonst das erste gefundene von foot, xterm, uxterm, x-terminal-emulator, urxvt, alacritty, konsole, kitty, xfce4-terminal, gnome-terminal | für Ctrl+T |
-| `MFM_FONT` | `Sans 10` | Pango-Name, z. B. `Sans Bold 11` (ohne Größe: 10); fontconfig-Muster wie in mfm-x11 (`Sans:size=10`) werden abgelehnt |
-| `MWC_INACTIVE`, `MWC_ACTIVE` | `#aeb2c3`, `#7387ad` | Hintergrund, Auswahl |
+| `MFM_OPEN` | `xdg-open` | program to open files with, e.g. `feh` or `"mimeopen -n"`; the file is appended as the last argument |
+| `MFM_SEND` | – | program for Ctrl+S, e.g. `adb-push-download`; it gets all paths at once as its last arguments and runs in the background like a copy; the status line reports success or its first error line |
+| `MFM_TERMINAL` | `$MWC_TERMINAL`, else the first one found of foot, xterm, uxterm, x-terminal-emulator, urxvt, alacritty, konsole, kitty, xfce4-terminal, gnome-terminal | for Ctrl+T |
+| `MFM_FONT` | `Sans 10` | Pango name, e.g. `Sans Bold 11` (without a size: 10); fontconfig patterns as in mfm-x11 (`Sans:size=10`) are rejected |
+| `MWC_INACTIVE`, `MWC_ACTIVE` | `#aeb2c3`, `#7387ad` | background, selection |
 
-`MFM_OPEN`, `MFM_SEND` und `MFM_TERMINAL` werden an Leerzeichen in Wörter zerlegt.
-Anführungszeichen fassen Wörter zusammen (`xterm -fa 'DejaVu Sans Mono'`),
-sonst gibt es keine Shell-Syntax (keine `$VAR`, kein `;`, keine Pipes); für
-so etwas ein kleines Skript eintragen. Das Programm wird nur in den
-absoluten Einträgen von `$PATH` gesucht, nie im gerade angezeigten Ordner.
-Fehlt es, steht das in der Statuszeile.
+`MFM_OPEN`, `MFM_SEND` and `MFM_TERMINAL` are split into words at spaces.
+Quotes group words (`xterm -fa 'DejaVu Sans Mono'`); beyond that there is
+no shell syntax (no `$VAR`, no `;`, no pipes) – for that, put in a small
+script. The program is only looked up in the absolute entries of `$PATH`,
+never in the folder being shown. If it is missing, the status line says so.
 
-Alles darüber hinaus (Rechte, Links, Archive, …): Ctrl+T und die Shell.
+Anything beyond that (permissions, links, archives, …): Ctrl+T and the
+shell.
 
 ## Compositor
 
-mfm braucht `xdg-shell` und fragt per `xdg-decoration` nach einem Rahmen vom
-Compositor. Wer das nicht anbietet (etwa GNOME/Mutter), zeigt mfm ohne Rahmen.
-Ein Fenstersymbol wie in mfm-x11 gibt es nicht: Wayland kennt `_NET_WM_ICON`
-nicht, der Compositor sieht nur die `app_id` `mfm`.
+mfm needs `xdg-shell` and asks the compositor for a frame via
+`xdg-decoration`. Compositors that do not offer it (such as GNOME/Mutter)
+show mfm without a frame. There is no window icon as in mfm-x11: Wayland has
+no `_NET_WM_ICON`; the compositor only sees the `app_id` `mfm`.
 
-Zeigerbewegungen mit gedrückter Taste brauchen vom Compositor einen impliziten
-Grab: Der Zeiger gehört der Oberfläche, auf der die Taste gedrückt wurde.
-Ohne ihn erfährt mfm nicht, wenn die Taste woanders losgelassen wird. Dann
-endet das Ziehen der Scrollbar am Fensterrand, und beim Kontextmenü führt
-„gedrückt halten, ziehen, loslassen“ den Befehl nicht aus: Das Menü bleibt
-offen, ein Klick auf den Befehl geht weiter.
+Pointer motion with a button held needs an implicit grab from the
+compositor: the pointer belongs to the surface the button was pressed on.
+Without it, mfm does not learn when the button is released elsewhere. Then
+dragging the scrollbar ends at the window's edge, and in the context menu
+"press, drag, release" does not run the command: the menu stays open, and a
+click on the command still works.
 
 ## Tests
 
     make test
 
-fährt mfm unter einem headless laufenden mwc mit simulierter Maus und
-Tastatur und prüft Dateien und Screenshots (`tests/ui.sh`), dazu Dateioperationen
-mit echten Mounts in einem privaten Namespace (`tests/files.sh`; ohne User-Namespaces
-übersprungen). Es braucht einen gebauten mwc samt `build/vinput` und
-`build/pngtool` in `MWC_DIR` (sonst `../mwc` oder `../mwm`) sowie `grim`. Die Tests
-haben einen eigenen Socket und fassen eine laufende Sitzung nicht an.
+runs mfm under a headless mwc with a simulated mouse and keyboard and checks
+files and screenshots (`tests/ui.sh`), plus file operations with real mounts
+in a private namespace (`tests/files.sh`; skipped without user namespaces).
+It needs a built mwc with `build/vinput` and `build/pngtool` in `MWC_DIR`
+(else `../mwc` or `../mwm`), and `grim`. The tests have a socket of their
+own and leave a running session alone.
 
-Ohne grim oder mwcs Build-Abhängigkeiten, oder wo Ubuntu per AppArmor die
-User-Namespaces sperrt, bringt
+Without grim or mwc's build dependencies, or where Ubuntu's AppArmor blocks
+user namespaces,
 
     make test-docker
 
-alles in einem Container mit (podman oder docker, Image `mfm-test`). mwc wird
-dort aus `MWC_DIR` (sonst `../mwc`) gebaut, beide Quellen nur lesend eingebunden.
+brings everything along in a container (podman or docker, image
+`mfm-test`). mwc is built there from `MWC_DIR` (else `../mwc`); both source
+trees are mounted read-only.
 
-## Lizenz
+## License
 
-MIT, siehe [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
