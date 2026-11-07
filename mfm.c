@@ -4277,8 +4277,7 @@ static void lost_connection(void)
 
 int main(int argc, char **argv)
 {
-	if (argc == 2 && (!strcmp(argv[1], "-v") ||
-	    !strcmp(argv[1], "--version"))) {
+	if (argc == 2 && !strcmp(argv[1], "-v")) {
 		puts("mfm " MFM_VERSION);
 		return 0;
 	}
