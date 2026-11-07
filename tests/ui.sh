@@ -300,6 +300,37 @@ sort_rename ctrl+1 z "back by name"
 [ -d "$D/folder" ] || fail "the folder was renamed"
 mfm_quit
 
+# Ctrl+S runs MFM_SEND once, with the full paths of the marked entries, else of
+# the selected one. (Without MFM_SEND the menu leaves Send out: the trash test
+# above counts on that.)
+fresh_dir send
+touch "$D/a.txt" "$D/b c.txt" "$D/d.txt"
+SENT=$SMOKE_DIR/sent
+MFM_SEND="sh -c 'printf \"%s\\n\" \"\$@\" > \"\$0.tmp\" && mv \"\$0.tmp\" \"\$0\"' $SENT" \
+	mfm_start "$D"
+do_input key Down
+do_input key space
+do_input key space
+do_input key ctrl+s
+file_appears "Ctrl+S sends the marked entries" "$SENT"
+[ "$(cat "$SENT")" = "$(printf '%s\n' "$D/a.txt" "$D/b c.txt")" ] ||
+	fail "MFM_SEND got: $(cat "$SENT")"
+rm "$SENT"
+# The marks are gone after sending, so Ctrl+S takes the selection: d.txt.
+do_input key ctrl+s
+file_appears "then the selected one" "$SENT"
+[ "$(cat "$SENT")" = "$D/d.txt" ] || fail "MFM_SEND got: $(cat "$SENT")"
+rm "$SENT"
+# Through the menu: Open Cut Copy Send (Paste is off with nothing to paste).
+do_input move $((LISTX + 40)) "$(row_y 1)"
+do_input click right
+sleep 0.4
+for _ in 1 2 3 4; do do_input key Down; done
+do_input key Return
+file_appears "the menu sends the clicked entry" "$SENT"
+[ "$(cat "$SENT")" = "$D/a.txt" ] || fail "MFM_SEND got: $(cat "$SENT")"
+mfm_quit
+
 # ---- settings --------------------------------------------------------------
 
 # A font name without a size has no metrics of its own: find_rows checks the height.

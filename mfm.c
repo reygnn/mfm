@@ -142,9 +142,12 @@ static int npend;
 
 /* The running copy, move or delete. A child process does the work and
  * writes one line per failed item to fd; EOF means it is done. */
-enum { OP_COPY, OP_MOVE, OP_DELETE };
-static const char *const op_ing[] = { "copying", "moving", "deleting" };
-static const char *const op_ed[] = { "copied", "moved", "deleted" };
+enum { OP_COPY, OP_MOVE, OP_DELETE, OP_SEND };
+static const char *const op_ing[] = { "copying", "moving", "deleting",
+	"sending" };
+static const char *const op_ed[] = { "copied", "moved", "deleted", "sent" };
+/* Ctrl+S: MFM_SEND, looked up before the job starts; the worker inherits it. */
+static char send_prog[PATH_MAX];
 static struct {
 	int fd, op, n, fails;
 	int finished;           /* the worker said it got to its end */
@@ -1797,6 +1800,12 @@ static void worker(int op, const char *sdir, char **names, int n,
 	setsid();               /* not killed with mfm's terminal */
 	signal(SIGCHLD, SIG_DFL);
 	signal(SIGPIPE, SIG_IGN);       /* mfm may quit; finish the job */
+	if (op == OP_SEND) {
+		/* names is MFM_SEND's argv with the paths at its end */
+		if (wait_prog(send_prog, names, msg, sizeof msg) < 0)
+			report(out, "%s", msg);
+		n = 0;
+	}
 	for (int i = 0; i < n; i++) {
 		const char *nm = names[i];
 		struct stat st;
@@ -1975,6 +1984,8 @@ static void job_done(void)
 	if (!job.finished)
 		set_status(1, "%s stopped unexpectedly, the result may be "
 			"incomplete", op_ing[job.op]);
+	else if (job.fails && job.op == OP_SEND)
+		set_status(1, "sending failed: %s", job.out);
 	else if (job.fails)
 		set_status(1, "%d of %d failed: %s", job.fails, job.n, job.out);
 	else
@@ -2061,6 +2072,59 @@ static void paste(void)
 	}
 	start_job(clip_move ? OP_MOVE : OP_COPY, clip_dir, clip, nclip, cwd,
 		clip[0]);
+}
+
+/* Ctrl+S: run MFM_SEND once with the full paths of the marked entries, else
+ * of the selected one, as a job: in the background, with its exit status and
+ * first error line in the status line. */
+static void send_files(void)
+{
+	const char *cmd = getenv("MFM_SEND");
+	char b[2048], *av[34], name[256];
+	if (!cmd || !*cmd) {
+		set_status(1, "nothing to send with: set MFM_SEND, e.g. "
+			"MFM_SEND=adb-push-download");
+		return;
+	}
+	if (busy())
+		return;
+	int ac = split_cmd(cmd, b, sizeof b, av, 33);
+	if (ac <= 0) {
+		set_status(1, "MFM_SEND: cannot parse the command");
+		return;
+	}
+	snprintf(name, sizeof name, "%s", av[0]);
+	int e = find_prog(av[0], send_prog);
+	if (e) {
+		set_status(1, "cannot run %s: %s", name, strerror(e));
+		return;
+	}
+	int n;
+	char **v = targets(&n);
+	if (!v)
+		return;
+	char **args = calloc(ac + n + 1, sizeof *args);
+	int ok = args != NULL;
+	for (int i = 0; ok && i < ac; i++)
+		ok = (args[i] = strdup(av[i])) != NULL;
+	for (int i = 0; ok && i < n; i++) {
+		char p[PATH_MAX];
+		if (join(p, cwd, v[i]) < 0) {
+			set_status(1, "%s: %s", v[i], strerror(errno));
+			free_names(args, ac + n);
+			free_names(v, n);
+			return;
+		}
+		ok = (args[ac + i] = strdup(p)) != NULL;
+	}
+	if (!ok) {
+		set_status(1, "%s", strerror(ENOMEM));
+	} else {
+		unmark_all();
+		start_job(OP_SEND, cwd, args, n, cwd, NULL);
+	}
+	free_names(args, ac + n);
+	free_names(v, n);
 }
 
 /* Delete: into the trash, at once. */
@@ -3050,13 +3114,14 @@ static void on_resize(void)
  * and the number of marks are still what the menu was opened on.
  */
 enum { M_OPEN, M_CUT, M_COPY, M_PASTE, M_RENAME, M_TRASH, M_DELETE,
-	M_MKDIR, M_TERM, M_HIDDEN, M_RELOAD, M_SEP };
+	M_MKDIR, M_TERM, M_HIDDEN, M_RELOAD, M_SEND, M_SEP };
 static const struct { int id; const char *label, *accel; } menu_items[] = {
 	{ M_OPEN, "Open", "Enter" },
 	{ M_SEP, NULL, NULL },
 	{ M_CUT, "Cut", "Ctrl+X" },
 	{ M_COPY, "Copy", "Ctrl+C" },
 	{ M_PASTE, "Paste", "Ctrl+V" },
+	{ M_SEND, "Send", "Ctrl+S" },     /* only with MFM_SEND */
 	{ M_SEP, NULL, NULL },
 	{ M_RENAME, "Rename", "F2" },
 	{ M_TRASH, "Move to trash", "Del" },
@@ -3132,6 +3197,8 @@ static int menu_draw(void)
 	bevel((struct rect){ 0, 0, menu_w, menu_h }, 1);
 	for (int i = 0; i < NMENU; i++) {
 		int y = menu_y[i], h = menu_y[i + 1] - y;
+		if (!h)
+			continue;       /* left out */
 		if (menu_items[i].id == M_SEP) {
 			fill(px_bot, BEV + 2, y + 3, menu_w - 2 * BEV - 4, 1);
 			fill(px_top, BEV + 2, y + 4, menu_w - 2 * BEV - 4, 1);
@@ -3200,6 +3267,12 @@ static const struct xdg_surface_listener menu_xdg_listener = {
 
 /* Which items work: `row` is the clicked entry, or -1 for the empty area
  * of the list. Commands on entries take the marks, else the selection. */
+static int has_send(void)
+{
+	const char *s = getenv("MFM_SEND");
+	return s && *s;
+}
+
 static void menu_enable(int row)
 {
 	int nm = nmarked(), idle = job.fd < 0;
@@ -3214,6 +3287,7 @@ static void menu_enable(int row)
 		case M_TRASH: case M_DELETE: menu_ok[i] = some && idle; break;
 		case M_PASTE: menu_ok[i] = nclip > 0 && idle; break;
 		case M_MKDIR: menu_ok[i] = idle; break;
+		case M_SEND: menu_ok[i] = some && idle && has_send(); break;
 		default: menu_ok[i] = 1;
 		}
 	}
@@ -3228,8 +3302,9 @@ static void menu_open(int px, int py, uint32_t serial, uint32_t t, int row)
 	menu_y[0] = BEV + 2;
 	for (int i = 0; i < NMENU; i++) {
 		int sep = menu_items[i].id == M_SEP;
-		menu_y[i + 1] = menu_y[i] + (sep ? 8 : ih);
-		if (sep)
+		int gone = menu_items[i].id == M_SEND && !has_send();
+		menu_y[i + 1] = menu_y[i] + (gone ? 0 : sep ? 8 : ih);
+		if (sep || gone)
 			continue;
 		lw = MAX(lw, textw(menu_items[i].label,
 			strlen(menu_items[i].label)));
@@ -3302,6 +3377,7 @@ static void menu_run(int i)
 	case M_CUT: clip_set(1); break;
 	case M_COPY: clip_set(0); break;
 	case M_PASTE: paste(); break;
+	case M_SEND: send_files(); break;
 	case M_RENAME: prompt_begin(PR_RENAME); break;
 	case M_TRASH: trash(); break;
 	case M_DELETE: ask_delete(); break;
@@ -3436,6 +3512,7 @@ static void key(xkb_keysym_t ks, const char *txt, int n, unsigned state)
 		case XKB_KEY_c: clip_set(0); break;
 		case XKB_KEY_x: clip_set(1); break;
 		case XKB_KEY_v: paste(); break;
+		case XKB_KEY_s: send_files(); break;
 		case XKB_KEY_n:
 			if (shift)
 				prompt_begin(PR_MKDIR);

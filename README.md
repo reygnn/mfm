@@ -50,6 +50,7 @@ Beim Start von mwc, z. B. in `~/.config/mwc/autostart`:
 | Ctrl+A | alles markieren bzw. alle Markierungen aufheben |
 | Ctrl+C / Ctrl+X | Markierte (sonst die Auswahl) zum Kopieren bzw. Verschieben merken |
 | Ctrl+V | im aktuellen Ordner einfügen |
+| Ctrl+S | Markierte (sonst die Auswahl) mit `MFM_SEND` senden, z. B. aufs Handy |
 | Entf | in den Papierkorb |
 | Shift+Entf | endgültig löschen, nach Rückfrage (`y`/`j` bestätigt, jede andere Taste bricht ab) |
 | Esc | der Reihe nach: Suche löschen, sonst Meldung löschen, sonst Markierungen aufheben |
@@ -65,10 +66,10 @@ Shift+Klick markiert den Bereich bis zur Auswahl, ein einfacher Klick hebt
 alle Markierungen auf.
 
 Rechtsklick in die Liste öffnet ein Kontextmenü mit den Befehlen von oben
-(Öffnen, Ausschneiden, Kopieren, Einfügen, Umbenennen, Papierkorb,
+(Öffnen, Ausschneiden, Kopieren, Einfügen, Senden – nur mit `MFM_SEND` –, Umbenennen, Papierkorb,
 endgültig löschen, neuer Ordner, Terminal, versteckte Dateien, neu laden).
 Ein Rechtsklick auf einen markierten Eintrag behält die Markierungen:
-Ausschneiden, Kopieren, Papierkorb und Löschen wirken dann auf alle
+Ausschneiden, Kopieren, Senden, Papierkorb und Löschen wirken dann auf alle
 markierten, Öffnen und Umbenennen gibt es nur bei höchstens einer
 Markierung. Ein Rechtsklick auf einen anderen Eintrag wählt nur diesen
 aus. Auf freier Fläche wirkt das Menü auf die Markierungen, sonst nur auf
@@ -160,11 +161,12 @@ wiederholen.
 | Variable | Standard | |
 |---|---|---|
 | `MFM_OPEN` | `xdg-open` | Programm zum Öffnen von Dateien, z. B. `feh` oder `"mimeopen -n"`; die Datei wird als letztes Argument angehängt |
+| `MFM_SEND` | – | Programm für Ctrl+S, z. B. `adb-push-download`; es bekommt alle Pfade auf einmal als letzte Argumente und läuft im Hintergrund wie Kopieren, die Statuszeile meldet Erfolg oder seine erste Fehlerzeile |
 | `MFM_TERMINAL` | `$MWC_TERMINAL`, sonst das erste gefundene von foot, xterm, uxterm, x-terminal-emulator, urxvt, alacritty, konsole, kitty, xfce4-terminal, gnome-terminal | für Ctrl+T |
 | `MFM_FONT` | `Sans 10` | Pango-Name, z. B. `Sans Bold 11` (ohne Größe: 10); fontconfig-Muster wie in mfm-x11 (`Sans:size=10`) werden abgelehnt |
 | `MWC_INACTIVE`, `MWC_ACTIVE` | `#aeb2c3`, `#7387ad` | Hintergrund, Auswahl |
 
-`MFM_OPEN` und `MFM_TERMINAL` werden an Leerzeichen in Wörter zerlegt.
+`MFM_OPEN`, `MFM_SEND` und `MFM_TERMINAL` werden an Leerzeichen in Wörter zerlegt.
 Anführungszeichen fassen Wörter zusammen (`xterm -fa 'DejaVu Sans Mono'`),
 sonst gibt es keine Shell-Syntax (keine `$VAR`, kein `;`, keine Pipes); für
 so etwas ein kleines Skript eintragen. Das Programm wird nur in den
