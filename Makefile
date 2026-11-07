@@ -56,7 +56,11 @@ test: mfm
 	tests/ui.sh
 	tests/files.sh
 
+# The same in a podman (or docker) container, image mfm-test; see tests/docker/run.sh.
+test-docker:
+	tests/docker/run.sh
+
 clean:
 	rm -rf mfm build
 
-.PHONY: all install uninstall test clean
+.PHONY: all install uninstall test test-docker clean

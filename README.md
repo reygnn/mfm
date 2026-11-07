@@ -198,6 +198,14 @@ mit echten Mounts in einem privaten Namespace (`tests/files.sh`; ohne User-Names
 `build/pngtool` in `MWC_DIR` (sonst `../mwc` oder `../mwm`) sowie `grim`. Die Tests
 haben einen eigenen Socket und fassen eine laufende Sitzung nicht an.
 
+Ohne grim oder mwcs Build-Abhängigkeiten, oder wo Ubuntu per AppArmor die
+User-Namespaces sperrt, bringt
+
+    make test-docker
+
+alles in einem Container mit (podman oder docker, Image `mfm-test`). mwc wird
+dort aus `MWC_DIR` (sonst `../mwc`) gebaut, beide Quellen nur lesend eingebunden.
+
 ## Lizenz
 
 MIT, siehe [LICENSE](LICENSE).
