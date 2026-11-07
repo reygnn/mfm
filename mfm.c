@@ -68,6 +68,7 @@
 
 #include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
+#include "version.h"
 
 #define BEV 2           /* bevel width, as in mwm */
 #define PAD 6
@@ -4276,10 +4277,15 @@ static void lost_connection(void)
 
 int main(int argc, char **argv)
 {
+	if (argc == 2 && (!strcmp(argv[1], "-v") ||
+	    !strcmp(argv[1], "--version"))) {
+		puts("mfm " MFM_VERSION);
+		return 0;
+	}
 	if (argc > 2 || (argc == 2 && (!strcmp(argv[1], "-h") ||
 	    !strcmp(argv[1], "--help")))) {
-		fprintf(stderr, "usage: mfm [directory or file]\n"
-			"Environment: MFM_OPEN (default xdg-open), "
+		fprintf(stderr, "usage: mfm [-v] [directory or file]\n"
+			"Environment: MFM_OPEN (default xdg-open), MFM_SEND, "
 			"MFM_TERMINAL / MWC_TERMINAL,\n"
 			"MFM_FONT (default \"Sans 10\"), "
 			"MWC_INACTIVE, MWC_ACTIVE.\n");

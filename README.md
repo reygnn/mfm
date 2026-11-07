@@ -18,11 +18,12 @@ To open files, optionally: `sudo apt install xdg-utils`.
 
 ## Running
 
-    mfm [directory | file]
+    mfm [-v] [directory | file]
 
 Given a file, mfm opens its folder and selects it. Without an argument it
 starts in the current directory. If the start directory cannot be opened,
-it shows `$HOME` and gives the reason in the status line.
+it shows `$HOME` and gives the reason in the status line. `-v` prints the
+version, set in `version.h`.
 
 To start it with mwc, e.g. in `~/.config/mwc/autostart`:
 

@@ -22,7 +22,7 @@ MFM_LIBS = $(shell $(PKG_CONFIG) --libs $(PKGS))
 
 all: mfm
 
-mfm: mfm.c $(PROTO_H) $(PROTO_C)
+mfm: mfm.c version.h $(PROTO_H) $(PROTO_C)
 	$(CC) $(MFM_CFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ mfm.c $(PROTO_C) $(MFM_LIBS) $(LDLIBS)
 
 build:
