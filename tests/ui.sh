@@ -372,6 +372,49 @@ rm "$XDG_CONFIG_HOME/mwc/mwmrc"
 echo "ok: mwmrc in another spelling"
 mfm_quit
 
+# ---- the clipboard of the session -----------------------------------------
+
+CLIPGET=$MFM_DIR/build/clipget
+[ -x "$CLIPGET" ] || fail "$CLIPGET not built (make build/clipget)"
+clipget() { WAYLAND_DISPLAY=wayland-0 "$CLIPGET" "$@" 2>>"$LOG"; }
+# Only this test's own: the box may share the host's processes.
+clip_procs() {
+	local p
+	for p in $(pgrep -x mfm); do
+		[ "$p" = "$MFM_PID" ] && continue
+		{ tr '\0' '\n' <"/proc/$p/environ"; } 2>/dev/null | grep -qx "SMOKE_DIR=$SMOKE_DIR" &&
+			echo "$p"
+	done
+}
+
+fresh_dir clip
+touch "$D/a b.txt" "$D/zz.txt"
+mfm_start "$D"
+do_input key a
+do_input key ctrl+c
+check "plain Ctrl+C leaves the clipboard alone" '! clipget types >/dev/null'
+do_input key ctrl+shift+c
+check "Ctrl+Shift+C offers text/uri-list" 'clipget types | grep -qx text/uri-list'
+check "... as a file URL, percent-encoded, CRLF-terminated" \
+	'[ "$(clipget text/uri-list | od -An -c | tr -d " \n")" = "$(printf "file://%s/a%%20b.txt\r\n" "${D// /%20}" | od -An -c | tr -d " \n")" ]'
+check "... and the path as text" '[ "$(clipget text/plain)" = "$D/a b.txt" ]'
+check "... and for GNOME's file managers" \
+	'[ "$(clipget x-special/gnome-copied-files)" = "copy
+file://${D// /%20}/a%20b.txt" ]'
+do_input key ctrl+v
+file_appears "Ctrl+V pastes it in mfm, too" "$D/a b (copy).txt"
+do_input key ctrl+a
+do_input key ctrl+shift+x
+check "Ctrl+Shift+X: the marked entries, marked as cut" \
+	'[ "$(clipget x-special/gnome-copied-files | head -1)" = cut ] &&
+	 [ "$(clipget x-special/gnome-copied-files | wc -l)" = 3 ]'
+check "... with the special characters encoded" \
+	'clipget text/uri-list | grep -qx "file://${D// /%20}/a%20b%20%28copy%29.txt"$'"'"'\r'"'"''
+check "one helper holds the clipboard" '[ "$(clip_procs | wc -l)" = 1 ]'
+mfm_quit
+check "it outlives the window" 'clipget text/plain | grep -qx "$D/zz.txt"'
+check "... still just one" '[ "$(clip_procs | wc -l)" = 1 ]'
+
 # ---- the end ---------------------------------------------------------------
 
 # Compositor gone: an error message and status 1, not a hang.

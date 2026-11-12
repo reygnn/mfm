@@ -8,10 +8,13 @@ WAYLAND_PROTOCOLS := $(shell $(PKG_CONFIG) --variable=pkgdatadir wayland-protoco
 WAYLAND_SCANNER := $(shell $(PKG_CONFIG) --variable=wayland_scanner wayland-scanner)
 XDG_SHELL = $(WAYLAND_PROTOCOLS)/stable/xdg-shell/xdg-shell.xml
 XDG_DECORATION = $(WAYLAND_PROTOCOLS)/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml
+DATA_CONTROL = $(WAYLAND_PROTOCOLS)/staging/ext-data-control/ext-data-control-v1.xml
 
 PROTO_H = build/xdg-shell-client-protocol.h \
-	build/xdg-decoration-unstable-v1-client-protocol.h
-PROTO_C = build/xdg-shell-protocol.c build/xdg-decoration-unstable-v1-protocol.c
+	build/xdg-decoration-unstable-v1-client-protocol.h \
+	build/ext-data-control-v1-client-protocol.h
+PROTO_C = build/xdg-shell-protocol.c build/xdg-decoration-unstable-v1-protocol.c \
+	build/ext-data-control-v1-protocol.c
 
 # CFLAGS and LDLIBS stay the user's, also on the command line: `make CFLAGS=-O0`
 # must not lose the include paths.
@@ -40,6 +43,18 @@ build/xdg-decoration-unstable-v1-client-protocol.h: | build
 build/xdg-decoration-unstable-v1-protocol.c: | build
 	$(WAYLAND_SCANNER) private-code $(XDG_DECORATION) $@
 
+build/ext-data-control-v1-client-protocol.h: | build
+	$(WAYLAND_SCANNER) client-header $(DATA_CONTROL) $@
+
+build/ext-data-control-v1-protocol.c: | build
+	$(WAYLAND_SCANNER) private-code $(DATA_CONTROL) $@
+
+# For the tests: what is in the clipboard.
+build/clipget: tests/clipget.c build/ext-data-control-v1-client-protocol.h \
+		build/ext-data-control-v1-protocol.c
+	$(CC) $(MFM_CFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tests/clipget.c \
+		build/ext-data-control-v1-protocol.c $(MFM_LIBS) $(LDLIBS)
+
 install: mfm
 	install -Dm755 mfm $(DESTDIR)$(PREFIX)/bin/mfm
 	mkdir -p $(DESTDIR)$(PREFIX)/share/applications
@@ -52,7 +67,7 @@ uninstall:
 
 # Needs a built mwc next to this directory, or in MWC_DIR, and grim. files.sh also
 # needs unprivileged user namespaces, and is skipped without them.
-test: mfm
+test: mfm build/clipget
 	tests/ui.sh
 	tests/files.sh
 

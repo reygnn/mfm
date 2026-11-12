@@ -53,6 +53,7 @@ To start it with mwc, e.g. in `~/.config/mwc/autostart`:
 | Ctrl+A | mark all, or unmark all |
 | Ctrl+C / Ctrl+X | remember the marked entries (else the selection) for copying or moving |
 | Ctrl+V | paste into the current folder |
+| Ctrl+Shift+C / Ctrl+Shift+X | the same as Ctrl+C / Ctrl+X, and the full paths into the clipboard of the session, to paste the files into Firefox or another program (see below) |
 | Ctrl+S | send the marked entries (else the selection) with `MFM_SEND`, e.g. to a phone |
 | Delete | move to the trash |
 | Shift+Delete | delete permanently, after asking (`y`/`j` confirms, any other key cancels) |
@@ -92,6 +93,18 @@ running one is done. If you quit mfm before that, it still runs to the
 end. The result, or the first error, appears in the status line. After
 Ctrl+X the clipboard stays until the move has fully succeeded. If the
 background process dies, mfm says so and keeps the clipboard as well.
+
+Ctrl+C/Ctrl+X only remember the entries inside mfm. Ctrl+Shift+C and
+Ctrl+Shift+X also put them into the clipboard of the session, for other
+programs: as `text/uri-list` (`file://` URLs, which Firefox can paste as files,
+e.g. into an upload field), as `x-special/gnome-copied-files` (with "cut"
+after Ctrl+Shift+X, for GNOME's file managers) and as plain text (one full
+path per line). On Wayland the clipboard holds only a promise; the data
+comes from the program that copied when someone pastes. So a small helper
+process of mfm hands it out, with a connection of its own, through
+`ext-data-control-v1`. It stays after mfm quits, until something else is
+copied, and ends with the compositor. Without `ext-data-control-v1` the
+status line says so; Ctrl+V inside mfm works either way.
 
 Nothing is ever overwritten. Within a file system, moving is a `rename`
 that never replaces an existing name. Copies (`cp -a`) and moves across
@@ -205,6 +218,9 @@ Without it, mfm does not learn when the button is released elsewhere. Then
 dragging the scrollbar ends at the window's edge, and in the context menu
 "press, drag, release" does not run the command: the menu stays open, and a
 click on the command still works.
+
+Ctrl+Shift+C/Ctrl+Shift+X need `ext-data-control-v1` (mwc, sway and other
+wlroots compositors offer it).
 
 ## Tests
 

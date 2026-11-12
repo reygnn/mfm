@@ -14,7 +14,9 @@
  *         Ctrl+T  terminal here   Ctrl+Q / Ctrl+W / Alt+F4  quit
  *         Esc  clear the search, else the message, else the marks
  *         Space / Insert  mark   Ctrl+A  mark all   Ctrl+C / Ctrl+X  copy /
- *         cut   Ctrl+V  paste   Delete  to the trash   Shift+Delete  delete
+ *         cut   Ctrl+V  paste   Ctrl+Shift+C / Ctrl+Shift+X  the same,
+ *         and into the clipboard of the session   Delete  to the trash
+ *         Shift+Delete  delete
  *         F2  rename   F7 / Ctrl+Shift+N  new folder
  * Mouse:  click select, double-click open, wheel scroll, scrollbar drag,
  *         Ctrl+click mark, Shift+click mark a range,
@@ -66,6 +68,7 @@
 #include <xkbcommon/xkbcommon-compose.h>
 #include <xkbcommon/xkbcommon.h>
 
+#include "ext-data-control-v1-client-protocol.h"
 #include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 #include "version.h"
@@ -1632,6 +1635,20 @@ static int topdir_trash(const char *rpar, uint64_t mnt, char *top,
 	return own_dir(out);
 }
 
+/* path with everything but [A-Za-z0-9/-._~] percent-encoded, as a file URL
+ * wants it; out has room for 3 * strlen(path) + 1. */
+static void url_path(char *out, const char *path)
+{
+	size_t o = 0;
+	for (const unsigned char *s = (const unsigned char *)path; *s; s++) {
+		if ((*s < 0x80 && isalnum(*s)) || strchr("/-._~", *s))
+			out[o++] = *s;
+		else
+			o += sprintf(out + o, "%%%02X", *s);
+	}
+	out[o] = 0;
+}
+
 /* Move path into the trash directory t, recording `orig` as the original
  * path. info/NAME.trashinfo is created first (exclusively, which reserves
  * NAME), then the file goes to files/NAME. */
@@ -1646,14 +1663,7 @@ static int trash_into(const char *t, const char *path, const char *orig)
 	if (own_dir(files) < 0 || own_dir(info) < 0)
 		return -1;
 
-	size_t o = 0;
-	for (const unsigned char *s = (const unsigned char *)orig; *s; s++) {
-		if ((*s < 0x80 && isalnum(*s)) || strchr("/-._~", *s))
-			url[o++] = *s;
-		else
-			o += sprintf(url + o, "%%%02X", *s);
-	}
-	url[o] = 0;
+	url_path(url, orig);
 	time_t now = time(NULL);
 	struct tm tm;
 	if (!localtime_r(&now, &tm) ||
@@ -2089,6 +2099,227 @@ static void clip_set(int move)
 	else
 		set_status(0, "%s %d items: Ctrl+V in the target directory",
 			move ? "move" : "copy", n);
+}
+
+/* ---- the clipboard of the session --------------------------------------- */
+
+/* On Wayland the clipboard holds no data, only a promise: whoever copied
+ * hands it out when someone pastes. A child process with a connection of its
+ * own does that, through ext-data-control-v1, so the clipboard outlives the
+ * window. It stays until something else is copied (a new Ctrl+Shift+C too),
+ * or until the compositor is gone. */
+enum { CB_URIS, CB_GNOME, CB_PLAIN, CB_N };
+static const struct { const char *mime; int what; } cb_types[] = {
+	{ "text/uri-list", CB_URIS },   /* what Firefox takes as files */
+	{ "x-special/gnome-copied-files", CB_GNOME },
+	{ "text/plain;charset=utf-8", CB_PLAIN },
+	{ "text/plain", CB_PLAIN },
+};
+static struct { char *data[CB_N]; size_t len[CB_N]; int done; } cb;
+static struct wl_seat *cb_seat;
+static struct ext_data_control_manager_v1 *cb_mgr;
+
+static void write_all(int fd, const char *p, size_t n)
+{
+	while (n) {
+		ssize_t w = write(fd, p, n);
+		if (w < 0 && errno == EINTR)
+			continue;
+		if (w <= 0)
+			return;
+		p += w;
+		n -= w;
+	}
+}
+
+static void cb_send(void *data, struct ext_data_control_source_v1 *src,
+	const char *mime, int32_t fd)
+{
+	/* Handing it out is all this process does: a slow reader may wait. */
+	int fl = fcntl(fd, F_GETFL);
+	if (fl >= 0)
+		fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+	for (size_t i = 0; i < sizeof cb_types / sizeof cb_types[0]; i++)
+		if (!strcmp(mime, cb_types[i].mime)) {
+			int w = cb_types[i].what;
+			write_all(fd, cb.data[w], cb.len[w]);
+			break;
+		}
+	close(fd);
+}
+
+static void cb_cancelled(void *data, struct ext_data_control_source_v1 *src)
+{
+	cb.done = 1;
+}
+
+static const struct ext_data_control_source_v1_listener cb_source_listener = {
+	.send = cb_send,
+	.cancelled = cb_cancelled,
+};
+
+/* What others copy: never read, but the offers must be let go of. */
+static void cb_data_offer(void *data, struct ext_data_control_device_v1 *d,
+	struct ext_data_control_offer_v1 *offer)
+{
+}
+
+static void cb_selection(void *data, struct ext_data_control_device_v1 *d,
+	struct ext_data_control_offer_v1 *offer)
+{
+	if (offer)
+		ext_data_control_offer_v1_destroy(offer);
+}
+
+static void cb_finished(void *data, struct ext_data_control_device_v1 *d)
+{
+	cb.done = 1;
+}
+
+static const struct ext_data_control_device_v1_listener cb_device_listener = {
+	.data_offer = cb_data_offer,
+	.selection = cb_selection,
+	.finished = cb_finished,
+	.primary_selection = cb_selection,
+};
+
+static void cb_global(void *data, struct wl_registry *r, uint32_t name,
+	const char *iface, uint32_t ver)
+{
+	if (!strcmp(iface, wl_seat_interface.name) && !cb_seat)
+		cb_seat = wl_registry_bind(r, name, &wl_seat_interface, 1);
+	else if (!strcmp(iface, ext_data_control_manager_v1_interface.name))
+		cb_mgr = wl_registry_bind(r, name,
+			&ext_data_control_manager_v1_interface, 1);
+}
+
+static void cb_global_remove(void *data, struct wl_registry *r, uint32_t name)
+{
+}
+
+static const struct wl_registry_listener cb_registry_listener = {
+	.global = cb_global,
+	.global_remove = cb_global_remove,
+};
+
+/* The child: says on fd whether it holds the clipboard (an empty line) or
+ * why not, then hands it out. */
+static _Noreturn void cb_child(int fd)
+{
+	signal(SIGPIPE, SIG_IGN);       /* a reader may leave early */
+	setsid();                       /* the terminal may go, too */
+	struct wl_display *d = wl_display_connect(NULL);
+	if (!d) {
+		dprintf(fd, "no connection to the compositor\n");
+		_exit(1);
+	}
+	struct wl_registry *reg = wl_display_get_registry(d);
+	wl_registry_add_listener(reg, &cb_registry_listener, NULL);
+	if (wl_display_roundtrip(d) < 0 || !cb_seat || !cb_mgr) {
+		dprintf(fd, "the compositor offers no ext-data-control-v1\n");
+		_exit(1);
+	}
+	struct ext_data_control_device_v1 *dev =
+		ext_data_control_manager_v1_get_data_device(cb_mgr, cb_seat);
+	ext_data_control_device_v1_add_listener(dev, &cb_device_listener, NULL);
+	struct ext_data_control_source_v1 *src =
+		ext_data_control_manager_v1_create_data_source(cb_mgr);
+	ext_data_control_source_v1_add_listener(src, &cb_source_listener, NULL);
+	for (size_t i = 0; i < sizeof cb_types / sizeof cb_types[0]; i++)
+		ext_data_control_source_v1_offer(src, cb_types[i].mime);
+	ext_data_control_device_v1_set_selection(dev, src);
+	if (wl_display_roundtrip(d) < 0 || cb.done) {
+		dprintf(fd, "the compositor did not take it\n");
+		_exit(1);
+	}
+	dprintf(fd, "\n");
+	close(fd);
+	while (!cb.done && wl_display_dispatch(d) >= 0)
+		;
+	_exit(0);
+}
+
+/* Ctrl+Shift+C / Ctrl+Shift+X: what Ctrl+C / Ctrl+X do, and the full paths
+ * into the clipboard of the session, for other programs to paste. */
+static void clip_export(int move)
+{
+	clip_set(move);
+	if (!nclip)
+		return;
+	FILE *f[CB_N];
+	for (int i = 0; i < CB_N; i++)
+		cb.data[i] = NULL;
+	for (int i = 0; i < CB_N; i++)
+		if (!(f[i] = open_memstream(&cb.data[i], &cb.len[i]))) {
+			while (i--)
+				fclose(f[i]);
+			goto nomem;
+		}
+	fputs(move ? "cut" : "copy", f[CB_GNOME]);
+	static char url[3 * PATH_MAX + 1];
+	char p[PATH_MAX];
+	for (int i = 0; i < nclip; i++) {
+		if (join(p, clip_dir, clip[i]) < 0)
+			continue;       /* clip_dir + name fit when they were read */
+		url_path(url, p);
+		fprintf(f[CB_URIS], "file://%s\r\n", url);
+		fprintf(f[CB_GNOME], "\nfile://%s", url);
+		fprintf(f[CB_PLAIN], "%s%s", i ? "\n" : "", p);
+	}
+	int bad = 0;
+	for (int i = 0; i < CB_N; i++)
+		bad |= fclose(f[i]) != 0;
+	if (bad)
+		goto nomem;
+
+	int pp[2] = { -1, -1 };
+	pid_t pid = -1;
+	if (pipe2(pp, O_CLOEXEC) == 0 && (pid = fork()) == 0) {
+		/* Nothing of mfm's own connection: see start_job. */
+		if (pp[1] != 3 && dup2(pp[1], 3) < 0)
+			_exit(1);
+		close_range(4, ~0U, 0);
+		cb_child(3);
+	}
+	if (pid < 0) {
+		set_status(1, "clipboard: %s", strerror(errno));
+		if (pp[0] >= 0) {
+			close(pp[0]);
+			close(pp[1]);
+		}
+		goto out;
+	}
+	close(pp[1]);
+	/* The answer comes after one roundtrip; don't wait on a stuck one. */
+	char msg[128];
+	size_t n = 0;
+	struct pollfd pf = { .fd = pp[0], .events = POLLIN };
+	while (n < sizeof msg - 1 && poll(&pf, 1, 2000) > 0) {
+		ssize_t r = read(pp[0], msg + n, sizeof msg - 1 - n);
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r <= 0)
+			break;
+		n += r;
+		if (memchr(msg, '\n', n))
+			break;
+	}
+	close(pp[0]);
+	msg[n] = 0;
+	msg[strcspn(msg, "\n")] = 0;
+	if (n && !msg[0])
+		set_status(0, "%s %d item%s, into the clipboard too",
+			move ? "cut" : "copied", nclip, nclip == 1 ? "" : "s");
+	else
+		set_status(1, "clipboard: %s", n ? msg : "no answer");
+	goto out;
+nomem:
+	set_status(1, "clipboard: %s", strerror(ENOMEM));
+out:
+	for (int i = 0; i < CB_N; i++) {
+		free(cb.data[i]);
+		cb.data[i] = NULL;
+	}
 }
 
 /* Ctrl+V: copy or move the clipboard into cwd. */
@@ -3560,8 +3791,8 @@ static void key(xkb_keysym_t ks, const char *txt, int n, unsigned state)
 		case XKB_KEY_l: edit_begin(); break;
 		case XKB_KEY_t: open_terminal(); break;
 		case XKB_KEY_a: mark_all(); break;
-		case XKB_KEY_c: clip_set(0); break;
-		case XKB_KEY_x: clip_set(1); break;
+		case XKB_KEY_c: shift ? clip_export(0) : clip_set(0); break;
+		case XKB_KEY_x: shift ? clip_export(1) : clip_set(1); break;
 		case XKB_KEY_v: paste(); break;
 		case XKB_KEY_s: send_files(); break;
 		case XKB_KEY_n:
