@@ -95,7 +95,8 @@ delete_row() {
 	do_input move $((LISTX + 40)) "$(row_y "$1")"
 	do_input click right
 	sleep 0.4
-	for _ in 1 2 3 4 5 6; do do_input key Down; done   # Open Cut Copy Rename Trash Delete
+	# Open Cut Copy "Copy to clipboard" Rename Trash Delete
+	for _ in 1 2 3 4 5 6 7; do do_input key Down; done
 	do_input key Return
 	sleep 0.2
 	do_input key y

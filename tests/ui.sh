@@ -154,13 +154,13 @@ for k in c d; do do_input key "$k"; done
 do_input key Return
 file_appears "a click beside the menu closes it" "$D/cd"
 
-# The whole way through the keys: Down to Move to trash (Open Cut Copy Rename
-# Trash; Paste is off with nothing to paste).
+# The whole way through the keys: Down to Move to trash (Open Cut Copy
+# "Copy to clipboard" Rename Trash; Paste is off with nothing to paste).
 do_input key F5
 do_input move "$X" "$(row_y 3)"
 do_input click right
 sleep 0.4
-for _ in 1 2 3 4 5; do do_input key Down; done
+for _ in 1 2 3 4 5 6; do do_input key Down; done
 do_input key Return
 file_appears "the menu moves a file to the trash" "$XDG_DATA_HOME/Trash/files/one.txt"
 [ ! -e "$D/one.txt" ] || fail "one.txt still there"
@@ -321,11 +321,12 @@ do_input key ctrl+s
 file_appears "then the selected one" "$SENT"
 [ "$(cat "$SENT")" = "$D/d.txt" ] || fail "MFM_SEND got: $(cat "$SENT")"
 rm "$SENT"
-# Through the menu: Open Cut Copy Send (Paste is off with nothing to paste).
+# Through the menu: Open Cut Copy "Copy to clipboard" Send (Paste is off with
+# nothing to paste).
 do_input move $((LISTX + 40)) "$(row_y 1)"
 do_input click right
 sleep 0.4
-for _ in 1 2 3 4; do do_input key Down; done
+for _ in 1 2 3 4 5; do do_input key Down; done
 do_input key Return
 file_appears "the menu sends the clicked entry" "$SENT"
 [ "$(cat "$SENT")" = "$D/a.txt" ] || fail "MFM_SEND got: $(cat "$SENT")"
@@ -391,8 +392,10 @@ fresh_dir clip
 touch "$D/a b.txt" "$D/zz.txt"
 mfm_start "$D"
 do_input key a
+do_input key Down
 do_input key ctrl+c
 check "plain Ctrl+C leaves the clipboard alone" '! clipget types >/dev/null'
+do_input key Up
 do_input key ctrl+shift+c
 check "Ctrl+Shift+C offers text/uri-list" 'clipget types | grep -qx text/uri-list'
 check "... as a file URL, percent-encoded, CRLF-terminated" \
@@ -402,14 +405,14 @@ check "... and for GNOME's file managers" \
 	'[ "$(clipget x-special/gnome-copied-files)" = "copy
 file://${D// /%20}/a%20b.txt" ]'
 do_input key ctrl+v
-file_appears "Ctrl+V pastes it in mfm, too" "$D/a b (copy).txt"
+file_appears "Ctrl+V in mfm still pastes what Ctrl+C remembered" "$D/zz (copy).txt"
+check "... and not what went into the clipboard" '[ ! -e "$D/a b (copy).txt" ]'
 do_input key ctrl+a
-do_input key ctrl+shift+x
-check "Ctrl+Shift+X: the marked entries, marked as cut" \
-	'[ "$(clipget x-special/gnome-copied-files | head -1)" = cut ] &&
-	 [ "$(clipget x-special/gnome-copied-files | wc -l)" = 3 ]'
+do_input key ctrl+shift+c
+check "Ctrl+Shift+C: all the marked entries" \
+	'[ "$(clipget x-special/gnome-copied-files | wc -l)" = 3 ]'
 check "... with the special characters encoded" \
-	'clipget text/uri-list | grep -qx "file://${D// /%20}/a%20b%20%28copy%29.txt"$'"'"'\r'"'"''
+	'clipget text/uri-list | grep -qx "file://${D// /%20}/zz%20%28copy%29.txt"$'"'"'\r'"'"''
 check "one helper holds the clipboard" '[ "$(clip_procs | wc -l)" = 1 ]'
 mfm_quit
 check "it outlives the window" 'clipget text/plain | grep -qx "$D/zz.txt"'

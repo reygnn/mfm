@@ -14,8 +14,8 @@
  *         Ctrl+T  terminal here   Ctrl+Q / Ctrl+W / Alt+F4  quit
  *         Esc  clear the search, else the message, else the marks
  *         Space / Insert  mark   Ctrl+A  mark all   Ctrl+C / Ctrl+X  copy /
- *         cut   Ctrl+V  paste   Ctrl+Shift+C / Ctrl+Shift+X  the same,
- *         and into the clipboard of the session   Delete  to the trash
+ *         cut   Ctrl+V  paste   Ctrl+Shift+C  into the clipboard of the
+ *         session   Delete  to the trash
  *         Shift+Delete  delete
  *         F2  rename   F7 / Ctrl+Shift+N  new folder
  * Mouse:  click select, double-click open, wheel scroll, scrollbar drag,
@@ -2239,13 +2239,16 @@ static _Noreturn void cb_child(int fd)
 	_exit(0);
 }
 
-/* Ctrl+Shift+C / Ctrl+Shift+X: what Ctrl+C / Ctrl+X do, and the full paths
- * into the clipboard of the session, for other programs to paste. */
-static void clip_export(int move)
+/* Ctrl+Shift+C: the full paths of the marked entries (else the selection)
+ * into the clipboard of the session only, for other programs to paste; what
+ * Ctrl+V pastes in mfm stays as it was. */
+static void clip_export(void)
 {
-	clip_set(move);
-	if (!nclip)
+	int nnames;
+	char **names = targets(&nnames);
+	if (!names)
 		return;
+	unmark_all();
 	FILE *f[CB_N];
 	for (int i = 0; i < CB_N; i++)
 		cb.data[i] = NULL;
@@ -2255,12 +2258,12 @@ static void clip_export(int move)
 				fclose(f[i]);
 			goto nomem;
 		}
-	fputs(move ? "cut" : "copy", f[CB_GNOME]);
+	fputs("copy", f[CB_GNOME]);
 	static char url[3 * PATH_MAX + 1];
 	char p[PATH_MAX];
-	for (int i = 0; i < nclip; i++) {
-		if (join(p, clip_dir, clip[i]) < 0)
-			continue;       /* clip_dir + name fit when they were read */
+	for (int i = 0; i < nnames; i++) {
+		if (join(p, cwd, names[i]) < 0)
+			continue;       /* cwd + name fit when they were read */
 		url_path(url, p);
 		fprintf(f[CB_URIS], "file://%s\r\n", url);
 		fprintf(f[CB_GNOME], "\nfile://%s", url);
@@ -2308,8 +2311,8 @@ static void clip_export(int move)
 	msg[n] = 0;
 	msg[strcspn(msg, "\n")] = 0;
 	if (n && !msg[0])
-		set_status(0, "%s %d item%s, into the clipboard too",
-			move ? "cut" : "copied", nclip, nclip == 1 ? "" : "s");
+		set_status(0, "%d item%s in the clipboard",
+			nnames, nnames == 1 ? "" : "s");
 	else
 		set_status(1, "clipboard: %s", n ? msg : "no answer");
 	goto out;
@@ -2320,6 +2323,7 @@ out:
 		free(cb.data[i]);
 		cb.data[i] = NULL;
 	}
+	free_names(names, nnames);
 }
 
 /* Ctrl+V: copy or move the clipboard into cwd. */
@@ -3394,13 +3398,14 @@ static void on_resize(void)
  * finished job). A command only runs if the directory, the clicked entry
  * and the number of marks are still what the menu was opened on.
  */
-enum { M_OPEN, M_CUT, M_COPY, M_PASTE, M_RENAME, M_TRASH, M_DELETE,
+enum { M_OPEN, M_CUT, M_COPY, M_EXPORT, M_PASTE, M_RENAME, M_TRASH, M_DELETE,
 	M_MKDIR, M_TERM, M_HIDDEN, M_RELOAD, M_SEND, M_SEP };
 static const struct { int id; const char *label, *accel; } menu_items[] = {
 	{ M_OPEN, "Open", "Enter" },
 	{ M_SEP, NULL, NULL },
 	{ M_CUT, "Cut", "Ctrl+X" },
 	{ M_COPY, "Copy", "Ctrl+C" },
+	{ M_EXPORT, "Copy to clipboard", "Ctrl+Shift+C" },
 	{ M_PASTE, "Paste", "Ctrl+V" },
 	{ M_SEND, "Send", "Ctrl+S" },     /* only with MFM_SEND */
 	{ M_SEP, NULL, NULL },
@@ -3565,7 +3570,7 @@ static void menu_enable(int row)
 		/* the clicked entry alone, so not while others are marked */
 		case M_OPEN: menu_ok[i] = row >= 0 && nm <= 1; break;
 		case M_RENAME: menu_ok[i] = entry && nm <= 1 && idle; break;
-		case M_CUT: case M_COPY: menu_ok[i] = some; break;
+		case M_CUT: case M_COPY: case M_EXPORT: menu_ok[i] = some; break;
 		case M_TRASH: case M_DELETE: menu_ok[i] = some && idle; break;
 		case M_PASTE: menu_ok[i] = nclip > 0 && idle; break;
 		case M_MKDIR: menu_ok[i] = idle; break;
@@ -3658,6 +3663,7 @@ static void menu_run(int i)
 	case M_OPEN: activate(sel); break;
 	case M_CUT: clip_set(1); break;
 	case M_COPY: clip_set(0); break;
+	case M_EXPORT: clip_export(); break;
 	case M_PASTE: paste(); break;
 	case M_SEND: send_files(); break;
 	case M_RENAME: prompt_begin(PR_RENAME); break;
@@ -3791,8 +3797,8 @@ static void key(xkb_keysym_t ks, const char *txt, int n, unsigned state)
 		case XKB_KEY_l: edit_begin(); break;
 		case XKB_KEY_t: open_terminal(); break;
 		case XKB_KEY_a: mark_all(); break;
-		case XKB_KEY_c: shift ? clip_export(0) : clip_set(0); break;
-		case XKB_KEY_x: shift ? clip_export(1) : clip_set(1); break;
+		case XKB_KEY_c: shift ? clip_export() : clip_set(0); break;
+		case XKB_KEY_x: clip_set(1); break;
 		case XKB_KEY_v: paste(); break;
 		case XKB_KEY_s: send_files(); break;
 		case XKB_KEY_n:
