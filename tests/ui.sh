@@ -18,6 +18,21 @@ echo "theme: border=$B title=$T"
 
 LIST=c6c9d5
 
+# ---- command line ----------------------------------------------------------
+
+# -h alone asks for the usage: stdout, status 0. --help, any other option and a
+# second argument are refused: the usage on stderr, status 1.
+out=$("$MFM" -h 2>/dev/null) && [ "${out#usage: mfm}" != "$out" ] ||
+	fail "-h: status $?, stdout '$out'"
+for args in --help -x "a b"; do
+	# shellcheck disable=SC2086
+	out=$("$MFM" $args 2>"$SMOKE_DIR/err")
+	status=$?
+	[ "$status" = 1 ] && [ -z "$out" ] && grep -q '^usage: mfm' "$SMOKE_DIR/err" ||
+		fail "$args: status $status, stdout '$out'"
+done
+echo "ok: -h on stdout, --help and the rest refused on stderr"
+
 # ---- rendering and frame ---------------------------------------------------
 
 fresh_dir basics
@@ -517,25 +532,72 @@ white=$(build/pngtool count "$SHOT" $((CX + 20)) $((ROW0 + 1)) 400 $((ROWH - 2))
 echo "ok: black text on the selected row"
 mfm_quit
 
-# A value too long, or a line too long whose end looks like a setting, leave the
-# value before them.
+# As mwc reads it: a line however long counts, and the last line wins, so a value
+# too long to keep gives the default, not a cut one nor the one before.
 fresh_dir rclong
 mkdir -p "$XDG_CONFIG_HOME/mfm"
-{
-	printf 'Mfm*background: #336699\n'
-	printf 'Mfm*background: #%0300d\n' 0
-	printf '%01023dMfm*background: #993333\n' 0
-} >"$XDG_CONFIG_HOME/mfm/mfmrc"
+printf 'Mfm*background:%1100s#336699\n' '' >"$XDG_CONFIG_HOME/mfm/mfmrc"
 BG=336699
 mfm_start "$D"
 BG=aeb2c3
+echo "ok: a line of 1100 blanks and a colour counts"
+mfm_quit
+{
+	printf 'Mfm*background: #ff0000\n'
+	printf 'Mfm*background: #%0300d\n' 0
+} >"$XDG_CONFIG_HOME/mfm/mfmrc"
+mfm_start "$D"
+echo "ok: a value too long to keep gives the default"
+mfm_quit
 rm "$XDG_CONFIG_HOME/mfm/mfmrc"
-echo "ok: over-long values and lines in mfmrc are skipped"
+
+# rgb: takes hex digits only, as mwc: no sign, blank or 0x. Each gives the default.
+for c in rgb:-1/0/0 rgb:-f/0/0 'rgb: f/0/0' rgb:0xf/0/0; do
+	MWC_INACTIVE=$c mfm_start "$D"
+	echo "ok: $c is no colour"
+	mfm_quit
+done
+
+# The text colours of mwc's titles: Mwm*foreground and Mwm*activeForeground, else
+# black or white. A big bold font has strokes wider than the edge smoothing; the
+# tolerance is small, as the smoothing passes through many colours.
+fresh_dir fgres
+touch "$D/a"
+mkdir -p "$XDG_CONFIG_HOME/mwc"
+printf 'Mwm*foreground: #c00000\nMwm*activeForeground: #00c000\n' \
+	>"$XDG_CONFIG_HOME/mwc/mwmrc"
+MFM_FONT="Sans Bold 24" mfm_start "$D"
+shoot
+red=$(build/pngtool count "$SHOT" $((CX + 20)) $((ROW0 + ROWH + 1)) 400 $((ROWH - 2)) c00000 6)
+green=$(build/pngtool count "$SHOT" $((CX + 20)) $((ROW0 + 1)) 400 $((ROWH - 2)) 00c000 6)
+[ "$red" -gt 0 ] && [ "$green" -gt 0 ] ||
+	fail "foreground: $red red pixels on a row, $green green on the selected one"
+echo "ok: Mwm*foreground and Mwm*activeForeground"
+mfm_quit
+rm "$XDG_CONFIG_HOME/mwc/mwmrc"
+
+# Dimmed text, the date here, as far as 4.5:1 allows: 3d3e44 on aeb2c3. The old 0.6
+# mix, 46474e, is lighter, and its smoothing towards the background never gets as
+# dark. The right end of the row holds only the date.
+fresh_dir dim
+touch -d 2024-01-01 "$D/a"
+MFM_FONT="Sans Bold 24" mfm_start "$D"
+W=$(get mfm w)
+shoot
+dim=$(build/pngtool count "$SHOT" $((CX + W - 220)) $((ROW0 + ROWH + 1)) 180 $((ROWH - 2)) 3d3e44 6)
+[ "$dim" -gt 0 ] || fail "no 3d3e44 in the date"
+echo "ok: dimmed text has 4.5:1"
 mfm_quit
 
-# A sign is not a hex digit: the colour falls back to the default.
-MWC_INACTIVE=rgb:-1/0/0 mfm_start "$D"
-echo "ok: rgb:-1/0/0 is no colour"
+# The error colour follows the background: light on a dark one. F2 on ".." is one.
+fresh_dir err
+BG=202020
+MWC_INACTIVE=#202020 MFM_FONT="Sans Bold 24" mfm_start "$D"
+BG=aeb2c3
+H=$(get mfm h)
+do_input key F2
+check "an error on a dark background is light" \
+	'shoot; [ "$(build/pngtool count "$SHOT" $CX $((CY + H - 60)) 600 60 ffa0a0 6)" -gt 0 ]'
 mfm_quit
 
 # mfm has to read mwmrc as mwc does.
@@ -649,6 +711,104 @@ check "the output is not scaled" '[ "$(global output_HEADLESS-1 scale)" = 100 ]'
 check "the cursor is set again at scale 1 without the pointer moving" 'cursor_ok 1'
 mfm_quit
 rm "$XDG_CONFIG_HOME/mwc/mwmrc"
+
+# A cursor theme need not have the size asked for: Adwaita has 24, 30, 36, 48, 72 and
+# 96, so 8 at scale 4 asks for 32 and gets 30, which 4 doesn't divide. A viewport then
+# shows the buffer at 30 / 4, about 8, as large as mwc shows its own cursor.
+# The last size the cursor's viewport was given, "w h"; -1 -1 is none.
+cursor_dest() {
+	grep -o 'wp_viewport#[0-9]*\.set_destination(-\?[0-9]*, -\?[0-9]*)' "$MFM_LOG" |
+		tail -1 | sed 's/.*(\(.*\), \(.*\))/\1 \2/'
+}
+# Buffers destroyed while the cursor surface still showed them: a theme gone too early.
+cursor_kept() {
+	awk '
+	match($0, /wl_pointer#[0-9]+\.set_cursor\([0-9]+, wl_surface#[0-9]+/) {
+		split(substr($0, RSTART, RLENGTH), f, /[#(, ]+/); cur = f[5]
+	}
+	match($0, /wl_surface#[0-9]+\.attach\((wl_buffer#[0-9]+|nil)/) {
+		split(substr($0, RSTART, RLENGTH), f, /[#.()]+/)
+		att[f[2]] = f[4] == "nil" ? "" : f[5]
+	}
+	match($0, /wl_buffer#[0-9]+\.destroy\(\)/) {
+		split(substr($0, RSTART, RLENGTH), f, /[#.()]+/)
+		if (cur != "" && att[cur] == f[2]) print f[2]
+	}' "$MFM_LOG"
+}
+# How often the cursor surface was left empty since line $1 of the log: with the
+# pointer on the window it never should be. The whole log is read, for which surface
+# is the cursor's.
+cursor_blank() {
+	awk -v from="$1" '
+	match($0, /wl_pointer#[0-9]+\.set_cursor\([0-9]+, wl_surface#[0-9]+/) {
+		split(substr($0, RSTART, RLENGTH), f, /[#(, ]+/); cur = f[5]
+	}
+	match($0, /wl_surface#[0-9]+\.attach\(nil/) {
+		split(substr($0, RSTART, RLENGTH), f, /[#.()]+/)
+		if (NR >= from && f[2] == cur) n++
+	}
+	END { print n + 0 }' "$MFM_LOG"
+}
+# mfm_raw [env...]: start mfm without the pixel checks of mfm_start, which count in
+# unscaled pixels.
+mfm_raw() {
+	env "$@" WAYLAND_DISPLAY=wayland-0 "$MFM" "$D" >>"$MFM_LOG" 2>&1 &
+	MFM_PID=$!
+	check "mfm has a focused window" '[ "$(get mfm kbfocus)" = 1 ]'
+	content_origin
+}
+echo 'Mwm*HEADLESS-1*outputScale: 4' >"$XDG_CONFIG_HOME/mwc/mwmrc"
+reload_mwc
+check "the output is scaled by 4" '[ "$(global output_HEADLESS-1 scale)" = 400 ]'
+fresh_dir cursor
+: >"$MFM_LOG"
+mfm_raw XCURSOR_THEME=Adwaita XCURSOR_SIZE=8 WAYLAND_DEBUG=client
+do_input move $((4 * (CX + 20))) $((4 * (CY + 20)))
+check "a cursor of 30 at scale 4 is set at scale 1" \
+	'cursor_ok 1 && [ "$(global cursor cw)" = 30 ]'
+check "and the viewport shows it at 8" '[ "$(cursor_dest)" = "8 8" ]'
+# Back to 2 with the pointer kept on the window: the cursor follows without an enter.
+FROM=$(($(wc -l <"$MFM_LOG") + 1))
+echo 'Mwm*HEADLESS-1*outputScale: 2' >"$XDG_CONFIG_HOME/mwc/mwmrc"
+reload_mwc
+check "a new scale loads the cursor again at once" \
+	'cursor_ok 2 && [ "$(global cursor cw)" = 24 ]'
+check "there the scale divides it, and the viewport is unset" \
+	'[ "$(cursor_dest)" = "-1 -1" ]'
+[ -z "$(cursor_kept)" ] || fail "with the pointer on it, the cursor showed destroyed buffers"
+echo "ok: with the pointer on the window no cursor buffer goes while shown"
+[ "$(cursor_blank "$FROM")" = 0 ] || fail "with the pointer on it, the cursor was left empty"
+echo "ok: and the cursor is never empty"
+# The pointer goes to mwc's title bar, and the scale changes: the surface lets go of
+# the old theme's buffer before that goes.
+refresh
+do_input move $((2 * (CX + 20))) $((2 * ($(get mfm y) + B + T / 2)))
+check "the pointer leaves the window" "grep -q 'wl_pointer#[0-9]*\.leave(' \"\$MFM_LOG\""
+GONE=$(grep -c 'wl_buffer#[0-9]*\.destroy()' "$MFM_LOG")
+echo 'Mwm*HEADLESS-1*outputScale: 4' >"$XDG_CONFIG_HOME/mwc/mwmrc"
+reload_mwc
+check "the output is scaled by 4 again" '[ "$(global output_HEADLESS-1 scale)" = 400 ]'
+check "the old theme is gone" \
+	"[ \"\$(grep -c 'wl_buffer#[0-9]*\.destroy()' \"\$MFM_LOG\")\" -gt $GONE ]"
+[ -z "$(cursor_kept)" ] || fail "with the pointer away, the cursor showed destroyed buffers"
+echo "ok: with the pointer away no cursor buffer goes while shown"
+mfm_quit
+echo 'Mwm*HEADLESS-1*outputScale: 2' >"$XDG_CONFIG_HOME/mwc/mwmrc"
+reload_mwc
+check "the output is scaled by 2 again" '[ "$(global output_HEADLESS-1 scale)" = 200 ]'
+# Only a whole number is a size: "32x" is none and gives the default 24, 48 at scale 2.
+mfm_raw XCURSOR_THEME=Adwaita XCURSOR_SIZE=32x
+do_input move $((2 * (CX + 20))) $((2 * (CY + 20)))
+check "XCURSOR_SIZE=32x gives the default" 'cursor_ok 2 && [ "$(global cursor cw)" = 48 ]'
+mfm_quit
+# A size past any theme is the largest there is, not an overflow.
+mfm_raw XCURSOR_THEME=Adwaita XCURSOR_SIZE=1000000000
+do_input move $((2 * (CX + 20))) $((2 * (CY + 20)))
+check "a huge XCURSOR_SIZE gives the largest cursor" '[ "$(global cursor cw)" = 96 ]'
+mfm_quit
+rm "$XDG_CONFIG_HOME/mwc/mwmrc"
+reload_mwc
+check "the output is not scaled" '[ "$(global output_HEADLESS-1 scale)" = 100 ]'
 
 # ---- the end ---------------------------------------------------------------
 

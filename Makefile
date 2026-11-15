@@ -9,12 +9,13 @@ WAYLAND_SCANNER := $(shell $(PKG_CONFIG) --variable=wayland_scanner wayland-scan
 XDG_SHELL = $(WAYLAND_PROTOCOLS)/stable/xdg-shell/xdg-shell.xml
 XDG_DECORATION = $(WAYLAND_PROTOCOLS)/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml
 DATA_CONTROL = $(WAYLAND_PROTOCOLS)/staging/ext-data-control/ext-data-control-v1.xml
+VIEWPORTER = $(WAYLAND_PROTOCOLS)/stable/viewporter/viewporter.xml
 
 PROTO_H = build/xdg-shell-client-protocol.h \
 	build/xdg-decoration-unstable-v1-client-protocol.h \
-	build/ext-data-control-v1-client-protocol.h
+	build/ext-data-control-v1-client-protocol.h build/viewporter-client-protocol.h
 PROTO_C = build/xdg-shell-protocol.c build/xdg-decoration-unstable-v1-protocol.c \
-	build/ext-data-control-v1-protocol.c
+	build/ext-data-control-v1-protocol.c build/viewporter-protocol.c
 
 # CPPFLAGS, CFLAGS, LDFLAGS and LDLIBS stay the user's, also on the command line:
 # `make CFLAGS=-O0` must not lose the include paths.
@@ -49,6 +50,12 @@ build/ext-data-control-v1-client-protocol.h: $(DATA_CONTROL) | build
 
 build/ext-data-control-v1-protocol.c: $(DATA_CONTROL) | build
 	$(WAYLAND_SCANNER) private-code $(DATA_CONTROL) $@
+
+build/viewporter-client-protocol.h: $(VIEWPORTER) | build
+	$(WAYLAND_SCANNER) client-header $(VIEWPORTER) $@
+
+build/viewporter-protocol.c: $(VIEWPORTER) | build
+	$(WAYLAND_SCANNER) private-code $(VIEWPORTER) $@
 
 # For the tests: what is in the clipboard.
 build/clipget: tests/clipget.c build/ext-data-control-v1-client-protocol.h \

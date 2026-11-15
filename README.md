@@ -22,11 +22,11 @@ another program.
 
 ## Run
 
-    mfm [-v] [directory | file]
+    mfm [-h | -v] [directory | file]
 
 Without an argument mfm starts in the current directory; given a file, it opens its
-folder and selects it. `-v` prints the version, which is set in `version.h`. To start
-it with mwc, in `~/.config/mwc/autostart`:
+folder and selects it. `-h` prints the usage, `-v` the version, which is set in
+`version.h`. To start it with mwc, in `~/.config/mwc/autostart`:
 
     mfm "$HOME" &
 
@@ -91,6 +91,7 @@ over its entry.
 | `terminal` | `MFM_TERMINAL` | `MWC_TERMINAL`, else the first found | Ctrl+T |
 | `font` | `MFM_FONT` | `Sans 10` | a Pango font name |
 | `background`, `activeBackground` | `MWC_INACTIVE`, `MWC_ACTIVE` | mwc's, from its mwmrc | window and selection |
+| `foreground`, `activeForeground` | | mwc's, else black or white | their text |
 | `sort`, `sortReverse` | | `name`, `false` | the order at start: `name`, `size` or `date` |
 | `showHidden` | | `false` | hidden files at start |
 

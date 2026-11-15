@@ -36,6 +36,11 @@ It draws at the integer scale the compositor asks for with wl_compositor 6. A
 fractional scale is drawn at the next integer and scaled down by the compositor; an
 older compositor never asks, and there the window stays at scale 1 and is blurred.
 
+A cursor theme has only some sizes. Where the window's scale does not divide the one
+it gives, mfm shows it through wp_viewporter at the size asked for; a compositor
+without wp_viewporter shows it at the largest scale that divides it, and that much
+larger.
+
 Dragging with a button held needs the compositor's implicit grab. Without it mfm does
 not see a release outside its window: the scroll bar stops at the edge, and in the
 context menu press, drag and release does not run the command, a click still does.

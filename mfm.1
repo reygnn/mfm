@@ -3,7 +3,7 @@
 mfm \- minimal file manager for Wayland
 .SH SYNOPSIS
 .B mfm
-.RB [ \-v ]
+.RB [ \-h | \-v ]
 .RI [ directory " | " file ]
 .SH DESCRIPTION
 mfm shows one folder as a list in the look of the Motif window manager, with the
@@ -19,8 +19,16 @@ Marks belong to the current folder and survive the automatic reload; changing
 folders, Ctrl+C, Ctrl+X and a plain click drop them.
 .SH OPTIONS
 .TP
+.B \-h
+Print the usage and exit.
+.TP
 .B \-v
 Print the version and exit.
+.PP
+Anything else that starts with
+.B \-
+is refused, the usage goes to stderr and the status is 1; a file named so is given as
+.BR ./\-name .
 .SH KEYS
 .TP
 .B Up, Down, PgUp, PgDn, Home, End
@@ -234,7 +242,8 @@ per line,
 .B Mfm.key
 and any case work too, a line starting with
 .B !
-is a comment, and the last line for a key wins.
+is a comment, and the last line for a key wins, also one with a value too long to
+keep, which then counts as none.
 mfm never writes it.
 .BR open ,
 .B send
@@ -257,6 +266,14 @@ and
 .B Mwm*activeBackground
 from
 .BR ~/.config/mwc/mwmrc .
+.TP
+.BR foreground ", " activeForeground
+Text on the window and on the selection.
+Default:
+.B Mwm*foreground
+and
+.B Mwm*activeForeground
+from mwc's mwmrc, else black or white, whichever reads better.
 .TP
 .B sort
 .BR name ", " size " or " date :

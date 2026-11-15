@@ -71,6 +71,7 @@
 #include <xkbcommon/xkbcommon.h>
 
 #include "ext-data-control-v1-client-protocol.h"
+#include "viewporter-client-protocol.h"
 #include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 #include "version.h"
@@ -81,6 +82,7 @@
 #define DCLICK_MS 400
 #define TYPEAHEAD_MS 1000
 #define POLL_MS 1000
+#define MAX_STEPS 20    /* wheel steps in one frame */
 #define MENU_CLICK_MS 300       /* a quicker click leaves the menu open */
 #ifndef MAX            /* glib has them too */
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
@@ -161,6 +163,7 @@ static struct {
 	char dir[PATH_MAX], first[NAME_MAX + 1];
 	char out[512];
 	size_t outlen;
+	int cut;                /* out is full, more was dropped */
 } job = { .fd = -1 };
 
 /* ---- Wayland ------------------------------------------------------------ */
@@ -199,6 +202,8 @@ static struct wl_display *dpy;
 static struct wl_compositor *compositor;
 static struct wl_shm *shm;
 static struct wl_seat *seat;
+static uint32_t seat_global;    /* its name in the registry */
+static struct wp_viewporter *viewporter;
 static struct xdg_wm_base *wm_base;
 static struct zxdg_decoration_manager_v1 *deco_mgr;
 static struct wsurf main_s;
@@ -222,9 +227,10 @@ static struct wl_cursor_theme *cursor_theme;
 static struct wl_cursor_image *cursor_img;
 static int cursor_scale;        /* the scale it was loaded at, 0 for none yet */
 static int cursor_buf_scale;    /* its buffer's scale: one that divides its size */
+static struct wp_viewport *cursor_vp;
+static int cursor_vw, cursor_vh; /* its size on the window, if the viewport sets it */
 static uint32_t ptr_serial;     /* of the last enter, for set_cursor */
-static void cursor_load(void);
-static void cursor_show(void);
+static void cursor_update(void);
 
 static struct wl_keyboard *keyboard;
 static struct xkb_context *xkb;
@@ -442,6 +448,22 @@ static int utf8_valid(const char *s)
 	return 1;
 }
 
+/* After a cut at a fixed length: drop a UTF-8 character the cut went into.
+ * Only then, as a single high byte at the end may be a Latin-1 letter. */
+static void u8_cut(char *s)
+{
+	size_t len = strlen(s);
+	for (size_t i = len; i > 0 && len - i < 4; i--) {
+		unsigned char c = s[i - 1];
+		if ((c & 0xc0) == 0x80)
+			continue;
+		int need = c >= 0xf0 ? 4 : c >= 0xe0 ? 3 : c >= 0xc2 ? 2 : 1;
+		if (c < 0xf5 && len - (i - 1) < (size_t)need)
+			s[i - 1] = 0;
+		return;
+	}
+}
+
 /* Characters that only reorder what is drawn: a name with U+202E shows
  * "fdp.exe" as "exe.pdf". */
 static int is_bidi_control(uint32_t c)
@@ -561,11 +583,31 @@ static float linear(unsigned c)
 /* Black or white, whichever has the higher WCAG contrast on bg. The two are equal
  * at a relative luminance of sqrt(1.05 * 0.05) - 0.05, a grey of about 0x76: a
  * mid-tone such as mwc's activeBackground gets black. */
+static float luminance(uint32_t c)
+{
+	return 0.2126f * linear((c >> 16) & 0xff) +
+		0.7152f * linear((c >> 8) & 0xff) + 0.0722f * linear(c & 0xff);
+}
+
 static uint32_t contrast(uint32_t bg)
 {
-	float l = 0.2126f * linear((bg >> 16) & 0xff) +
-		0.7152f * linear((bg >> 8) & 0xff) + 0.0722f * linear(bg & 0xff);
+	float l = luminance(bg);
 	return (l + 0.05f) * (l + 0.05f) > 1.05f * 0.05f ? 0x000000 : 0xffffff;
+}
+
+/* Dimmed towards fg, but no further than WCAG AA's 4.5:1 for small text
+ * allows; fg itself if even that falls short. The same steps as the dock
+ * tools, so they match. */
+static uint32_t dimmed(uint32_t bg, uint32_t fg)
+{
+	float lb = luminance(bg) + 0.05f;
+	for (int k = 12; k < 20; k++) {
+		uint32_t c = mix(bg, fg, k / 20.0f);
+		float lc = luminance(c) + 0.05f;
+		if ((lb > lc ? lb / lc : lc / lb) >= 4.5f)
+			return c;
+	}
+	return fg;
 }
 
 /* What mwc reads: "#rrggbb", names like "gold", and rgb:r/g/b with 1 to 4 hex
@@ -579,17 +621,16 @@ static int parse_color(const char *s, uint32_t *out)
 		uint32_t rgb = 0;
 		s += 4;
 		for (int i = 0; i < 3; i++) {
-			char *end;
-			/* strtoul would take a sign, blanks and "0x" */
-			if (!isxdigit((unsigned char)*s))
+			/* Only hex digits: strtoul alone also takes blanks, signs
+			 * and 0x. */
+			int digits = strspn(s, "0123456789abcdefABCDEF");
+			if (digits < 1 || digits > 4 ||
+			    s[digits] != (i < 2 ? '/' : '\0'))
 				return 0;
-			unsigned long v = strtoul(s, &end, 16);
-			int digits = end - s;
-			if (digits < 1 || digits > 4 || *end != (i < 2 ? '/' : '\0'))
-				return 0;
+			unsigned long v = strtoul(s, NULL, 16);
 			unsigned long max = (1ul << (4 * digits)) - 1;
 			rgb = rgb << 8 | (v * 255 + max / 2) / max;
-			s = end + 1;
+			s += digits + 1;
 		}
 		*out = rgb;
 		return 1;
@@ -605,30 +646,24 @@ static int parse_color(const char *s, uint32_t *out)
 static char *rc_get(const char *file, const char *prefix, const char *key,
 	char *val, size_t n)
 {
-	char path[PATH_MAX], line[1024];
+	char path[PATH_MAX];
 	const char *home = getenv("HOME"), *xdg = getenv("XDG_CONFIG_HOME");
 	int len;
+	/* As mwc: without either there is no file, not one in /.config. */
 	if (xdg && *xdg)
 		len = snprintf(path, sizeof path, "%s/%s", xdg, file);
+	else if (home && *home)
+		len = snprintf(path, sizeof path, "%s/.config/%s", home, file);
 	else
-		len = snprintf(path, sizeof path, "%s/.config/%s",
-			home ? home : "", file);
+		return NULL;
 	if (len < 0 || (size_t)len >= sizeof path)
 		return NULL;
 	FILE *f = fopen(path, "r");
 	if (!f)
 		return NULL;
-	char *found = NULL;
-	size_t kl = strlen(key), pl = strlen(prefix);
-	int rest = 0;           /* in the rest of a line too long to read */
-	while (fgets(line, sizeof line, f)) {
-		/* A line too long for the buffer is skipped as a whole: its
-		 * tail must not count as a line of its own. */
-		int whole = strchr(line, '\n') || feof(f);
-		int skip = rest;
-		rest = !whole;
-		if (skip || !whole)
-			continue;
+	char *found = NULL, *line = NULL;      /* whole lines, however long */
+	size_t kl = strlen(key), pl = strlen(prefix), cap = 0;
+	while (getline(&line, &cap, f) > 0) {
 		char *p = line;
 		while (isspace((unsigned char)*p))
 			p++;
@@ -650,17 +685,20 @@ static char *rc_get(const char *file, const char *prefix, const char *key,
 		char *e = p + strlen(p);
 		while (e > p && isspace((unsigned char)e[-1]))
 			*--e = 0;
-		/* A value too long is ignored, the one before it stays. */
-		if (strlen(p) < n) {
-			memcpy(val, p, strlen(p) + 1);
+		/* The last line wins, as in mwc, even a bad one: too long to
+		 * keep is no value, not a cut one nor the one before. */
+		if ((size_t)(e - p) < n) {
+			memcpy(val, p, e - p + 1);
 			found = val;
+		} else {
+			found = NULL;
 		}
 	}
+	free(line);
 	fclose(f);
 	return found;
 }
 
-/* mwc's colors: ~/.config/mwc/mwmrc, as mwc reads it */
 static char *mwmrc_get(const char *key, char *val, size_t n)
 {
 	return rc_get("mwc/mwmrc", "mwm", key, val, n);
@@ -700,15 +738,18 @@ static int rc_bool(const char *key)
 		!strcasecmp(v, "on") || !strcmp(v, "1");
 }
 
+/* A colour from mfmrc, else from mwmrc. */
+static int rc_color(const char *res, uint32_t *out)
+{
+	char v[256];
+	return parse_color(mfmrc_get(res, v, sizeof v), out) ||
+		parse_color(mwmrc_get(res, v, sizeof v), out);
+}
+
 static uint32_t setting(const char *env, const char *res, uint32_t def)
 {
 	uint32_t rgb;
-	char v[256];
-	if (parse_color(getenv(env), &rgb))
-		return rgb;
-	if (parse_color(mfmrc_get(res, v, sizeof v), &rgb))
-		return rgb;
-	if (parse_color(mwmrc_get(res, v, sizeof v), &rgb))
+	if (parse_color(getenv(env), &rgb) || rc_color(res, &rgb))
 		return rgb;
 	return def;
 }
@@ -717,7 +758,10 @@ static void theme_init(void)
 {
 	uint32_t bg = setting("MWC_INACTIVE", "background", 0xaeb2c3);
 	uint32_t act = setting("MWC_ACTIVE", "activeBackground", 0x7387ad);
-	uint32_t fg = contrast(bg);
+	uint32_t fg;
+	/* Text as mwc's titles: the resource if set, else black or white. */
+	if (!rc_color("foreground", &fg))
+		fg = contrast(bg);
 
 	px_bg = bg;
 	px_top = mix(bg, 0xffffff, 0.55f);
@@ -730,9 +774,11 @@ static void theme_init(void)
 	px_folder = 0xc9a85c;
 	px_paper = 0xf6f6f6;
 	xc_fg = fg;
-	xc_sel = contrast(act);
-	xc_dim = mix(bg, fg, 0.6f);
-	xc_err = 0x8a0303;
+	if (!rc_color("activeForeground", &xc_sel))
+		xc_sel = contrast(act);
+	xc_dim = dimmed(bg, fg);
+	/* by the background, not fg: readable on dark themes */
+	xc_err = contrast(bg) == 0xffffff ? 0xffa0a0 : 0x8a0303;
 
 	/* fontconfig patterns (Sans:bold:size=10, as mfm-x11 took them) mean
 	 * nothing to Pango, which would quietly pick some other font. */
@@ -774,7 +820,9 @@ static void set_status(int err, const char *fmt, ...)
 	va_list ap;
 	int saved = errno;
 	va_start(ap, fmt);
-	vsnprintf(status_msg, sizeof status_msg, fmt, ap);
+	if ((size_t)vsnprintf(status_msg, sizeof status_msg, fmt, ap) >=
+	    sizeof status_msg)
+		u8_cut(status_msg);
 	va_end(ap);
 	status_err = err;
 	dirty = 1;
@@ -1943,7 +1991,8 @@ static void report(int out, const char *fmt, ...)
 	char b[1200];
 	va_list ap;
 	va_start(ap, fmt);
-	vsnprintf(b, sizeof b, fmt, ap);
+	if ((size_t)vsnprintf(b, sizeof b, fmt, ap) >= sizeof b)
+		u8_cut(b);
 	va_end(ap);
 	for (char *s = b; *s; s++)
 		if (*s == '\n')
@@ -2135,6 +2184,7 @@ static void start_job(int op, const char *sdir, char **names, int n,
 	job.fails = 0;
 	job.finished = 0;
 	job.outlen = 0;
+	job.cut = 0;
 	job.clip_gen = clip_gen;
 	snprintf(job.dir, sizeof job.dir, "%s", ddir);
 	snprintf(job.first, sizeof job.first, "%s", first ? first : "");
@@ -2166,7 +2216,10 @@ static void job_done(void)
 	close(job.fd);
 	job.fd = -1;
 	job.out[job.outlen] = 0;
-	job.out[strcspn(job.out, "\n")] = 0;
+	size_t first = strcspn(job.out, "\n");
+	job.out[first] = 0;
+	if (job.cut && first == job.outlen)
+		u8_cut(job.out);
 	/* A move that worked used up the clipboard, unless it was replaced
 	 * in the meantime. */
 	if (job.op == OP_MOVE && job.finished && !job.fails &&
@@ -2209,6 +2262,8 @@ static void job_poll(void)
 			}
 			if (job.outlen < sizeof job.out - 1)
 				job.out[job.outlen++] = b[i];
+			else
+				job.cut = 1;
 			job.fails += b[i] == '\n';
 		}
 	}
@@ -4303,8 +4358,10 @@ static void kb_keymap(void *data, struct wl_keyboard *k, uint32_t format,
 	close(fd);
 	if (s == MAP_FAILED)
 		return;
-	struct xkb_keymap *map = xkb_keymap_new_from_string(xkb, s,
-		XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
+	/* The protocol promises no NUL at the end: read size bytes at most. */
+	struct xkb_keymap *map = xkb_keymap_new_from_buffer(xkb, s,
+		strnlen(s, size), XKB_KEYMAP_FORMAT_TEXT_V1,
+		XKB_KEYMAP_COMPILE_NO_FLAGS);
 	munmap(s, size);
 	struct xkb_state *state = map ? xkb_state_new(map) : NULL;
 	if (!state) {
@@ -4411,8 +4468,7 @@ static void ptr_enter(void *data, struct wl_pointer *p, uint32_t serial,
 	/* An unchanged position gets no motion event after this. */
 	if (menu_on)
 		menu_pointer_moved();
-	cursor_load();
-	cursor_show();
+	cursor_update();
 }
 
 /* Not every compositor keeps the pointer on a window while a button is held,
@@ -4481,11 +4537,17 @@ static void ptr_button(void *data, struct wl_pointer *p, uint32_t serial,
 		btn_mask &= ~held;
 }
 
+static void ptr_frame(void *data, struct wl_pointer *p);
+
 static void ptr_axis(void *data, struct wl_pointer *p, uint32_t time,
 	uint32_t axis, wl_fixed_t value)
 {
-	if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
-		axis_acc += wl_fixed_to_double(value);
+	if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
+		return;
+	axis_acc += wl_fixed_to_double(value);
+	/* Before wl_seat 5 no frame ends the event: each one counts by itself. */
+	if (wl_pointer_get_version(p) < WL_POINTER_FRAME_SINCE_VERSION)
+		ptr_frame(data, p);
 }
 
 static void ptr_axis_source(void *data, struct wl_pointer *p, uint32_t source)
@@ -4503,7 +4565,8 @@ static void ptr_axis_discrete(void *data, struct wl_pointer *p, uint32_t axis,
 	int32_t steps)
 {
 	if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
-		axis_steps += steps;
+		axis_steps = MAX(MIN(axis_steps + MAX(MIN(steps, MAX_STEPS),
+			-MAX_STEPS), MAX_STEPS), -MAX_STEPS);
 }
 
 /* Wheels report steps; touchpads only a distance, of which AXIS_STEP makes
@@ -4515,8 +4578,10 @@ static void ptr_frame(void *data, struct wl_pointer *p)
 	if (steps) {
 		axis_acc = 0;
 	} else {
-		steps = (int)(axis_acc / AXIS_STEP);
-		axis_acc -= steps * AXIS_STEP;
+		double v = axis_acc / AXIS_STEP;
+		steps = (int)MAX(MIN(v, MAX_STEPS), -MAX_STEPS);
+		axis_acc = v > MAX_STEPS || v < -MAX_STEPS ? 0 :
+			axis_acc - steps * AXIS_STEP;
 	}
 	axis_steps = 0;
 	for (int i = 0; i < abs(steps); i++)
@@ -4545,7 +4610,13 @@ static void seat_capabilities(void *data, struct wl_seat *s, uint32_t caps)
 	} else if (!want_ptr && pointer) {
 		/* No leave comes: a drag or a held button would outlive it. */
 		ptr_leave(NULL, pointer, 0, NULL);
-		wl_pointer_release(pointer);
+		/* release is from wl_seat 3 on; an older seat only knows
+		 * destroy. */
+		if (wl_pointer_get_version(pointer) >=
+		    WL_POINTER_RELEASE_SINCE_VERSION)
+			wl_pointer_release(pointer);
+		else
+			wl_pointer_destroy(pointer);
 		pointer = NULL;
 	}
 	if (want_kb && !keyboard) {
@@ -4553,7 +4624,11 @@ static void seat_capabilities(void *data, struct wl_seat *s, uint32_t caps)
 		wl_keyboard_add_listener(keyboard, &keyboard_listener, NULL);
 	} else if (!want_kb && keyboard) {
 		kb_leave(NULL, keyboard, 0, NULL);     /* held Ctrl included */
-		wl_keyboard_release(keyboard);
+		if (wl_keyboard_get_version(keyboard) >=
+		    WL_KEYBOARD_RELEASE_SINCE_VERSION)
+			wl_keyboard_release(keyboard);
+		else
+			wl_keyboard_destroy(keyboard);
 		keyboard = NULL;
 	}
 }
@@ -4579,14 +4654,19 @@ static const struct xdg_wm_base_listener wm_base_listener = { wm_ping };
 static void registry_global(void *data, struct wl_registry *r, uint32_t name,
 	const char *iface, uint32_t ver)
 {
-	if (!strcmp(iface, wl_compositor_interface.name)) {
+	/* wl_surface.damage_buffer is from version 4: an older one is not
+	 * taken. */
+	if (!strcmp(iface, wl_compositor_interface.name) && ver >= 4) {
 		compositor = wl_registry_bind(r, name, &wl_compositor_interface,
 			MIN(ver, 6));
 	} else if (!strcmp(iface, wl_shm_interface.name)) {
 		shm = wl_registry_bind(r, name, &wl_shm_interface, 1);
 	} else if (!strcmp(iface, wl_seat_interface.name) && !seat) {
 		seat = wl_registry_bind(r, name, &wl_seat_interface, MIN(ver, 7));
+		seat_global = name;
 		wl_seat_add_listener(seat, &seat_listener, NULL);
+	} else if (!strcmp(iface, wp_viewporter_interface.name) && !viewporter) {
+		viewporter = wl_registry_bind(r, name, &wp_viewporter_interface, 1);
 	} else if (!strcmp(iface, xdg_wm_base_interface.name)) {
 		wm_base = wl_registry_bind(r, name, &xdg_wm_base_interface,
 			MIN(ver, 2));
@@ -4597,8 +4677,17 @@ static void registry_global(void *data, struct wl_registry *r, uint32_t name,
 	}
 }
 
+/* A seat that goes is let go of, so that the next one announced is taken. */
 static void registry_remove(void *data, struct wl_registry *r, uint32_t name)
 {
+	if (!seat || name != seat_global)
+		return;
+	seat_capabilities(NULL, seat, 0);
+	if (wl_seat_get_version(seat) >= WL_SEAT_RELEASE_SINCE_VERSION)
+		wl_seat_release(seat);
+	else
+		wl_seat_destroy(seat);
+	seat = NULL;
 }
 
 static const struct wl_registry_listener registry_listener = {
@@ -4653,58 +4742,102 @@ static const struct xdg_toplevel_listener toplevel_listener = {
 	.close = top_close,
 };
 
-/* The theme's arrow at this size in buffer pixels, in cursor_theme and
- * cursor_img. */
-static void cursor_theme_load(int size)
+/* The buffer scale and viewport for the loaded image. A theme has only some
+ * sizes: Adwaita gives 30 for 32. A buffer scale that doesn't divide the image
+ * is a protocol error. With a viewport the buffer is shown at its size over
+ * the scale, as mwc shows its own cursor; without, at the largest scale up to
+ * the window's that divides it, and that much larger. */
+static void cursor_fit(void)
 {
-	if (cursor_theme)
-		wl_cursor_theme_destroy(cursor_theme);
-	cursor_img = NULL;
-	cursor_theme = wl_cursor_theme_load(getenv("XCURSOR_THEME"), size, shm);
-	if (!cursor_theme)
-		return;
-	struct wl_cursor *c = wl_cursor_theme_get_cursor(cursor_theme, "default");
-	if (!c)
-		c = wl_cursor_theme_get_cursor(cursor_theme, "left_ptr");
-	if (c)
-		cursor_img = c->images[0];
-}
-
-/* The cursor at the window's scale, loaded again when that changes. A theme
- * has only some sizes: Adwaita gives 30x30 for 32. A buffer scale that doesn't
- * divide the size is a protocol error, so take the largest one up to the
- * window's that does; the compositor scales the rest. */
-static void cursor_load(void)
-{
-	if (cursor_scale == scale)
-		return;
-	cursor_scale = scale;
-	const char *s = getenv("XCURSOR_SIZE");
-	int size = s && atoi(s) > 0 ? atoi(s) : 24;
-	cursor_theme_load(size * scale);
+	int w = cursor_img->width, h = cursor_img->height, sc = scale;
 	cursor_buf_scale = 1;
-	for (int d = scale; cursor_img && d > 1; d--)
-		if (cursor_img->width % d == 0 && cursor_img->height % d == 0) {
-			cursor_buf_scale = d;
-			break;
-		}
-	if (!cursor_surf)
-		cursor_surf = wl_compositor_create_surface(compositor);
+	cursor_vw = cursor_vh = -1;
+	if (w % sc == 0 && h % sc == 0) {
+		cursor_buf_scale = sc;
+	} else if (cursor_vp) {
+		cursor_vw = MAX((w + sc / 2) / sc, 1);
+		cursor_vh = MAX((h + sc / 2) / sc, 1);
+	} else {
+		for (int d = sc - 1; d > 1; d--)
+			if (w % d == 0 && h % d == 0) {
+				cursor_buf_scale = d;
+				break;
+			}
+	}
 }
 
-/* The cursor on the window or the menu, while the pointer is over one. */
-static void cursor_show(void)
+/* The cursor on the window or the menu, while the pointer is over one; 0 if
+ * not shown. */
+static int cursor_show(void)
 {
-	if (!pointer || !ptr_surface || !cursor_img)
-		return;
-	int d = cursor_buf_scale;
-	wl_pointer_set_cursor(pointer, ptr_serial, cursor_surf,
-		cursor_img->hotspot_x / d, cursor_img->hotspot_y / d);
-	wl_surface_set_buffer_scale(cursor_surf, d);
-	wl_surface_attach(cursor_surf, wl_cursor_image_get_buffer(cursor_img), 0, 0);
+	if (!cursor_img || !pointer || !ptr_surface)
+		return 0;
+	int hx = cursor_img->hotspot_x / cursor_buf_scale;
+	int hy = cursor_img->hotspot_y / cursor_buf_scale;
+	if (cursor_vw > 0) {
+		/* Rounded as the viewport's size is. */
+		hx = (cursor_img->hotspot_x * cursor_vw + cursor_img->width / 2) /
+			cursor_img->width;
+		hy = (cursor_img->hotspot_y * cursor_vh + cursor_img->height / 2) /
+			cursor_img->height;
+	}
+	wl_pointer_set_cursor(pointer, ptr_serial, cursor_surf, hx, hy);
+	if (cursor_vp)
+		wp_viewport_set_destination(cursor_vp, cursor_vw, cursor_vh);
+	wl_surface_set_buffer_scale(cursor_surf, cursor_buf_scale);
+	wl_surface_attach(cursor_surf, wl_cursor_image_get_buffer(cursor_img), 0,
+		0);
 	wl_surface_damage_buffer(cursor_surf, 0, 0, cursor_img->width,
 		cursor_img->height);
 	wl_surface_commit(cursor_surf);
+	return 1;
+}
+
+/* The theme's cursor at the window's scale, loaded again when that changes,
+ * and shown if the pointer is on the window. The new theme first: a failed
+ * load keeps the old cursor and is tried again on the next enter. The old
+ * theme's buffers go with it, so the surface shows the new cursor or none
+ * before it goes. */
+static void cursor_update(void)
+{
+	if (cursor_scale != scale) {
+		/* A whole number only: "32x" is none. */
+		const char *s = getenv("XCURSOR_SIZE");
+		char *end = NULL;
+		long size = s ? strtol(s, &end, 10) : 0;
+		if (!s || end == s || *end || size <= 0)
+			size = 24;
+		/* No theme has more; and times the scale it must stay an int. */
+		size = MIN(size, 256);
+		struct wl_cursor_theme *t = wl_cursor_theme_load(
+			getenv("XCURSOR_THEME"), (int)size * scale, shm);
+		struct wl_cursor *c = t ?
+			wl_cursor_theme_get_cursor(t, "default") : NULL;
+		if (t && !c)
+			c = wl_cursor_theme_get_cursor(t, "left_ptr");
+		if (c) {
+			struct wl_cursor_theme *old = cursor_theme;
+			cursor_theme = t;
+			cursor_img = c->images[0];
+			cursor_scale = scale;
+			if (!cursor_surf)
+				cursor_surf = wl_compositor_create_surface(compositor);
+			if (viewporter && !cursor_vp)
+				cursor_vp = wp_viewporter_get_viewport(viewporter,
+					cursor_surf);
+			cursor_fit();
+			if (!cursor_show() && old) {
+				wl_surface_attach(cursor_surf, NULL, 0, 0);
+				wl_surface_commit(cursor_surf);
+			}
+			if (old)
+				wl_cursor_theme_destroy(old);
+			return;
+		}
+		if (t)
+			wl_cursor_theme_destroy(t);
+	}
+	cursor_show();
 }
 
 /* Sharp on a scaled output: wl_compositor 6 says which scale the output it is on
@@ -4720,14 +4853,14 @@ static void surf_leave(void *data, struct wl_surface *s, struct wl_output *o)
 
 static void surf_preferred_scale(void *data, struct wl_surface *s, int32_t factor)
 {
+	factor = MIN(factor, 16);       /* no output is denser */
 	if (factor < 1 || factor == scale)
 		return;
 	scale = factor;
 	dirty = 1;
 	menu_dirty = 1;
 	/* Not only at the next enter: the pointer may stay where it is. */
-	cursor_load();
-	cursor_show();
+	cursor_update();
 }
 
 static void surf_preferred_transform(void *data, struct wl_surface *s,
@@ -4859,15 +4992,19 @@ int main(int argc, char **argv)
 		puts("mfm " MFM_VERSION);
 		return 0;
 	}
-	if (argc > 2 || (argc == 2 && (!strcmp(argv[1], "-h") ||
-	    !strcmp(argv[1], "--help")))) {
-		fprintf(stderr, "usage: mfm [-v] [directory or file]\n"
+	int help = argc == 2 && !strcmp(argv[1], "-h");
+	/* -h alone asks for it, on stdout, as mwc's does; any other option,
+	 * --help too, or more than one argument is refused. A name that starts
+	 * with "-" goes as ./-name. */
+	if (help || argc > 2 || (argc == 2 && argv[1][0] == '-')) {
+		fprintf(help ? stdout : stderr,
+			"usage: mfm [-h | -v] [directory or file]\n"
 			"Environment: MFM_OPEN (default xdg-open), MFM_SEND, "
 			"MFM_TERMINAL / MWC_TERMINAL,\n"
 			"MFM_FONT (default \"Sans 10\"), "
 			"MWC_INACTIVE, MWC_ACTIVE;\n"
 			"or the same in ~/.config/mfm/mfmrc (see the README).\n");
-		return argc == 2 ? 0 : 1;
+		return help ? 0 : 1;
 	}
 	setlocale(LC_ALL, "");
 	signal(SIGCHLD, SIG_IGN);
@@ -4885,11 +5022,11 @@ int main(int argc, char **argv)
 	wl_registry_add_listener(registry, &registry_listener, NULL);
 	wl_display_roundtrip(dpy);
 	if (!compositor || !shm || !wm_base) {
-		fprintf(stderr, "mfm: the compositor lacks wl_compositor, wl_shm "
+		fprintf(stderr, "mfm: the compositor lacks wl_compositor 4, wl_shm "
 			"or xdg_wm_base\n");
 		return 1;
 	}
-	cursor_load();
+	cursor_update();
 	theme_init();
 	setup_window();
 	start(argc == 2 ? argv[1] : NULL);
