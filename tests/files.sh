@@ -33,11 +33,16 @@ if [ "$MFMT_STAGE" = mounts ]; then
 	mount -t tmpfs -o size=32m none "$R/wide" || exit 1
 	head -c 4194304 /dev/urandom >"$R/src/big"
 	echo slow >"$R/src/slow"
-	mkdir -p "$R/src/rofull" "$R/src/roempty" "$R/src/tree/sub"
+	mkdir -p "$R/src/rofull" "$R/src/roempty" "$R/src/rotrash" "$R/src/tree/sub"
 	echo f >"$R/src/rofull/f"
+	echo f >"$R/src/rotrash/f"
 	echo f >"$R/src/tree/sub/f"
 	echo f >"$R/src/tree/secret"
-	chmod 555 "$R/src/rofull" "$R/src/roempty" "$R/src/tree/sub"
+	# Sentinels: each refusal shares its job with one of these, which must arrive
+	# or go, so the refusal is known to have been tried.
+	touch "$R/del/zzb" "$R/del/zzc" "$R/del2/zzb" "$R/src/zm1" "$R/src/zm2" \
+		"$R/src/zc1"
+	chmod 555 "$R/src/rofull" "$R/src/roempty" "$R/src/rotrash" "$R/src/tree/sub"
 	chmod 000 "$R/src/tree/secret"
 	# Inside a namespace of its own the mounts cannot be undone, as for a user.
 	MFMT_STAGE=test exec unshare -U --map-user="$MFMT_UID" --map-group="$MFMT_GID" \
@@ -74,7 +79,8 @@ to_dir() {
 	sleep 0.2
 }
 
-# job_settled: wait until no worker runs below mfm any more.
+# job_settled: wait until no worker runs below mfm any more. That alone says nothing
+# about a job that has not started yet: wait for what it does first.
 job_settled() {
 	local i
 	for ((i = 0; i < 100; i++)); do
@@ -90,54 +96,98 @@ no_hidden_left() {
 	[ -z "$left" ] || fail "$2: left behind: $left"
 }
 
-# delete_row <row>: Delete permanently through the menu, and say yes.
-delete_row() {
-	do_input move $((LISTX + 40)) "$(row_y "$1")"
-	do_input click right
-	sleep 0.4
-	# Open Cut Copy "Copy to clipboard" Rename Trash Delete
-	for _ in 1 2 3 4 5 6 7; do do_input key Down; done
-	do_input key Return
-	sleep 0.2
+# mark_rows <row>...: Ctrl+click them.
+mark_rows() {
+	local r
+	do_input hold ctrl
+	for r; do
+		do_input move $((LISTX + 40)) "$(row_y "$r")"
+		do_input click left
+	done
+	do_input release ctrl
+}
+
+# delete_rows <sentinel> <row>...: mark the rows, Shift+Delete and say yes; done once
+# the sentinel among them is gone.
+delete_rows() {
+	local sentinel=$1
+	shift
+	mark_rows "$@"
+	do_input key shift+Delete
 	do_input key y
+	wait_for "the delete ran" test ! -e "$sentinel"
 	job_settled
+}
+
+# mark_names <name>...: type-ahead to each and mark it, with Space once the search is
+# over (vinput has no Insert).
+mark_names() {
+	local n
+	for n; do
+		type_name "$n"
+		sleep 1.1
+		do_input key space
+	done
 }
 
 # ---- delete -----------------------------------------------------------------
 
+# .. outer precious zzb zzc
 mfm_start "$R/del"
-delete_row 1
+mark_rows 1 4
+do_input key Delete
+wait_for "the trash ran" test ! -e "$R/del/zzc"
+[ -d "$R/del/outer/inner" ] || fail "outer went to the trash with its mount"
+[ -e "$R/del/precious/thesis.txt" ] || fail "the bind mount went with it"
+echo "ok: the trash keeps out of a folder with a mount in it"
+do_input key Escape
+do_input key Escape
+delete_rows "$R/del/zzb" 1 3
 [ -e "$R/del/precious/thesis.txt" ] || fail "a bind mount of the same file system was emptied"
 [ -d "$R/del/outer/inner" ] || fail "outer was deleted around its mount"
 echo "ok: delete keeps out of a folder with a bind mount in it"
 mfm_quit
 
+# .. box zzb
 mfm_start "$R/del2"
-delete_row 1
+delete_rows "$R/del2/zzb" 1 2
 [ -e "$R/del2/box/m/keep" ] || fail "a mounted file system was emptied"
 echo "ok: delete keeps out of a folder with another file system mounted in it"
 mfm_quit
 
+# Renaming a folder into another one changes its "..": a read-only one is opened for
+# that and gets its mode back. The trash is the one of the tmpfs, at its top.
+mfm_start "$R/src"
+type_name rot
+do_input key Delete
+wait_for "a read-only folder goes to the trash" test ! -e "$R/src/rotrash"
+[ "$(stat -c %a "$R/.Trash-$(id -u)/files/rotrash")" = 555 ] ||
+	fail "the trashed folder lost its mode"
+echo "ok: and keeps its mode there"
+mfm_quit
+
 # ---- move -------------------------------------------------------------------
 
+# The full disk frees up again once the failed copy is cleaned up: then zm1 fits.
 mfm_start "$R/src"
-type_name big
+mark_names big zm1
 do_input key ctrl+x
 to_dir dst
 do_input key ctrl+v
+wait_for "the move ran" test -e "$R/dst/zm1"
 job_settled
 [ ! -e "$R/dst/big" ] || fail "half a file under its real name"
 [ "$(stat -c %s "$R/src/big")" = 4194304 ] || fail "the source was damaged"
-[ -n "$(find "$R/dst" -maxdepth 1 -name '.mfm-*')" ] || fail "what arrived is gone"
-echo "ok: a move to a full disk shows nothing under the real name"
-rm -rf "$R"/dst/.mfm-*
+no_hidden_left "$R/dst" "a move to a full disk"
+echo "ok: a move to a full disk leaves the source and no half copy"
 mfm_quit
 
 mfm_start "$R/src"
-type_name mnt
+mark_names mnt zm2
 do_input key ctrl+x
 to_dir wide
 do_input key ctrl+v
+wait_for "the move ran" test -e "$R/wide/zm2"
 job_settled
 [ -e "$R/src/mnt/keep" ] || fail "the mounted file system was emptied"
 [ ! -e "$R/wide/mnt" ] || fail "the mount point was moved"
@@ -150,9 +200,10 @@ type_name roe
 do_input key ctrl+x
 to_dir wide
 do_input key ctrl+v
+wait_for "the read-only folder arrives" test -e "$R/wide/roempty"
+wait_for "... and leaves the source" test ! -e "$R/src/roempty"
 job_settled
-[ "$(stat -c %a "$R/wide/roempty" 2>/dev/null)" = 555 ] || fail "read-only folder not moved"
-[ ! -e "$R/src/roempty" ] || fail "read-only folder still in the source"
+[ "$(stat -c %a "$R/wide/roempty")" = 555 ] || fail "the moved folder lost its mode"
 no_hidden_left "$R/wide" "moving a read-only folder"
 echo "ok: a move of a read-only folder arrives under its name"
 mfm_quit
@@ -160,13 +211,13 @@ mfm_quit
 # A worker that dies must not look like success: the clipboard stays for another try.
 SHIM=$SMOKE_DIR/shim
 mkdir -p "$SHIM"
-REAL_MV=$(command -v mv)
-cat >"$SHIM/mv" <<EOS
+REAL_CP=$(command -v cp)
+cat >"$SHIM/cp" <<EOS
 #!/bin/sh
 [ -e "$SHIM/hang" ] && exec sleep 300
-exec "$REAL_MV" "\$@"
+exec "$REAL_CP" "\$@"
 EOS
-chmod +x "$SHIM/mv"
+chmod +x "$SHIM/cp"
 touch "$SHIM/hang"
 PATH=$SHIM:$PATH mfm_start "$R/src"
 type_name slow
@@ -192,22 +243,37 @@ type_name rof
 do_input key ctrl+c
 to_dir wide
 do_input key ctrl+v
+wait_for "the read-only folder is copied" test -e "$R/wide/rofull/f"
 job_settled
-[ -e "$R/wide/rofull/f" ] || fail "read-only folder not copied"
 [ "$(stat -c %a "$R/wide/rofull")" = 555 ] || fail "the copy lost its mode"
 no_hidden_left "$R/wide" "copying a read-only folder"
 echo "ok: a copy of a read-only folder arrives under its name, still read-only"
 mfm_quit
 
 mfm_start "$R/src"
-type_name tree
+mark_names tree zc1
 do_input key ctrl+c
 to_dir wide
 do_input key ctrl+v
+wait_for "the copy ran" test -e "$R/wide/zc1"
 job_settled
 [ ! -e "$R/wide/tree" ] || fail "a failed copy under its real name"
 no_hidden_left "$R/wide" "a failed copy with a read-only folder in it"
 echo "ok: a failed copy is cleaned up, read-only folders included"
+mfm_quit
+
+# A read-only folder with something in it, to another file system: it arrives
+# complete, under its name, and the original goes.
+mfm_start "$R/src"
+type_name rof
+do_input key ctrl+x
+to_dir dst
+do_input key ctrl+v
+wait_for "the read-only folder arrives with its file" test -e "$R/dst/rofull/f"
+wait_for "... and the original goes" test ! -e "$R/src/rofull"
+job_settled
+[ "$(stat -c %a "$R/dst/rofull")" = 555 ] || fail "the moved folder lost its mode"
+no_hidden_left "$R/dst" "moving a read-only folder with a file in it"
 mfm_quit
 
 # ---- the directory on screen ------------------------------------------------

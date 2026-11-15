@@ -13,11 +13,11 @@ files where hard links fail too.
 
 ## Mount points
 
-Permanent deletion is `rm -rf --one-file-system`. mfm refuses to delete a mount point
-or a folder with something mounted in it, bind mounts from the same file system
-included, since `rm` would empty what is mounted. A mount point cannot be moved, nor
-can a folder with something mounted in it be moved to another file system. Copying
-works.
+Permanent deletion is `rm -rf --one-file-system`. mfm refuses to delete or trash a
+mount point or a folder with something mounted in it, bind mounts from the same file
+system included, since `rm` or emptying the trash would empty what is mounted. A mount
+point cannot be moved, nor can a folder with something mounted in it be moved to
+another file system. Copying works.
 
 
 ## Input methods

@@ -26,7 +26,7 @@
  *         empty area was clicked.
  *
  * Copy, move and permanent delete run in a child process, one item after
- * the other (cp -a, rename or mv, rm -rf --one-file-system). Nothing is
+ * the other (rename or cp -a, rm -rf --one-file-system). Nothing is
  * overwritten: a taken name gets " (copy)" or, when moving, " (2)". The
  * trash follows the freedesktop.org specification.
  *
@@ -60,6 +60,7 @@
 #include <strings.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -251,6 +252,12 @@ static uint64_t now_ms(void)
 	return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+/* A type-ahead is going on: keys still add to the name. */
+static int searching(void)
+{
+	return search[0] && now_ms() - search_ms < TYPEAHEAD_MS;
+}
+
 /* ---- buffers ------------------------------------------------------------ */
 
 static void buf_free(struct shmbuf *b)
@@ -426,6 +433,15 @@ static size_t u8_prev(const char *s, size_t len)
 	return last - s;
 }
 
+static int utf8_valid(const char *s)
+{
+	uint32_t cp;
+	for (int n; *s; s += n)
+		if (!(n = u8_len((const unsigned char *)s, &cp)))
+			return 0;
+	return 1;
+}
+
 /* Characters that only reorder what is drawn: a name with U+202E shows
  * "fdp.exe" as "exe.pdf". */
 static int is_bidi_control(uint32_t c)
@@ -434,8 +450,16 @@ static int is_bidi_control(uint32_t c)
 		(c >= 0x202a && c <= 0x202e) || (c >= 0x2066 && c <= 0x2069);
 }
 
+/* Characters that do not show: a name could hide behind them. */
+static int is_invisible(uint32_t c)
+{
+	return c < 0x20 || (c >= 0x7f && c <= 0x9f) || c == 0x200b ||
+		c == 0x2028 || c == 0x2029 || c == 0xfeff;
+}
+
 /* A valid UTF-8 copy of s for drawing (static buffer): Latin-1 bytes are
- * converted, C1 control bytes and bidi controls become U+FFFD. */
+ * converted; control characters, C1 bytes, bidi controls and other
+ * invisible characters become U+FFFD. */
 static const char *disp(const char *s)
 {
 	static char out[3 * PATH_MAX + 8];
@@ -443,7 +467,7 @@ static const char *disp(const char *s)
 	while (*s && o + 4 < sizeof out) {
 		uint32_t cp;
 		int n = u8_len((const unsigned char *)s, &cp);
-		if (n && is_bidi_control(cp)) {
+		if (n && (is_bidi_control(cp) || is_invisible(cp))) {
 			memcpy(out + o, "\xef\xbf\xbd", 3);
 			o += 3;
 			s += n;
@@ -468,11 +492,13 @@ static const char *disp(const char *s)
 	return out;
 }
 
+/* What belongs to the character before it: the marks of any script (Hindi
+ * vowel signs, Hebrew points, variation selectors too), the joiner in emoji
+ * sequences and the skin tones. */
 static int is_combining(uint32_t c)
 {
-	return (c >= 0x300 && c <= 0x36f) || (c >= 0x1ab0 && c <= 0x1aff) ||
-		(c >= 0x1dc0 && c <= 0x1dff) || (c >= 0x20d0 && c <= 0x20ff) ||
-		(c >= 0xfe20 && c <= 0xfe2f);
+	return c >= 0x300 && (g_unichar_ismark(c) || c == 0x200d ||
+		(c >= 0x1f3fb && c <= 0x1f3ff));
 }
 
 /* Lower case for type-ahead. towlower() only knows non-ASCII letters in a
@@ -498,13 +524,19 @@ static uint32_t fold(uint32_t c)
 	return c;
 }
 
+/* Names from macOS and SMB are decomposed (NFD), what is typed is not:
+ * both are compared composed. A name that is not UTF-8 stays as it is. */
 static int prefix_ci(const char *name, const char *pre)
 {
-	while (*pre) {
-		if (!*name || fold(u8_next(&name)) != fold(u8_next(&pre)))
-			return 0;
-	}
-	return 1;
+	char *cn = g_utf8_normalize(name, -1, G_NORMALIZE_NFC);
+	char *cp = g_utf8_normalize(pre, -1, G_NORMALIZE_NFC);
+	const char *a = cn ? cn : name, *b = cp ? cp : pre;
+	int r = 1;
+	while (*b && r)
+		r = *a && fold(u8_next(&a)) == fold(u8_next(&b));
+	g_free(cn);
+	g_free(cp);
+	return r;
 }
 
 /* ---- colours (same rules as mwm's draw.c) ------------------------------- */
@@ -548,6 +580,9 @@ static int parse_color(const char *s, uint32_t *out)
 		s += 4;
 		for (int i = 0; i < 3; i++) {
 			char *end;
+			/* strtoul would take a sign, blanks and "0x" */
+			if (!isxdigit((unsigned char)*s))
+				return 0;
 			unsigned long v = strtoul(s, &end, 16);
 			int digits = end - s;
 			if (digits < 1 || digits > 4 || *end != (i < 2 ? '/' : '\0'))
@@ -565,7 +600,6 @@ static int parse_color(const char *s, uint32_t *out)
 	return 1;
 }
 
-/* Last global "Mwm*key: value" line of ~/.config/mwc/mwmrc. */
 /* `key` from $XDG_CONFIG_HOME/`file` (default ~/.config/`file`), resource
  * style: "Prefix*key: value" or "Prefix.key: value". The last one wins. */
 static char *rc_get(const char *file, const char *prefix, const char *key,
@@ -586,7 +620,15 @@ static char *rc_get(const char *file, const char *prefix, const char *key,
 		return NULL;
 	char *found = NULL;
 	size_t kl = strlen(key), pl = strlen(prefix);
+	int rest = 0;           /* in the rest of a line too long to read */
 	while (fgets(line, sizeof line, f)) {
+		/* A line too long for the buffer is skipped as a whole: its
+		 * tail must not count as a line of its own. */
+		int whole = strchr(line, '\n') || feof(f);
+		int skip = rest;
+		rest = !whole;
+		if (skip || !whole)
+			continue;
 		char *p = line;
 		while (isspace((unsigned char)*p))
 			p++;
@@ -608,8 +650,11 @@ static char *rc_get(const char *file, const char *prefix, const char *key,
 		char *e = p + strlen(p);
 		while (e > p && isspace((unsigned char)e[-1]))
 			*--e = 0;
-		if ((size_t)snprintf(val, n, "%s", p) < n)
+		/* A value too long is ignored, the one before it stays. */
+		if (strlen(p) < n) {
+			memcpy(val, p, strlen(p) + 1);
 			found = val;
+		}
 	}
 	fclose(f);
 	return found;
@@ -816,7 +861,8 @@ static void human(off_t s, char *o, size_t n)
 	const char *u = "BKMGTP";
 	double v = s;
 	int i = 0;
-	while (v >= 1024 && i < 5) {
+	/* 1023.97 K would show as "1024.0 K": rounded, it is 1.0 M. */
+	while (i < 5 && (v >= 1024 || (i > 0 && v >= 1023.95))) {
 		v /= 1024;
 		i++;
 	}
@@ -845,21 +891,23 @@ static int ent_cmp(const void *a, const void *b)
 		return y->up - x->up;
 	if (x->dir != y->dir)
 		return y->dir - x->dir;
-	int r = 0;
-	/* Unknown sizes and dates go last; folder sizes say nothing, so
-	 * folders stay by name when sorting by size. Largest and newest
-	 * come first. */
-	if (sort_by != SORT_NAME && x->nostat != y->nostat)
+	/* Folder sizes say nothing, so folders stay by name, A to Z, when
+	 * sorting by size. Otherwise unknown sizes and dates go last, largest
+	 * and newest come first, and equal ones by name, A to Z. Only the
+	 * order the key chose is reversed. */
+	int by = sort_by == SORT_SIZE && x->dir ? SORT_NAME : sort_by, r = 0;
+	if (by != SORT_NAME && x->nostat != y->nostat)
 		return x->nostat - y->nostat;
-	if (sort_by == SORT_SIZE && !x->dir && x->size != y->size)
+	if (by == SORT_SIZE && x->size != y->size)
 		r = x->size > y->size ? -1 : 1;
-	else if (sort_by == SORT_DATE && x->mtime != y->mtime)
+	else if (by == SORT_DATE && x->mtime != y->mtime)
 		r = x->mtime > y->mtime ? -1 : 1;
-	if (!r)
-		r = strcoll(x->name, y->name);
+	if (r)
+		return sort_rev ? -r : r;
+	r = strcoll(x->name, y->name);
 	if (!r)
 		r = strcmp(x->name, y->name);
-	return sort_rev ? -r : r;
+	return sort_rev && sort_by == SORT_NAME ? -r : r;
 }
 
 static void free_ents(struct ent *v, int n)
@@ -1674,6 +1722,21 @@ static void url_path(char *out, const char *path)
 	out[o] = 0;
 }
 
+/* rename_new() for what may be a directory without write permission for
+ * its owner, as in place_any(). */
+static int move_dir_any(const char *from, const char *to)
+{
+	struct stat st;
+	int unlock = lstat(from, &st) == 0 && S_ISDIR(st.st_mode) &&
+		!(st.st_mode & S_IWUSR) &&
+		chmod(from, (st.st_mode & 07777) | S_IWUSR) == 0;
+	int r = rename_new(from, to), e = errno;
+	if (unlock)
+		chmod(r == 0 ? to : from, st.st_mode & 07777);
+	errno = e;
+	return r;
+}
+
 /* Move path into the trash directory t, recording `orig` as the original
  * path. info/NAME.trashinfo is created first (exclusively, which reserves
  * NAME), then the file goes to files/NAME. */
@@ -1725,7 +1788,7 @@ static int trash_into(const char *t, const char *path, const char *orig)
 			"DeletionDate=%s\n", url, date) < 0;
 		if (f ? fclose(f) != 0 : close(fd) != 0)
 			bad = 1;
-		if (bad || rename_new(path, fp) < 0) {
+		if (bad || move_dir_any(path, fp) < 0) {
 			int e = bad ? EIO : errno;
 			unlink(ip);
 			errno = e;
@@ -1754,6 +1817,19 @@ static int trash_one(const char *path, char *err, size_t esz)
 	}
 	if (is_mount(path)) {
 		snprintf(err, esz, "%s is a mount point", base);
+		return -1;
+	}
+	/* Emptying the trash later would empty what is mounted in it. */
+	struct stat st;
+	int below = lstat(path, &st) == 0 && S_ISDIR(st.st_mode) ?
+		mount_below(path) : 0;
+	if (below > 0) {
+		snprintf(err, esz, "%s has a mount point in it", base);
+		return -1;
+	}
+	if (below < 0) {
+		snprintf(err, esz, "%s: cannot check for mount points: %s",
+			base, strerror(errno));
 		return -1;
 	}
 	/* The physical path, which stays right when a link to it goes. */
@@ -1800,15 +1876,40 @@ static int wait_prog(const char *prog, char *const argv[], char *msg,
 	}
 	if (pid == 0) {
 		int nul = open("/dev/null", O_RDONLY);
-		if (nul >= 0)
+		if (nul >= 0) {
 			dup2(nul, 0);
+			if (nul != 0)
+				close(nul);
+		}
 		dup2(p[1], 2);
+		signal(SIGPIPE, SIG_DFL);       /* the worker ignores it */
 		execv(prog, argv);
 		dprintf(2, "cannot run %s: %s\n", argv[0], strerror(errno));
 		_exit(127);
 	}
 	close(p[1]);
+	/* The end of the program, not of its stderr, ends the wait: something
+	 * it started in the background may keep stderr open for good. */
+	int pfd = syscall(SYS_pidfd_open, pid, 0);
+	struct pollfd pf[2] = {
+		{ .fd = p[0], .events = POLLIN },
+		{ .fd = pfd, .events = POLLIN },
+	};
+	int exited = pfd < 0;   /* without a pidfd: read to the end */
 	for (;;) {
+		if (pfd >= 0 && !exited) {
+			if (poll(pf, 2, -1) < 0) {
+				if (errno == EINTR)
+					continue;
+				break;
+			}
+			if (pf[1].revents & POLLIN) {
+				exited = 1;     /* read what is left */
+				fcntl(p[0], F_SETFL, O_NONBLOCK);
+			} else if (!(pf[0].revents & (POLLIN | POLLHUP))) {
+				continue;
+			}
+		}
 		char junk[512];
 		ssize_t r = len < sizeof buf - 1 ?
 			read(p[0], buf + len, sizeof buf - 1 - len) :
@@ -1820,6 +1921,8 @@ static int wait_prog(const char *prog, char *const argv[], char *msg,
 		if (len < sizeof buf - 1)
 			len += r;
 	}
+	if (pfd >= 0)
+		close(pfd);
 	close(p[0]);
 	while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
 		;
@@ -1848,13 +1951,15 @@ static void report(int out, const char *fmt, ...)
 	dprintf(out, "%s\n", b);
 }
 
-/* Run cp, mv, rm or chmod (looked up once) with up to four arguments. */
+enum { T_CP, T_RM, T_CHMOD, T_N };
+
+/* Run cp, rm or chmod (looked up once) with up to four arguments. */
 static int tool(int which, const char *a1, const char *a2, const char *a3,
 	const char *a4, char *msg, size_t msz)
 {
-	static const char *const names[] = { "cp", "mv", "rm", "chmod" };
-	static char path[4][PATH_MAX];
-	static int err[4] = { -1, -1, -1, -1 };
+	static const char *const names[T_N] = { "cp", "rm", "chmod" };
+	static char path[T_N][PATH_MAX];
+	static int err[T_N] = { -1, -1, -1 };
 	if (err[which] < 0)
 		err[which] = find_prog(names[which], path[which]);
 	if (err[which]) {
@@ -1870,10 +1975,11 @@ static int tool(int which, const char *a1, const char *a2, const char *a3,
 /*
  * The child that does a job, one item after the other. A move within a
  * file system is a rename. A copy, or a move to another file system, goes
- * to a hidden directory in the target first (cp -a / mv) and is renamed
- * into place from there, so a partial copy never shows under the real name
- * and the final name is picked only when it is used: nothing is ever
- * overwritten, not even on a case-insensitive file system. Delete is
+ * to a hidden directory in the target first (cp -a) and is renamed into
+ * place from there, so a partial copy never shows under the real name and
+ * the final name is picked only when it is used: nothing is ever
+ * overwritten, not even on a case-insensitive file system. The original of
+ * such a move is removed after that. Delete is
  * rm -rf, after making sure there is no mount in the way. A NUL byte at the end
  * tells mfm that the job ran to its end.
  */
@@ -1911,8 +2017,8 @@ static void worker(int op, const char *sdir, char **names, int n,
 			else if (below < 0)
 				report(out, "%s: cannot check for mount points: %s",
 					nm, strerror(errno));
-			else if (tool(2, "-rf", "--one-file-system", "--", src,
-			    msg, sizeof msg) < 0)
+			else if (tool(T_RM, "-rf", "--one-file-system", "--",
+			    src, msg, sizeof msg) < 0)
 				report(out, "%s", msg);
 			continue;
 		}
@@ -1924,7 +2030,7 @@ static void worker(int op, const char *sdir, char **names, int n,
 				report(out, "%s: %s", nm, strerror(errno));
 				continue;
 			}
-			/* mv's removal after the copy would empty what is mounted. */
+			/* Removing the original would empty what is mounted. */
 			int below = isdir ? mount_below(src) : 0;
 			if (below != 0) {
 				report(out, below > 0 ?
@@ -1943,28 +2049,17 @@ static void worker(int op, const char *sdir, char **names, int n,
 			rmdir(tmp);
 			continue;
 		}
-		int ok = op == OP_COPY ?
-			tool(0, "-a", "--", src, t, msg, sizeof msg) == 0 :
-			tool(1, "--", src, t, NULL, msg, sizeof msg) == 0;
-		/* A failed mv may have removed part of the source already, so
-		 * whatever arrived is kept, but not under the real name: it may
-		 * be half a file. A failed copy is cleaned up, also from the
-		 * read-only directories cp -a made. */
-		if (op == OP_MOVE && !ok) {
-			if (lstat(t, &st) < 0) {
-				report(out, "%s", msg);
-				rmdir(tmp);
-			} else {
-				report(out, "%s (what arrived is in %s)", msg,
-					strrchr(tmp, '/') + 1);
-			}
-			continue;
-		}
-		if (op == OP_COPY && !ok) {
+		/* A move to another file system is a copy, and the original
+		 * goes only once the copy is complete and in place. mv would
+		 * leave it unclear which side is whole when it fails. */
+		if (tool(T_CP, "-a", "--", src, t, msg, sizeof msg) < 0) {
+			/* Cleaned up, also from the read-only directories cp -a
+			 * made; the source is untouched. */
 			char why[sizeof msg];
 			snprintf(why, sizeof why, "%s", msg);
-			tool(3, "-R", "u+w", "--", tmp, msg, sizeof msg);
-			if (tool(2, "-rf", "--", tmp, NULL, msg, sizeof msg) < 0)
+			tool(T_CHMOD, "-R", "u+w", "--", tmp, msg, sizeof msg);
+			if (tool(T_RM, "-rf", "--", tmp, NULL, msg,
+			    sizeof msg) < 0)
 				report(out, "%s (the rest is in %s)", why,
 					strrchr(tmp, '/') + 1);
 			else
@@ -1977,6 +2072,20 @@ static void worker(int op, const char *sdir, char **names, int n,
 			continue;
 		}
 		rmdir(tmp);
+		if (op != OP_MOVE)
+			continue;
+		/* A read-only folder in the original, as cp -a keeps it, would
+		 * stop rm halfway; it is being removed anyway. */
+		int gone = tool(T_RM, "-rf", "--one-file-system", "--", src,
+			msg, sizeof msg) == 0;
+		if (!gone) {
+			tool(T_CHMOD, "-R", "u+w", "--", src, msg, sizeof msg);
+			gone = tool(T_RM, "-rf", "--one-file-system", "--", src,
+				msg, sizeof msg) == 0;
+		}
+		if (!gone)
+			report(out, "%s is in place as %s, but the original is "
+				"not completely removed: %s", nm, final, msg);
 	}
 	if (write(out, "", 1) < 0) {
 		/* mfm has quit: nobody to tell */
@@ -2140,16 +2249,29 @@ static const struct { const char *mime; int what; } cb_types[] = {
 	{ "text/plain;charset=utf-8", CB_PLAIN },
 	{ "text/plain", CB_PLAIN },
 };
-static struct { char *data[CB_N]; size_t len[CB_N]; int done; } cb;
+static struct {
+	char *data[CB_N];
+	size_t len[CB_N];
+	int done;
+	int plain;      /* the paths are UTF-8, so they may go as text */
+} cb;
 static struct wl_seat *cb_seat;
 static struct ext_data_control_manager_v1 *cb_mgr;
 
+/* A reader that stops reading is given up on after a while: until then
+ * this process serves nobody else and misses being replaced. */
 static void write_all(int fd, const char *p, size_t n)
 {
+	struct pollfd pf = { .fd = fd, .events = POLLOUT };
 	while (n) {
 		ssize_t w = write(fd, p, n);
 		if (w < 0 && errno == EINTR)
 			continue;
+		if (w < 0 && errno == EAGAIN) {
+			if (poll(&pf, 1, 5000) <= 0)
+				return;
+			continue;
+		}
 		if (w <= 0)
 			return;
 		p += w;
@@ -2160,10 +2282,9 @@ static void write_all(int fd, const char *p, size_t n)
 static void cb_send(void *data, struct ext_data_control_source_v1 *src,
 	const char *mime, int32_t fd)
 {
-	/* Handing it out is all this process does: a slow reader may wait. */
 	int fl = fcntl(fd, F_GETFL);
 	if (fl >= 0)
-		fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+		fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 	for (size_t i = 0; i < sizeof cb_types / sizeof cb_types[0]; i++)
 		if (!strcmp(mime, cb_types[i].mime)) {
 			int w = cb_types[i].what;
@@ -2251,7 +2372,8 @@ static _Noreturn void cb_child(int fd)
 		ext_data_control_manager_v1_create_data_source(cb_mgr);
 	ext_data_control_source_v1_add_listener(src, &cb_source_listener, NULL);
 	for (size_t i = 0; i < sizeof cb_types / sizeof cb_types[0]; i++)
-		ext_data_control_source_v1_offer(src, cb_types[i].mime);
+		if (cb_types[i].what != CB_PLAIN || cb.plain)
+			ext_data_control_source_v1_offer(src, cb_types[i].mime);
 	ext_data_control_device_v1_set_selection(dev, src);
 	if (wl_display_roundtrip(d) < 0 || cb.done) {
 		dprintf(fd, "the compositor did not take it\n");
@@ -2273,7 +2395,6 @@ static void clip_export(void)
 	char **names = targets(&nnames);
 	if (!names)
 		return;
-	unmark_all();
 	FILE *f[CB_N];
 	for (int i = 0; i < CB_N; i++)
 		cb.data[i] = NULL;
@@ -2284,6 +2405,7 @@ static void clip_export(void)
 			goto nomem;
 		}
 	fputs("copy", f[CB_GNOME]);
+	cb.plain = 1;
 	static char url[3 * PATH_MAX + 1];
 	char p[PATH_MAX];
 	for (int i = 0; i < nnames; i++) {
@@ -2293,6 +2415,7 @@ static void clip_export(void)
 		fprintf(f[CB_URIS], "file://%s\r\n", url);
 		fprintf(f[CB_GNOME], "\nfile://%s", url);
 		fprintf(f[CB_PLAIN], "%s%s", i ? "\n" : "", p);
+		cb.plain &= utf8_valid(p);
 	}
 	int bad = 0;
 	for (int i = 0; i < CB_N; i++)
@@ -2335,11 +2458,18 @@ static void clip_export(void)
 	close(pp[0]);
 	msg[n] = 0;
 	msg[strcspn(msg, "\n")] = 0;
-	if (n && !msg[0])
-		set_status(0, "%d item%s in the clipboard",
-			nnames, nnames == 1 ? "" : "s");
-	else
+	if (!n)                 /* it must not take the clipboard after all */
+		kill(pid, SIGKILL);
+	if (n && !msg[0]) {
+		/* The marks have done their job; after a failure they stay
+		 * for another try. */
+		unmark_all();
+		set_status(0, "%d item%s in the clipboard%s",
+			nnames, nnames == 1 ? "" : "s",
+			cb.plain ? "" : ", not as text: a name is not UTF-8");
+	} else {
 		set_status(1, "clipboard: %s", n ? msg : "no answer");
+	}
 	goto out;
 nomem:
 	set_status(1, "clipboard: %s", strerror(ENOMEM));
@@ -2652,12 +2782,13 @@ static void poll_dir(void)
 	 * try that again every second. */
 	int stuck = !strcmp(cwd, climb_failed);
 	if (stat(cwd, &st) != 0) {
-		if (gone(errno))
+		if (gone(errno) && !stuck)
 			climb();
 		return;
 	}
 	if (!S_ISDIR(st.st_mode)) {
-		climb();
+		if (!stuck)
+			climb();
 		return;
 	}
 	/* chmod does not change the mtime that is checked below. */
@@ -2666,6 +2797,7 @@ static void poll_dir(void)
 			climb();
 		return;
 	}
+	climb_failed[0] = 0;    /* listable again: a later loss climbs */
 	if (!cwd_unsure && st.st_mtim.tv_sec == cwd_mtime.tv_sec &&
 	    st.st_mtim.tv_nsec == cwd_mtime.tv_nsec)
 		return;
@@ -2748,8 +2880,14 @@ static int line_key(char *b, size_t sz, size_t *cur, int *fresh, int sel,
 		if (cut) {
 			memmove(b, b + c, len - c + 1);
 			c = 0;
-		} else if (c) {
-			size_t q = u8_prev(b, c);
+		} else if (c) {         /* the letter with its marks */
+			size_t q = c;
+			while (q) {
+				q = u8_prev(b, q);
+				p = b + q;
+				if (!is_combining(u8_next(&p)))
+					break;
+			}
 			memmove(b + q, b + c, len - c + 1);
 			c = q;
 		}
@@ -2761,6 +2899,8 @@ static int line_key(char *b, size_t sz, size_t *cur, int *fresh, int sel,
 		} else if (c < len) {
 			p = b + c;
 			u8_next(&p);
+			for (const char *q = p; *q && is_combining(u8_next(&q));)
+				p = q;
 			memmove(b + c, p, len - (p - b) + 1);
 		}
 		break;
@@ -2922,6 +3062,18 @@ static void prompt_begin(int kind)
 	dirty = 1;
 }
 
+#define HIDDEN_SHOWN ", hidden files shown (Ctrl+H hides them)"
+
+/* A new name that is hidden shows hidden files: else the entry vanishes and
+ * the selection lands on a neighbour, which Delete would then trash. */
+static int reveal_new(const char *name)
+{
+	if (name[0] != '.' || show_hidden)
+		return 0;
+	show_hidden = 1;
+	return 1;
+}
+
 static void prompt_commit(void)
 {
 	char p[PATH_MAX], q[PATH_MAX];
@@ -2949,9 +3101,10 @@ static void prompt_commit(void)
 				strerror(errno));
 			return;
 		}
+		int shown = reveal_new(pbuf);
 		reload();
 		select_name(pbuf);
-		set_status(0, "created %s", pbuf);
+		set_status(0, "created %s%s", pbuf, shown ? HIDDEN_SHOWN : "");
 		return;
 	}
 	struct stat a, b;
@@ -2980,9 +3133,11 @@ static void prompt_commit(void)
 		rename_lost = 0;
 		return;
 	}
+	int shown = reveal_new(pbuf);
 	reload();
 	select_name(pbuf);
-	set_status(0, "renamed %s to %s", pold, pbuf);
+	set_status(0, "renamed %s to %s%s", pold, pbuf,
+		shown ? HIDDEN_SHOWN : "");
 }
 
 static void prompt_key(xkb_keysym_t ks, const char *txt, int n, int ctrl)
@@ -3807,7 +3962,7 @@ static void key(xkb_keysym_t ks, const char *txt, int n, unsigned state)
 		return;
 	}
 	/* A type-ahead that timed out is over: Backspace means "parent". */
-	if (search[0] && now_ms() - search_ms >= TYPEAHEAD_MS)
+	if (!searching())
 		search[0] = 0;
 	int had_msg = status_msg[0] != 0;
 	clear_status();
@@ -3930,6 +4085,12 @@ static void list_menu(const struct pev *ev)
 static void on_button(const struct pev *ev)
 {
 	int x = ev->x, y = ev->y;
+	/* Scrolling only looks: a touchpad brushed while typing a name must
+	 * not drop it, nor answer the question before deleting. */
+	switch (ev->button) {
+	case B_WHEEL_UP: top -= 3; clamp_top(); dirty = 1; return;
+	case B_WHEEL_DOWN: top += 3; clamp_top(); dirty = 1; return;
+	}
 	if (pend)
 		answer_delete(0);
 	if (prompt) {
@@ -3941,8 +4102,6 @@ static void on_button(const struct pev *ev)
 		dirty = 1;
 	}
 	switch (ev->button) {
-	case B_WHEEL_UP: top -= 3; clamp_top(); dirty = 1; return;
-	case B_WHEEL_DOWN: top += 3; clamp_top(); dirty = 1; return;
 	case B_BACK: go_parent(); return;
 	case B_RIGHT: list_menu(ev); return;
 	case B_LEFT: break;
@@ -4049,7 +4208,8 @@ static unsigned current_state(void)
 }
 
 /* A held key moves and types, but runs no command again: Delete would empty
- * the folder into the trash, Return would open a file 25 times a second. */
+ * the folder into the trash, Return would open a file 25 times a second,
+ * Backspace would climb to /. */
 static int key_repeats(uint32_t kc)
 {
 	xkb_keysym_t ks = xkb_state_key_get_one_sym(kb_state, kc);
@@ -4068,13 +4228,34 @@ static int key_repeats(uint32_t kc)
 	case XKB_KEY_Next: case XKB_KEY_KP_Next:
 	case XKB_KEY_Left: case XKB_KEY_KP_Left:
 	case XKB_KEY_Right: case XKB_KEY_KP_Right:
+		return editing || prompt;
+	/* In the list Backspace and Left go up and Right opens a folder,
+	 * Space marks: once per press. In a search they edit it. */
 	case XKB_KEY_BackSpace:
-		return 1;
+	case XKB_KEY_space:
+		return editing || prompt || searching();
 	case XKB_KEY_Delete: case XKB_KEY_KP_Delete:
 		return editing || prompt;
 	}
 	uint32_t c = xkb_keysym_to_utf32(ks);
 	return c >= 0x20 && c != 0x7f;
+}
+
+/* With Ctrl or Alt, a key that gives no Latin letter on the active layout
+ * (Cyrillic, Greek) acts as it does on the first layout where it gives one:
+ * else Ctrl+C would only ever see a "с". */
+static xkb_keysym_t shortcut_sym(uint32_t kc, xkb_keysym_t ks)
+{
+	if (ks < 0x100)
+		return ks;
+	xkb_layout_index_t n = xkb_keymap_num_layouts_for_key(kb_map, kc);
+	for (xkb_layout_index_t l = 0; l < n; l++) {
+		const xkb_keysym_t *syms;
+		if (xkb_keymap_key_get_syms_by_level(kb_map, kc, l, 0,
+		    &syms) == 1 && syms[0] > 0x20 && syms[0] < 0x7f)
+			return syms[0];
+	}
+	return ks;
 }
 
 /* One key press or repeat, with kc an xkb keycode. Compose and dead keys come
@@ -4105,7 +4286,10 @@ static void key_press(uint32_t kc)
 		n = xkb_state_key_get_utf8(kb_state, kc, txt, sizeof txt);
 	if (n >= (int)sizeof txt)
 		n = 0;
-	key(ks, txt, n, current_state());
+	unsigned state = current_state();
+	if (state & (MOD_CTRL | MOD_ALT))
+		ks = shortcut_sym(kc, ks);
+	key(ks, txt, n, state);
 }
 
 static void kb_keymap(void *data, struct wl_keyboard *k, uint32_t format,
@@ -4359,17 +4543,18 @@ static void seat_capabilities(void *data, struct wl_seat *s, uint32_t caps)
 		pointer = wl_seat_get_pointer(s);
 		wl_pointer_add_listener(pointer, &pointer_listener, NULL);
 	} else if (!want_ptr && pointer) {
+		/* No leave comes: a drag or a held button would outlive it. */
+		ptr_leave(NULL, pointer, 0, NULL);
 		wl_pointer_release(pointer);
 		pointer = NULL;
-		ptr_surface = NULL;
 	}
 	if (want_kb && !keyboard) {
 		keyboard = wl_seat_get_keyboard(s);
 		wl_keyboard_add_listener(keyboard, &keyboard_listener, NULL);
 	} else if (!want_kb && keyboard) {
+		kb_leave(NULL, keyboard, 0, NULL);     /* held Ctrl included */
 		wl_keyboard_release(keyboard);
 		keyboard = NULL;
-		repeat_kc = 0;
 	}
 }
 

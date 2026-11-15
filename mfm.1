@@ -26,9 +26,12 @@ Print the version and exit.
 .B Up, Down, PgUp, PgDn, Home, End
 Move, on the keypad too.
 .TP
-.B Return, Right
+.B Return
 Open a folder, or a file with
 .BR MFM_OPEN .
+.TP
+.B Right
+Open a folder.
 .TP
 .B Backspace, Left, Alt+Up
 The parent folder.
@@ -65,6 +68,7 @@ Show or hide hidden files.
 Sort by name, by size with the largest first, or by date with the newest first.
 The same key again reverses the order.
 Folders stay on top, by name among themselves when sorting by size.
+Entries of equal size or date are by name.
 .TP
 .B Ctrl+R, F5
 Reload.
@@ -93,7 +97,9 @@ with
 .B file://
 URLs, which Firefox pastes as files, as
 .B x-special/gnome-copied-files
-for GNOME's file managers, and as plain text, one path per line.
+for GNOME's file managers, and as plain text, one path per line, unless a name is not
+valid UTF-8.
+When the clipboard cannot take them, the marks stay.
 .TP
 .B Ctrl+S
 Send the entries with
@@ -120,13 +126,16 @@ In the input fields for the path, a rename and a new folder, Left, Right, Home a
 move the cursor, Backspace and Delete delete, Ctrl+U clears, Return confirms and Esc
 cancels.
 .PP
-Only moving and typing repeat when held.
-Delete, Return and other commands act once per press; in input fields Delete and
-Backspace repeat.
+Only moving and typing repeat when held: the arrow keys, PgUp and PgDn in the list,
+letters, and in input fields also Backspace, Delete, Left and Right.
+During a search Backspace and Space repeat too.
+Everything else acts once per press: holding Backspace goes up one folder, holding
+Space marks one entry.
 .SH MOUSE
 A click selects and unmarks everything, a double click opens, Ctrl+click marks,
 Shift+click marks the range up to the selection.
-The wheel scrolls; the scroll bar can be dragged or clicked into its trough.
+The wheel scrolls, and leaves an input field or the question before deleting open;
+the scroll bar can be dragged or clicked into its trough.
 The arrow button and button 8 go to the parent folder.
 A click into the path field edits it.
 .SS Context menu
@@ -156,11 +165,9 @@ After Ctrl+X the remembered entries stay until the move has fully succeeded, and
 when the background process dies.
 .SS Nothing is overwritten
 Within a file system, moving is a rename that never replaces an existing name.
-Copies with
+Copies and moves across file systems are made with
 .B cp \-a
-and moves across file systems with
-.B mv
-first land in a hidden folder
+and first land in a hidden folder
 .B .mfm\-XXXXXX
 in the target and are renamed from there, so half a copy never shows under the real
 name.
@@ -172,13 +179,16 @@ and so on, a moved entry
 That is also how Ctrl+C, Ctrl+V in the same folder makes a duplicate.
 mfm refuses to copy or move a folder into itself, and a rename onto a taken name.
 .PP
-If a move across file systems fails, for example on a full disk, what arrived stays in
-the hidden folder and the status line names it; the source is as a rule still complete.
-A failed copy is cleaned up.
+A move across file systems removes the original only once the copy is in place.
+If the copy fails, for example on a full disk, it is cleaned up and the original stays
+as it was.
+If the original cannot be removed completely, the status line says so; the copy is
+complete.
 .SS Deleting and the trash
 Permanent deletion is
-.BR "rm \-rf \-\-one\-file\-system" ;
-mount points and folders with something mounted in them are refused.
+.BR "rm \-rf \-\-one\-file\-system" .
+Mount points and folders with something mounted in them are refused, for deleting and
+for the trash.
 .PP
 The trash follows the freedesktop.org specification, so any file manager that knows it
 restores from it; by hand, the files are in

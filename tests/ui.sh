@@ -104,9 +104,15 @@ else
 fi
 rm -f "$SMOKE_DIR/opened"
 
-# A menu that is still up would take this key: the menu must be closed now.
-do_input key F7
-do_input key Escape
+# A menu that is still up would take these keys: the menu must be closed now.
+do_input key F2
+do_input key q
+do_input key Return
+file_appears "the menu is closed after it ran Open" "$D/q.txt"
+do_input key F2
+for k in o n e; do do_input key "$k"; done
+do_input key Return
+file_appears "... and the name is back" "$D/one.txt"
 
 # A quick click leaves it open for a second click.
 do_input move "$X" "$Y"
@@ -147,13 +153,14 @@ do_input click right
 sleep 0.4
 do_input move "$LISTX" "$(row_y 0)"
 do_input click left
-sleep 0.3
-shoot
-[ "$(pixel "$LISTX" "$ROW0")" != "$SEL" ] || fail "the click selected a row"
+do_input key F2
+for k in z z; do do_input key "$k"; done
+do_input key Return
+file_appears "a click beside the menu closes it, ab is still selected" "$D/zz"
 do_input key F7
 for k in c d; do do_input key "$k"; done
 do_input key Return
-file_appears "a click beside the menu closes it" "$D/cd"
+file_appears "... and the keys go to the list" "$D/cd"
 
 # The whole way through the keys: Down to Move to trash (Open Cut Copy
 # "Copy to clipboard" Rename Trash; Paste is off with nothing to paste).
@@ -275,6 +282,83 @@ do_input key Return
 file_appears "Left steps over a combining accent" "$D/$(printf 'cae\xcc\x81.txt')"
 mfm_quit
 
+# Delete and Backspace take a letter with its accent, as Left and Right step over it.
+fresh_dir comb2
+mkdir "$D/$(printf 'e\xcc\x81x')" "$D/$(printf 'ye\xcc\x81')"
+mfm_start "$D"
+do_input key Down
+do_input key F2
+do_input key Home
+do_input key Delete
+do_input key Return
+file_appears "Delete takes the e with its accent" "$D/x"
+do_input key Down
+do_input key F2
+do_input key End
+do_input key BackSpace
+do_input key Return
+file_appears "Backspace takes the e with its accent" "$D/y"
+mfm_quit
+
+# The same for the marks of other scripts: a Devanagari ka with its virama.
+fresh_dir comb3
+mkdir "$D/$(printf 'z\xe0\xa4\x95\xe0\xa5\x8d')"
+mfm_start "$D"
+do_input key Down
+do_input key F2
+do_input key End
+do_input key BackSpace
+do_input key Return
+file_appears "Backspace takes a letter with a mark of another script" "$D/z"
+mfm_quit
+
+# A new name that is hidden shows hidden files, and stays selected: F2 again renames
+# it, not a neighbour.
+fresh_dir dotname
+touch "$D/a.txt" "$D/b.txt"
+mfm_start "$D"
+do_input key Down
+do_input key F2
+do_input key period
+do_input key Return
+file_appears "F2 to a hidden name" "$D/..txt"
+do_input key F2
+do_input key x
+do_input key Return
+file_appears "the hidden name stays selected" "$D/x.txt"
+[ -e "$D/b.txt" ] || fail "the neighbour was renamed"
+do_input key ctrl+h
+do_input key F7
+do_input key period
+do_input key d
+do_input key Return
+file_appears "F7 makes a hidden folder" "$D/.d"
+do_input key F2
+do_input key e
+do_input key Return
+file_appears "the hidden folder stays selected" "$D/e"
+[ -d "$D/e" ] || fail "e is not the folder"
+mfm_quit
+
+# The wheel only scrolls: a name being typed and the question before deleting stay.
+fresh_dir wheel
+touch "$D/a.txt" "$D/b.txt"
+mfm_start "$D"
+do_input move $((LISTX + 40)) "$(row_y 1)"
+do_input key Down
+do_input key F2
+do_input key 1
+do_input wheel 1
+do_input key Return
+file_appears "F2 survives the wheel" "$D/1.txt"
+[ ! -e "$SMOKE_DIR/opened" ] || fail "Return opened the file"
+do_input key Down
+do_input key shift+Delete
+do_input wheel 1
+do_input key y
+wait_for "Shift+Del survives the wheel" test ! -e "$D/b.txt"
+mfm_quit
+
 # Ctrl+1/2/3 sort by name, size and date, the same key again reverses; folders
 # stay on top (the last row would be the folder in the reversed size order
 # otherwise). vinput has no End: up to "..", then down to the fifth row.
@@ -299,6 +383,50 @@ sort_rename ctrl+3 o "by date, the oldest last"
 sort_rename ctrl+3 n "by date reversed, the newest last"
 sort_rename ctrl+1 z "back by name"
 [ -d "$D/folder" ] || fail "the folder was renamed"
+mfm_quit
+
+# Folders stay A to Z when sorting by size, reversed too; files of one size by name.
+fresh_dir sort2
+mkdir "$D/fa" "$D/fb"
+head -c 100 /dev/zero >"$D/x.txt"
+head -c 100 /dev/zero >"$D/y.txt"
+mfm_start "$D"
+do_input key ctrl+2
+do_input key ctrl+2
+do_input key Down
+do_input key F2
+do_input key g
+do_input key Return
+file_appears "by size reversed, the folders by name" "$D/g"
+[ -d "$D/fb" ] || fail "fb came first"
+do_input key Down
+do_input key F2
+do_input key h
+do_input key Return
+file_appears "... and files of one size too" "$D/h.txt"
+[ -e "$D/y.txt" ] || fail "y.txt came first"
+mfm_quit
+
+# Holding a key runs a command once: Backspace goes up one folder, Space marks one
+# entry.
+fresh_dir hold
+mkdir -p "$D/a/b/c/d"
+touch "$D/a/b/c/d/f1" "$D/a/b/c/d/f2" "$D/a/b/c/d/f3"
+mfm_start "$D/a/b/c/d"
+do_input key Down
+do_input press space
+sleep 1.2
+do_input lift space
+do_input key Delete
+wait_for "Space held marks f1" test ! -e "$D/a/b/c/d/f1"
+[ -e "$D/a/b/c/d/f2" ] && [ -e "$D/a/b/c/d/f3" ] || fail "holding Space marked more"
+do_input press BackSpace
+sleep 1.2
+do_input lift BackSpace
+do_input key F7
+do_input key n
+do_input key Return
+file_appears "Backspace held goes up once" "$D/a/b/c/n"
 mfm_quit
 
 # Ctrl+S runs MFM_SEND once, with the full paths of the marked entries, else of
@@ -331,6 +459,20 @@ for _ in 1 2 3 4 5; do do_input key Down; done
 do_input key Return
 file_appears "the menu sends the clicked entry" "$SENT"
 [ "$(cat "$SENT")" = "$D/a.txt" ] || fail "MFM_SEND got: $(cat "$SENT")"
+mfm_quit
+
+# The end of MFM_SEND ends the job, also when it leaves something running that keeps
+# its stderr open.
+BGPID=$SMOKE_DIR/bg.pid
+MFM_SEND="sh -c 'sleep 300 & echo \$! > \"\$0\"' $BGPID" mfm_start "$D"
+do_input key Down
+do_input key ctrl+s
+file_appears "MFM_SEND ran" "$BGPID"
+do_input key F7
+do_input key q
+do_input key Return
+file_appears "the job is over when MFM_SEND is" "$D/q"
+kill "$(cat "$BGPID")"
 mfm_quit
 
 # ~/.config/mfm/mfmrc: Mfm*send for Ctrl+S, and where sorting and hidden files
@@ -375,6 +517,27 @@ white=$(build/pngtool count "$SHOT" $((CX + 20)) $((ROW0 + 1)) 400 $((ROWH - 2))
 echo "ok: black text on the selected row"
 mfm_quit
 
+# A value too long, or a line too long whose end looks like a setting, leave the
+# value before them.
+fresh_dir rclong
+mkdir -p "$XDG_CONFIG_HOME/mfm"
+{
+	printf 'Mfm*background: #336699\n'
+	printf 'Mfm*background: #%0300d\n' 0
+	printf '%01023dMfm*background: #993333\n' 0
+} >"$XDG_CONFIG_HOME/mfm/mfmrc"
+BG=336699
+mfm_start "$D"
+BG=aeb2c3
+rm "$XDG_CONFIG_HOME/mfm/mfmrc"
+echo "ok: over-long values and lines in mfmrc are skipped"
+mfm_quit
+
+# A sign is not a hex digit: the colour falls back to the default.
+MWC_INACTIVE=rgb:-1/0/0 mfm_start "$D"
+echo "ok: rgb:-1/0/0 is no colour"
+mfm_quit
+
 # mfm has to read mwmrc as mwc does.
 fresh_dir rc
 mkdir -p "$XDG_CONFIG_HOME/mwc"
@@ -407,8 +570,11 @@ mfm_start "$D"
 do_input key a
 do_input key Down
 do_input key ctrl+c
+do_input key ctrl+v
+file_appears "Ctrl+C, Ctrl+V" "$D/zz (copy).txt"
 check "plain Ctrl+C leaves the clipboard alone" '! clipget types >/dev/null'
-do_input key Up
+do_input key Home
+do_input key Down
 do_input key ctrl+shift+c
 check "Ctrl+Shift+C offers text/uri-list" 'clipget types | grep -qx text/uri-list'
 check "... as a file URL, percent-encoded, CRLF-terminated" \
@@ -418,18 +584,28 @@ check "... and for GNOME's file managers" \
 	'[ "$(clipget x-special/gnome-copied-files)" = "copy
 file://${D// /%20}/a%20b.txt" ]'
 do_input key ctrl+v
-file_appears "Ctrl+V in mfm still pastes what Ctrl+C remembered" "$D/zz (copy).txt"
+file_appears "Ctrl+V in mfm still pastes what Ctrl+C remembered" "$D/zz (copy 2).txt"
 check "... and not what went into the clipboard" '[ ! -e "$D/a b (copy).txt" ]'
 do_input key ctrl+a
 do_input key ctrl+shift+c
 check "Ctrl+Shift+C: all the marked entries" \
-	'[ "$(clipget x-special/gnome-copied-files | wc -l)" = 3 ]'
+	'[ "$(clipget x-special/gnome-copied-files | wc -l)" = 4 ]'
 check "... with the special characters encoded" \
 	'clipget text/uri-list | grep -qx "file://${D// /%20}/zz%20%28copy%29.txt"$'"'"'\r'"'"''
 check "one helper holds the clipboard" '[ "$(clip_procs | wc -l)" = 1 ]'
 mfm_quit
 check "it outlives the window" 'clipget text/plain | grep -qx "$D/zz.txt"'
 check "... still just one" '[ "$(clip_procs | wc -l)" = 1 ]'
+
+# A name that is not UTF-8 goes as a URL, not as text that says it is UTF-8.
+fresh_dir clip2
+touch "$D/$(printf 'caf\xe9')"
+mfm_start "$D"
+do_input key Down
+do_input key ctrl+shift+c
+check "a Latin-1 name goes as a URL" 'clipget text/uri-list | grep -q "caf%E9"'
+check "... and not as text" '! clipget types | grep -q "^text/plain"'
+mfm_quit
 
 # ---- a scaled output ------------------------------------------------------
 
