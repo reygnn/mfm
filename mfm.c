@@ -220,8 +220,10 @@ static struct wl_surface *cursor_surf;
 static struct wl_cursor_theme *cursor_theme;
 static struct wl_cursor_image *cursor_img;
 static int cursor_scale;        /* the scale it was loaded at, 0 for none yet */
-static int cursor_buf_scale;    /* ... and the one its buffer has */
+static int cursor_buf_scale;    /* its buffer's scale: one that divides its size */
+static uint32_t ptr_serial;     /* of the last enter, for set_cursor */
 static void cursor_load(void);
+static void cursor_show(void);
 
 static struct wl_keyboard *keyboard;
 static struct xkb_context *xkb;
@@ -4219,23 +4221,14 @@ static void ptr_enter(void *data, struct wl_pointer *p, uint32_t serial,
 	struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y)
 {
 	ptr_surface = surface;
+	ptr_serial = serial;
 	ptr_x = wl_fixed_to_int(x);
 	ptr_y = wl_fixed_to_int(y);
 	/* An unchanged position gets no motion event after this. */
 	if (menu_on)
 		menu_pointer_moved();
 	cursor_load();
-	if (cursor_img) {
-		wl_pointer_set_cursor(p, serial, cursor_surf,
-			cursor_img->hotspot_x / cursor_buf_scale,
-			cursor_img->hotspot_y / cursor_buf_scale);
-		wl_surface_set_buffer_scale(cursor_surf, cursor_buf_scale);
-		wl_surface_attach(cursor_surf,
-			wl_cursor_image_get_buffer(cursor_img), 0, 0);
-		wl_surface_damage_buffer(cursor_surf, 0, 0, cursor_img->width,
-			cursor_img->height);
-		wl_surface_commit(cursor_surf);
-	}
+	cursor_show();
 }
 
 /* Not every compositor keeps the pointer on a window while a button is held,
@@ -4493,8 +4486,9 @@ static void cursor_theme_load(int size)
 }
 
 /* The cursor at the window's scale, loaded again when that changes. A theme
- * without an image that divides by the scale (the compositor would reject it)
- * gets the unscaled one. */
+ * has only some sizes: Adwaita gives 30x30 for 32. A buffer scale that doesn't
+ * divide the size is a protocol error, so take the largest one up to the
+ * window's that does; the compositor scales the rest. */
 static void cursor_load(void)
 {
 	if (cursor_scale == scale)
@@ -4503,13 +4497,29 @@ static void cursor_load(void)
 	const char *s = getenv("XCURSOR_SIZE");
 	int size = s && atoi(s) > 0 ? atoi(s) : 24;
 	cursor_theme_load(size * scale);
-	cursor_buf_scale = scale;
-	if (cursor_img && (cursor_img->width % scale || cursor_img->height % scale)) {
-		cursor_theme_load(size);
-		cursor_buf_scale = 1;
-	}
+	cursor_buf_scale = 1;
+	for (int d = scale; cursor_img && d > 1; d--)
+		if (cursor_img->width % d == 0 && cursor_img->height % d == 0) {
+			cursor_buf_scale = d;
+			break;
+		}
 	if (!cursor_surf)
 		cursor_surf = wl_compositor_create_surface(compositor);
+}
+
+/* The cursor on the window or the menu, while the pointer is over one. */
+static void cursor_show(void)
+{
+	if (!pointer || !ptr_surface || !cursor_img)
+		return;
+	int d = cursor_buf_scale;
+	wl_pointer_set_cursor(pointer, ptr_serial, cursor_surf,
+		cursor_img->hotspot_x / d, cursor_img->hotspot_y / d);
+	wl_surface_set_buffer_scale(cursor_surf, d);
+	wl_surface_attach(cursor_surf, wl_cursor_image_get_buffer(cursor_img), 0, 0);
+	wl_surface_damage_buffer(cursor_surf, 0, 0, cursor_img->width,
+		cursor_img->height);
+	wl_surface_commit(cursor_surf);
 }
 
 /* Sharp on a scaled output: wl_compositor 6 says which scale the output it is on
@@ -4530,6 +4540,9 @@ static void surf_preferred_scale(void *data, struct wl_surface *s, int32_t facto
 	scale = factor;
 	dirty = 1;
 	menu_dirty = 1;
+	/* Not only at the next enter: the pointer may stay where it is. */
+	cursor_load();
+	cursor_show();
 }
 
 static void surf_preferred_transform(void *data, struct wl_surface *s,

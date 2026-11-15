@@ -456,10 +456,22 @@ done
 [ "$sharp" = "$SEL" ] ||
 	fail "at scale 2 the selected row's first pixel is $sharp, not $SEL"
 echo "ok: sharp at scale 2"
-mfm_quit
+
+# The cursor follows the scale, also while the pointer stays on the window. Its
+# buffer scale must divide its size, or compositors that check kill the client.
+# vinput counts in the output's pixels.
+cursor_ok() { # scale
+	local w h s
+	w=$(global cursor cw) h=$(global cursor ch) s=$(global cursor cscale)
+	[ "$s" = "$1" ] && [ "$w" -gt 0 ] && [ $((w % s)) = 0 ] && [ $((h % s)) = 0 ]
+}
+do_input move $((2 * (CX + 80))) $((2 * (CY + ROWOFF + 30)))
+check "the cursor is at scale 2" 'cursor_ok 2'
 echo 'Mwm*HEADLESS-1*outputScale: 1' >"$XDG_CONFIG_HOME/mwc/mwmrc"
 reload_mwc
 check "the output is not scaled" '[ "$(global output_HEADLESS-1 scale)" = 100 ]'
+check "the cursor is set again at scale 1 without the pointer moving" 'cursor_ok 1'
+mfm_quit
 rm "$XDG_CONFIG_HOME/mwc/mwmrc"
 
 # ---- the end ---------------------------------------------------------------
