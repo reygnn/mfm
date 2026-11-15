@@ -26,6 +26,7 @@ mkdir "$D/folder"
 mfm_start "$D"
 check "mwc gave it a frame" '[ "$(get mfm frame)" = 1 ]'
 check "it has the default size" '[ "$(get mfm w)" = 680 ] && [ "$(get mfm h)" = 480 ]'
+ROWOFF=$((ROW0 - CY))   # for the scaled output at the end
 
 # A new size means new buffers, while the compositor may still hold the old ones.
 for size in 1 2 3; do
@@ -362,6 +363,18 @@ MFM_FONT=Monospace mfm_start "$D"
 mfm_quit
 echo "ok: a font without a size"
 
+# The selected row has mwc's activeBackground, a mid-tone: black reads better on it
+# than white. A big bold font has strokes wider than the edge smoothing.
+fresh_dir ink
+MFM_FONT="Sans Bold 24" mfm_start "$D"
+shoot
+ink=$(build/pngtool count "$SHOT" $((CX + 20)) $((ROW0 + 1)) 400 $((ROWH - 2)) 000000)
+white=$(build/pngtool count "$SHOT" $((CX + 20)) $((ROW0 + 1)) 400 $((ROWH - 2)) ffffff)
+[ "$ink" -gt 0 ] && [ "$white" = 0 ] ||
+	fail "the selected row has $ink black and $white white pixels, not black text"
+echo "ok: black text on the selected row"
+mfm_quit
+
 # mfm has to read mwmrc as mwc does.
 fresh_dir rc
 mkdir -p "$XDG_CONFIG_HOME/mwc"
@@ -417,6 +430,37 @@ check "one helper holds the clipboard" '[ "$(clip_procs | wc -l)" = 1 ]'
 mfm_quit
 check "it outlives the window" 'clipget text/plain | grep -qx "$D/zz.txt"'
 check "... still just one" '[ "$(clip_procs | wc -l)" = 1 ]'
+
+# ---- a scaled output ------------------------------------------------------
+
+# At scale 2 it draws twice the pixels: the first one of the selected row is the
+# row's colour, not a blend with the one above from a buffer scaled up. The
+# screenshot has the output's pixels, twice the layout's.
+mkdir -p "$XDG_CONFIG_HOME/mwc"
+echo 'Mwm*HEADLESS-1*outputScale: 2' >"$XDG_CONFIG_HOME/mwc/mwmrc"
+reload_mwc
+check "the output is scaled" '[ "$(global output_HEADLESS-1 scale)" = 200 ]'
+fresh_dir scaled
+touch "$D/a" "$D/b"
+WAYLAND_DISPLAY=wayland-0 "$MFM" "$D" >>"$MFM_LOG" 2>&1 &
+MFM_PID=$!
+check "mfm has a focused window" '[ "$(get mfm kbfocus)" = 1 ]'
+content_origin
+sharp=
+for ((i = 0; i < 30; i++)); do
+	WAYLAND_DISPLAY=wayland-0 grim "$SHOT" 2>/dev/null &&
+		sharp=$(pixel $((2 * (CX + 80))) $((2 * (CY + ROWOFF))))
+	[ "$sharp" = "$SEL" ] && break
+	sleep 0.1
+done
+[ "$sharp" = "$SEL" ] ||
+	fail "at scale 2 the selected row's first pixel is $sharp, not $SEL"
+echo "ok: sharp at scale 2"
+mfm_quit
+echo 'Mwm*HEADLESS-1*outputScale: 1' >"$XDG_CONFIG_HOME/mwc/mwmrc"
+reload_mwc
+check "the output is not scaled" '[ "$(global output_HEADLESS-1 scale)" = 100 ]'
+rm "$XDG_CONFIG_HOME/mwc/mwmrc"
 
 # ---- the end ---------------------------------------------------------------
 
