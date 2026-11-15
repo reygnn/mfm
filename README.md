@@ -100,6 +100,19 @@ The manual page has the details on keys, the context menu and how files are copi
 moved and trashed. Known limits are in [CAVEATS.md](CAVEATS.md).
 
 
+## How this is built
+
+mfm is developed with Claude (Anthropic) as a coding assistant. I set the scope and the
+design and review the changes; Claude writes most of the code and the tests. The checks:
+
+* `make test` drives mfm under a headless mwc with a simulated mouse and keyboard and
+  checks what lands on disk and on screen, and runs copy, move, trash and delete
+  against real mounts, read-only folders and a full disk.
+* Every fix comes with a test that fails without it, checked by taking the fix out.
+* What is left open is written down rather than hidden: see CAVEATS, and the reviews
+  in `docs/history`.
+
+
 ## Testing
 
     make test
