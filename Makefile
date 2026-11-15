@@ -62,10 +62,12 @@ install: mfm
 	sed 's|^Exec=mfm |Exec=$(PREFIX)/bin/mfm |' data/mfm.desktop \
 		>$(DESTDIR)$(PREFIX)/share/applications/mfm.desktop
 	chmod 644 $(DESTDIR)$(PREFIX)/share/applications/mfm.desktop
+	install -Dm644 mfm.1 $(DESTDIR)$(PREFIX)/share/man/man1/mfm.1
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/mfm \
-		$(DESTDIR)$(PREFIX)/share/applications/mfm.desktop
+		$(DESTDIR)$(PREFIX)/share/applications/mfm.desktop \
+		$(DESTDIR)$(PREFIX)/share/man/man1/mfm.1
 
 # Needs a built mwc next to this directory, or in MWC_DIR, and grim. files.sh also
 # needs unprivileged user namespaces, and is skipped without them.

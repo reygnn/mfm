@@ -2,14 +2,11 @@
 # tests/vinput, and helpers on top. Set LOG and MFM_LOG, then source this.
 #
 # Needs a built mwc with build/vinput and build/pngtool in MWC_DIR (by default
-# ../mwc or ../mwm), and grim. It has its own runtime directory and Wayland socket,
+# ../mwc), and grim. It has its own runtime directory and Wayland socket,
 # so it does not touch a running session.
 MFM_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 MFM=${MFM:-$MFM_DIR/mfm}
-if [ -z "${MWC_DIR:-}" ]; then
-	MWC_DIR=$MFM_DIR/../mwc
-	[ -d "$MWC_DIR" ] || MWC_DIR=$MFM_DIR/../mwm
-fi
+MWC_DIR=${MWC_DIR:-$MFM_DIR/../mwc}
 
 [ -x "$MFM" ] || { echo "FAIL: $MFM not built"; exit 1; }
 [ -d "$MWC_DIR" ] || { echo "FAIL: no mwc in $MWC_DIR (set MWC_DIR)"; exit 1; }

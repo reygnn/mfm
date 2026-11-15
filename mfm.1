@@ -1,0 +1,310 @@
+.TH MFM 1 2026-11-15 mfm "User Commands"
+.SH NAME
+mfm \- minimal file manager for Wayland
+.SH SYNOPSIS
+.B mfm
+.RB [ \-v ]
+.RI [ directory " | " file ]
+.SH DESCRIPTION
+mfm shows one folder as a list in the look of the Motif window manager, with the
+colours of mwc.
+Without an argument it starts in the current directory; given a file, it opens its
+folder and selects it.
+If the start directory cannot be opened, it shows
+.B $HOME
+and gives the reason in the status line.
+.PP
+Commands act on the marked entries, else on the selected one.
+Marks belong to the current folder and survive the automatic reload; changing
+folders, Ctrl+C, Ctrl+X and a plain click drop them.
+.SH OPTIONS
+.TP
+.B \-v
+Print the version and exit.
+.SH KEYS
+.TP
+.B Up, Down, PgUp, PgDn, Home, End
+Move, on the keypad too.
+.TP
+.B Return, Right
+Open a folder, or a file with
+.BR MFM_OPEN .
+.TP
+.B Backspace, Left, Alt+Up
+The parent folder.
+A parent that may be traversed but not listed is skipped.
+.TP
+.B Alt+Home
+The home folder.
+.TP
+.B letters
+Jump to the next name starting with what was typed, ignoring case, umlauts included.
+After a second without a key the search starts over.
+During a search Space is part of the name.
+.TP
+.B Ctrl+L
+Enter a path.
+Typing
+.B /
+or
+.B ~
+first starts over.
+.TP
+.B F2
+Rename.
+The name without its extension is selected: typing replaces it, Left and Right place
+the cursor.
+.TP
+.B F7, Ctrl+Shift+N
+New folder.
+.TP
+.B Ctrl+H
+Show or hide hidden files.
+.TP
+.B Ctrl+1, Ctrl+2, Ctrl+3
+Sort by name, by size with the largest first, or by date with the newest first.
+The same key again reverses the order.
+Folders stay on top, by name among themselves when sorting by size.
+.TP
+.B Ctrl+R, F5
+Reload.
+.TP
+.B Ctrl+T
+A terminal in the current folder.
+.TP
+.B Space, Insert
+Mark or unmark, then move to the next row.
+.TP
+.B Ctrl+A
+Mark all, or unmark all.
+.TP
+.B Ctrl+C, Ctrl+X
+Remember the entries for copying or moving, inside mfm.
+.TP
+.B Ctrl+V
+Paste into the current folder.
+.TP
+.B Ctrl+Shift+C
+Put the entries into the clipboard of the session, for other programs, and leave what
+Ctrl+V pastes as it was.
+They are offered as
+.B text/uri-list
+with
+.B file://
+URLs, which Firefox pastes as files, as
+.B x-special/gnome-copied-files
+for GNOME's file managers, and as plain text, one path per line.
+.TP
+.B Ctrl+S
+Send the entries with
+.BR MFM_SEND .
+.TP
+.B Delete
+Move to the trash.
+.TP
+.B Shift+Delete
+Delete permanently, after asking:
+.B y
+or
+.B j
+confirms, any other key cancels.
+.TP
+.B Esc
+Clear the search, else the message, else the marks.
+.TP
+.B Ctrl+Q, Ctrl+W, Alt+F4
+Quit.
+Under mwc the compositor takes Alt+F4 and closes the window.
+.PP
+In the input fields for the path, a rename and a new folder, Left, Right, Home and End
+move the cursor, Backspace and Delete delete, Ctrl+U clears, Return confirms and Esc
+cancels.
+.PP
+Only moving and typing repeat when held.
+Delete, Return and other commands act once per press; in input fields Delete and
+Backspace repeat.
+.SH MOUSE
+A click selects and unmarks everything, a double click opens, Ctrl+click marks,
+Shift+click marks the range up to the selection.
+The wheel scrolls; the scroll bar can be dragged or clicked into its trough.
+The arrow button and button 8 go to the parent folder.
+A click into the path field edits it.
+.SS Context menu
+Button 3 in the list opens a menu with Open, Cut, Copy, Copy to clipboard, Paste,
+Send, Rename, Move to trash, Delete permanently, New folder, Terminal, hidden files and
+Reload.
+Send is there only with
+.BR MFM_SEND .
+.PP
+On a marked entry the marks stay: the commands act on all of them, while Open and
+Rename are offered only with at most one mark.
+On any other entry the menu selects just that one.
+On empty space it acts on the marks, else on the folder.
+While a copy or move runs, Paste, Rename, Move to trash, Delete and New folder are off.
+.PP
+Press, drag onto a command and release, or click it; Up, Down and Return work too.
+Esc or a click elsewhere closes the menu.
+If the listing changed while the menu was open, the command does nothing.
+.SH FILES AND FOLDERS
+.SS Background work
+Copying, moving and permanent deletion run in a background process, and the window
+stays usable.
+Another such action, F2 and F7 included, waits until the running one is done.
+Quitting mfm does not stop it.
+The status line shows the result or the first error.
+After Ctrl+X the remembered entries stay until the move has fully succeeded, and also
+when the background process dies.
+.SS Nothing is overwritten
+Within a file system, moving is a rename that never replaces an existing name.
+Copies with
+.B cp \-a
+and moves across file systems with
+.B mv
+first land in a hidden folder
+.B .mfm\-XXXXXX
+in the target and are renamed from there, so half a copy never shows under the real
+name.
+If the name is taken, also in different case on FAT, a copy is called
+.IR "name (copy).txt" ,
+.IR "name (copy 2).txt"
+and so on, a moved entry
+.IR "name (2).txt" .
+That is also how Ctrl+C, Ctrl+V in the same folder makes a duplicate.
+mfm refuses to copy or move a folder into itself, and a rename onto a taken name.
+.PP
+If a move across file systems fails, for example on a full disk, what arrived stays in
+the hidden folder and the status line names it; the source is as a rule still complete.
+A failed copy is cleaned up.
+.SS Deleting and the trash
+Permanent deletion is
+.BR "rm \-rf \-\-one\-file\-system" ;
+mount points and folders with something mounted in them are refused.
+.PP
+The trash follows the freedesktop.org specification, so any file manager that knows it
+restores from it; by hand, the files are in
+.B files/
+and their original paths in
+.BR info/*.trashinfo .
+It is
+.B $XDG_DATA_HOME/Trash
+(default
+.BR ~/.local/share/Trash ).
+Files on other file systems go to
+.B .Trash/$UID
+at their root, if the administrator set up a shared
+.BR .Trash ,
+else to
+.BR .Trash\-$UID ,
+with the path relative to that root.
+What is in the trash already is not trashed again.
+Where trashing fails, as on a read\-only file system, Shift+Delete is left.
+.SS The listing
+The folder is checked for changes every second and read again, keeping the selection
+and the scroll position.
+If it disappears or becomes unreadable, mfm moves to the nearest readable parent.
+A changed size or permission alone does not count; Ctrl+R shows it.
+.PP
+Paths are logical, as with
+.B cd
+in the shell: after entering a linked folder,
+.B ..
+leads back to the folder the link is in, and a terminal from Ctrl+T gets that path as
+.BR $PWD .
+.PP
+File names that are not valid UTF\-8 are shown as Latin\-1.
+Bidirectional control characters show as U+FFFD, so that a name cannot pose as one with
+another extension.
+.SH CONFIGURATION
+.B $XDG_CONFIG_HOME/mfm/mfmrc
+(default
+.BR ~/.config/mfm/mfmrc )
+is written like mwc's mwmrc: one
+.B Mfm*key: value
+per line,
+.B Mfm.key
+and any case work too, a line starting with
+.B !
+is a comment, and the last line for a key wins.
+mfm never writes it.
+.BR open ,
+.B send
+and
+.B terminal
+are read on each use; the rest at startup.
+.TP
+.BR open ", " send ", " terminal ", " font
+The same as
+.BR MFM_OPEN ,
+.BR MFM_SEND ,
+.BR MFM_TERMINAL ,
+.BR MFM_FONT .
+.TP
+.BR background ", " activeBackground
+Window and selection colour.
+Default:
+.B Mwm*background
+and
+.B Mwm*activeBackground
+from
+.BR ~/.config/mwc/mwmrc .
+.TP
+.B sort
+.BR name ", " size " or " date :
+the order mfm starts with.
+.TP
+.B sortReverse
+.BR true :
+that order reversed.
+.TP
+.B showHidden
+.BR true :
+start with hidden files shown.
+.SH ENVIRONMENT
+A set variable wins over its mfmrc entry.
+.TP
+.B MFM_OPEN
+Opens files; default
+.BR xdg\-open .
+The file is the last argument.
+.TP
+.B MFM_SEND
+Ctrl+S, for example
+.BR adb\-push\-download .
+It gets all paths at once as its last arguments and runs in the background like a copy;
+the status line shows success or its first error line.
+.TP
+.B MFM_TERMINAL
+Ctrl+T.
+Default
+.BR MWC_TERMINAL ,
+else the first found of foot, xterm, uxterm, x\-terminal\-emulator, urxvt, alacritty,
+konsole, kitty, xfce4\-terminal and gnome\-terminal.
+.TP
+.B MFM_FONT
+A Pango font name such as
+.BR "Sans Bold 11" ;
+default
+.BR "Sans 10" ,
+and 10 points without a size.
+Fontconfig patterns such as
+.B Sans:size=10
+are rejected.
+.TP
+.BR MWC_INACTIVE ", " MWC_ACTIVE
+Window and selection colour, as for mwc; default
+.B #aeb2c3
+and
+.BR #7387ad .
+.PP
+.BR MFM_OPEN ,
+.B MFM_SEND
+and
+.B MFM_TERMINAL
+are split into words at spaces, and quotes group words, as in
+.BR "xterm \-fa 'DejaVu Sans Mono'" .
+There is no shell syntax beyond that; a small script can provide it.
+The program is looked up only in the absolute entries of
+.BR $PATH ,
+never in the folder shown.
+.SH SEE ALSO
+.BR xdg\-open (1)
