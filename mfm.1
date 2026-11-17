@@ -169,12 +169,14 @@ stays usable.
 Another such action, F2 and F7 included, waits until the running one is done.
 Quitting mfm does not stop it.
 The status line shows the result or the first error.
-After Ctrl+X the remembered entries stay until the move has fully succeeded, and also
-when the background process dies.
+After Ctrl+X the remembered entries that could not be moved stay, to paste again;
+all of them stay when the background process dies.
 .SS Nothing is overwritten
 Within a file system, moving is a rename that never replaces an existing name.
 Copies and moves across file systems are made with
 .B cp \-a
+(on FAT and exFAT, which keep no permissions,
+.BR "cp \-R \-\-preserve=timestamps" )
 and first land in a hidden folder
 .B .mfm\-XXXXXX
 in the target and are renamed from there, so half a copy never shows under the real

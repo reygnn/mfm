@@ -164,6 +164,9 @@ static struct {
 	char out[512];
 	size_t outlen;
 	int cut;                /* out is full, more was dropped */
+	char *keep;             /* a move: the items to try again, if known */
+	int keeping, idx;       /* in a JOB_KEEP line, and its index so far */
+	int bol;                /* at the start of a line */
 } job = { .fd = -1 };
 
 /* ---- Wayland ------------------------------------------------------------ */
@@ -1462,60 +1465,72 @@ static int u8_fit(const char *s, int n, int max)
 	return max;
 }
 
-/* Which mount `path` is on: the mount ID where the kernel reports one
- * (it tells bind mounts and btrfs subvolumes apart), else the device. */
-static int mount_id(const char *path, int follow, uint64_t *id)
+/* Where `path` is: the mount, by its ID where the kernel reports one (it
+ * tells bind mounts apart), and the device. A btrfs subvolume has a device
+ * of its own but shares the mount it is in, unless mounted by itself: a
+ * rename into or out of it fails with EXDEV all the same. */
+struct mnt { uint64_t id, dev; };
+
+static int mount_id(const char *path, int follow, struct mnt *m)
 {
 	struct statx sx;
 	if (statx(AT_FDCWD, path, follow ? 0 : AT_SYMLINK_NOFOLLOW,
 	    STATX_MNT_ID, &sx) < 0)
 		return -1;
-	if (sx.stx_mask & STATX_MNT_ID)
-		*id = sx.stx_mnt_id;
-	else
-		*id = 1ULL << 63 | (uint64_t)sx.stx_dev_major << 32 |
-			sx.stx_dev_minor;
+	m->id = sx.stx_mask & STATX_MNT_ID ? sx.stx_mnt_id : 0;
+	m->dev = (uint64_t)sx.stx_dev_major << 32 | sx.stx_dev_minor;
 	return 0;
 }
 
+static int same_mnt(struct mnt a, struct mnt b)
+{
+	return a.id == b.id && a.dev == b.dev;
+}
+
 /* Is path (not followed) a mount point, i.e. on another mount than the
- * directory it is in? */
+ * directory it is in? A subvolume is not: it can be renamed. */
 static int is_mount(const char *path)
 {
 	char par[PATH_MAX];
-	uint64_t a, b;
+	struct mnt a, b;
 	snprintf(par, sizeof par, "%s", path);
 	parent_of(par);
-	return mount_id(path, 0, &a) == 0 && mount_id(par, 1, &b) == 0 &&
-		a != b;
+	if (mount_id(path, 0, &a) < 0 || mount_id(par, 1, &b) < 0)
+		return 0;
+	return a.id && b.id ? a.id != b.id : a.dev != b.dev;
 }
 
-/* Is anything mounted below the directory path? -1 if that cannot be told.
- * rm --one-file-system only compares devices, so it walks into a bind mount of
- * the same file system and empties what that shows. */
-static int mount_below(const char *path)
+/* The mount points, from /proc/self/mountinfo, sorted. */
+struct mtab { char **v; int n; };
+
+static void mtab_free(struct mtab *m)
 {
-	char real[PATH_MAX];
+	free_names(m->v, m->n);
+	m->v = NULL;
+	m->n = 0;
+}
+
+static int mtab_read(struct mtab *m)
+{
 	char *line = NULL;
 	size_t cap = 0;
-	int found = 0;
-	if (!realpath(path, real))
-		return -1;
+	int vcap = 0;
+	m->v = NULL;
+	m->n = 0;
 	FILE *f = fopen("/proc/self/mountinfo", "r");
 	if (!f)
 		return -1;
-	size_t n = strlen(real);
-	while (!found && getline(&line, &cap, f) > 0) {
+	while (getline(&line, &cap, f) > 0) {
 		/* The mount point is the fifth field, with blanks and the like
 		 * as \ooo. */
-		char *m = line;
-		for (int i = 0; i < 4 && m; i++)
-			if ((m = strchr(m, ' ')))
-				m++;
-		if (!m)
+		char *p = line;
+		for (int i = 0; i < 4 && p; i++)
+			if ((p = strchr(p, ' ')))
+				p++;
+		if (!p)
 			continue;
-		char *o = m;
-		for (const char *r = m; *r && *r != ' ' && *r != '\n'; r++) {
+		char *o = p;
+		for (const char *r = p; *r && *r != ' ' && *r != '\n'; r++) {
 			if (r[0] == '\\' && r[1] >= '0' && r[1] <= '3' && r[2] &&
 			    r[3]) {
 				*o++ = (r[1] - '0') << 6 | (r[2] - '0') << 3 |
@@ -1526,10 +1541,61 @@ static int mount_below(const char *path)
 			}
 		}
 		*o = 0;
-		found = !strncmp(m, real, n) && m[n] == '/';
+		if (m->n == vcap) {
+			vcap = vcap ? 2 * vcap : 64;
+			char **nv = realloc(m->v, vcap * sizeof *nv);
+			if (!nv)
+				goto fail;
+			m->v = nv;
+		}
+		if (!(m->v[m->n] = strdup(p)))
+			goto fail;
+		m->n++;
 	}
 	free(line);
 	fclose(f);
+	qsort(m->v, m->n, sizeof *m->v, name_cmp);
+	return 0;
+fail:
+	free(line);
+	fclose(f);
+	mtab_free(m);
+	errno = ENOMEM;
+	return -1;
+}
+
+/* Is anything mounted below the directory path? -1 if that cannot be told.
+ * rm --one-file-system only compares devices, so it walks into a bind mount of
+ * the same file system and empties what that shows. With m the mounts read
+ * before, else they are read now. */
+static int mount_below(const char *path, const struct mtab *m)
+{
+	char real[PATH_MAX + 1];
+	struct mtab now;
+	if (!realpath(path, real))
+		return -1;
+	if (!m) {
+		if (mtab_read(&now) < 0)
+			return -1;
+		m = &now;
+	}
+	/* What is below real/ sorts in one run from there. */
+	size_t n = strlen(real);
+	if (strcmp(real, "/"))
+		real[n++] = '/';
+	real[n] = 0;
+	int lo = 0, hi = m->n;
+	while (lo < hi) {
+		int mid = lo + (hi - lo) / 2;
+		if (strcmp(m->v[mid], real) < 0)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	int found = lo < m->n && !strncmp(m->v[lo], real, n) &&
+		m->v[lo][n] != 0;
+	if (m == &now)
+		mtab_free(&now);
 	return found;
 }
 
@@ -1736,17 +1802,17 @@ static int own_dir(const char *p)
  * top directory of that mount goes to top, the trash to out. That is
  * $topdir/.Trash/$uid if the administrator set up a shared .Trash (a real
  * directory with the sticky bit), else $topdir/.Trash-$uid. */
-static int topdir_trash(const char *rpar, uint64_t mnt, char *top,
+static int topdir_trash(const char *rpar, struct mnt mnt, char *top,
 	char *out)
 {
 	char up[PATH_MAX];
 	struct stat st;
-	uint64_t id;
+	struct mnt id;
 	snprintf(top, PATH_MAX, "%s", rpar);
 	while (strcmp(top, "/")) {
 		snprintf(up, sizeof up, "%s", top);
 		parent_of(up);
-		if (mount_id(up, 1, &id) < 0 || id != mnt)
+		if (mount_id(up, 1, &id) < 0 || !same_mnt(id, mnt))
 			break;
 		snprintf(top, PATH_MAX, "%s", up);
 	}
@@ -1842,13 +1908,17 @@ static int trash_into(const char *t, const char *path, const char *orig)
 			unlink(ip);
 			continue;
 		}
+		/* The first error is the one to tell: a full disk, say. */
 		FILE *f = fdopen(fd, "w");
-		int bad = !f || fprintf(f, "[Trash Info]\nPath=%s\n"
-			"DeletionDate=%s\n", url, date) < 0;
-		if (f ? fclose(f) != 0 : close(fd) != 0)
-			bad = 1;
-		if (bad || move_dir_any(path, fp) < 0) {
-			int e = bad ? EIO : errno;
+		int e = 0;
+		if (!f || fprintf(f, "[Trash Info]\nPath=%s\n"
+		    "DeletionDate=%s\n", url, date) < 0)
+			e = errno ? errno : EIO;
+		if ((f ? fclose(f) : close(fd)) != 0 && !e)
+			e = errno ? errno : EIO;
+		if (!e && move_dir_any(path, fp) < 0)
+			e = errno;
+		if (e) {
 			unlink(ip);
 			errno = e;
 			return -1;
@@ -1860,12 +1930,13 @@ static int trash_into(const char *t, const char *path, const char *orig)
 }
 
 /* Trash one entry. On failure, why it failed goes to err. */
-static int trash_one(const char *path, char *err, size_t esz)
+static int trash_one(const char *path, const struct mtab *mt, char *err,
+	size_t esz)
 {
 	char par[PATH_MAX], rpar[PATH_MAX], orig[PATH_MAX], t[PATH_MAX];
 	char top[PATH_MAX];
 	const char *base = strrchr(path, '/') + 1;
-	uint64_t mnt, tm;
+	struct mnt mnt, tm;
 	snprintf(par, sizeof par, "%s", path);
 	parent_of(par);
 	if (!realpath(par, rpar) || mount_id(path, 0, &mnt) < 0)
@@ -1881,7 +1952,7 @@ static int trash_one(const char *path, char *err, size_t esz)
 	/* Emptying the trash later would empty what is mounted in it. */
 	struct stat st;
 	int below = lstat(path, &st) == 0 && S_ISDIR(st.st_mode) ?
-		mount_below(path) : 0;
+		mount_below(path, mt) : 0;
 	if (below > 0) {
 		snprintf(err, esz, "%s has a mount point in it", base);
 		return -1;
@@ -1894,7 +1965,8 @@ static int trash_one(const char *path, char *err, size_t esz)
 	/* The physical path, which stays right when a link to it goes. */
 	if (join(orig, rpar, base) < 0)
 		goto fail;
-	if (home_trash(t, 1) == 0 && mount_id(t, 1, &tm) == 0 && tm == mnt) {
+	if (home_trash(t, 1) == 0 && mount_id(t, 1, &tm) == 0 &&
+	    same_mnt(tm, mnt)) {
 		if (trash_into(t, path, orig) == 0)
 			return 0;
 		if (errno != EXDEV)
@@ -1996,7 +2068,8 @@ static int wait_prog(const char *prog, char *const argv[], char *msg,
 	return -1;
 }
 
-/* One failure line for mfm; a newline in a file name must not make two. */
+/* One failure line for mfm. A newline in a file name must not make two,
+ * nor may it start a line of its own kind (JOB_KEEP). */
 static void report(int out, const char *fmt, ...)
 {
 	char b[1200];
@@ -2006,20 +2079,23 @@ static void report(int out, const char *fmt, ...)
 		u8_cut(b);
 	va_end(ap);
 	for (char *s = b; *s; s++)
-		if (*s == '\n')
+		if ((unsigned char)*s < 0x20)
 			*s = '?';
 	dprintf(out, "%s\n", b);
 }
 
 enum { T_CP, T_RM, T_CHMOD, T_N };
 
-/* Run cp, rm or chmod (looked up once) with up to four arguments. */
-static int tool(int which, const char *a1, const char *a2, const char *a3,
-	const char *a4, char *msg, size_t msz)
+/* Run cp, rm or chmod (looked up once) with the arguments in args, which ends
+ * with NULL. */
+#define ARGS(...) ((const char *const []){ __VA_ARGS__, NULL })
+static int tool(int which, const char *const *args, char *msg, size_t msz)
 {
 	static const char *const names[T_N] = { "cp", "rm", "chmod" };
 	static char path[T_N][PATH_MAX];
 	static int err[T_N] = { -1, -1, -1 };
+	char *argv[8];
+	int n = 0;
 	if (err[which] < 0)
 		err[which] = find_prog(names[which], path[which]);
 	if (err[which]) {
@@ -2027,27 +2103,138 @@ static int tool(int which, const char *a1, const char *a2, const char *a3,
 			strerror(err[which]));
 		return -1;
 	}
-	char *argv[] = { (char *)names[which], (char *)a1, (char *)a2,
-		(char *)a3, (char *)a4, NULL };
+	argv[n++] = (char *)names[which];
+	while (*args && n < 7)
+		argv[n++] = (char *)*args++;
+	argv[n] = NULL;
 	return wait_prog(path[which], argv, msg, msz);
 }
 
+/* Lines from the worker that start with this byte are no failures: they name
+ * an item of a move that failed with its original still whole, by index. */
+#define JOB_KEEP '\001'
+
 /*
- * The child that does a job, one item after the other. A move within a
- * file system is a rename. A copy, or a move to another file system, goes
- * to a hidden directory in the target first (cp -a) and is renamed into
- * place from there, so a partial copy never shows under the real name and
- * the final name is picked only when it is used: nothing is ever
- * overwritten, not even on a case-insensitive file system. The original of
- * such a move is removed after that. Delete is
- * rm -rf, after making sure there is no mount in the way. A NUL byte at the end
- * tells mfm that the job ran to its end.
+ * One item of a job. A move within a file system is a rename. A copy, or a
+ * move to another file system, goes to a hidden directory in the target
+ * first (cp -a) and is renamed into place from there, so a partial copy
+ * never shows under the real name and the final name is picked only when it
+ * is used: nothing is ever overwritten, not even on a case-insensitive file
+ * system. The original of such a move is removed after that. Delete is
+ * rm -rf, after making sure there is no mount in the way.
+ * 0 when done; failures are reported to out, and are -1 while the original
+ * is still whole, else -2.
  */
-static void worker(int op, const char *sdir, char **names, int n,
+static int work_one(int op, const char *sdir, const char *nm,
 	const char *ddir, int out)
 {
 	char src[PATH_MAX], tmp[PATH_MAX], t[PATH_MAX], msg[1024];
 	char final[NAME_MAX + 1];
+	struct stat st;
+	if (join(src, sdir, nm) < 0 || lstat(src, &st) < 0) {
+		report(out, "%s: %s", nm, strerror(errno));
+		return -1;
+	}
+	int isdir = S_ISDIR(st.st_mode);
+	if (isdir && op != OP_COPY && is_mount(src)) {
+		report(out, "%s is a mount point, not %s", nm, op_ed[op]);
+		return -1;
+	}
+	if (op == OP_DELETE) {
+		int below = isdir ? mount_below(src, NULL) : 0;
+		if (below > 0)
+			report(out, "%s has a mount point in it, not deleted",
+				nm);
+		else if (below < 0)
+			report(out, "%s: cannot check for mount points: %s",
+				nm, strerror(errno));
+		else if (tool(T_RM, ARGS("-rf", "--one-file-system", "--",
+		    src), msg, sizeof msg) < 0)
+			report(out, "%s", msg);
+		else
+			return 0;
+		return -1;
+	}
+	if (op == OP_MOVE) {
+		if (place_any(src, ddir, nm, isdir, 1, final) == 0)
+			return 0;
+		/* EINVAL: into itself, which paste() rules out */
+		if (errno != EXDEV) {
+			report(out, "%s: %s", nm, strerror(errno));
+			return -1;
+		}
+		/* Removing the original would empty what is mounted. */
+		int below = isdir ? mount_below(src, NULL) : 0;
+		if (below != 0) {
+			report(out, below > 0 ?
+				"%s has a mount point in it, not moved" :
+				"%s: cannot check for mount points, not moved",
+				nm);
+			return -1;
+		}
+	}
+	if (join(tmp, ddir, ".mfm-XXXXXX") < 0 || !mkdtemp(tmp)) {
+		report(out, "%s: %s", nm, strerror(errno));
+		return -1;
+	}
+	if (join(t, tmp, nm) < 0) {
+		report(out, "%s: %s", nm, strerror(errno));
+		rmdir(tmp);
+		return -1;
+	}
+	/* A move to another file system is a copy, and the original goes only
+	 * once the copy is complete and in place. mv would leave it unclear
+	 * which side is whole when it fails. FAT and exFAT keep no modes, and
+	 * cp -a fails on every one it cannot set: there the copy keeps the
+	 * times only. They show as the mount's mode, not the 0700 asked for. */
+	struct stat tst;
+	int modes = stat(tmp, &tst) < 0 || (tst.st_mode & 0777) == 0700;
+	if (tool(T_CP, modes ? ARGS("-a", "--", src, t) :
+	    ARGS("-R", "--preserve=timestamps", "--", src, t),
+	    msg, sizeof msg) < 0) {
+		/* Cleaned up, also from the read-only directories cp -a made;
+		 * the source is untouched. */
+		char why[sizeof msg];
+		snprintf(why, sizeof why, "%s", msg);
+		tool(T_CHMOD, ARGS("-R", "u+w", "--", tmp), msg, sizeof msg);
+		if (tool(T_RM, ARGS("-rf", "--", tmp), msg, sizeof msg) < 0)
+			report(out, "%s (the rest is in %s)", why,
+				strrchr(tmp, '/') + 1);
+		else
+			report(out, "%s", why);
+		return -1;
+	}
+	if (place_any(t, ddir, nm, isdir, op == OP_MOVE, final) < 0) {
+		report(out, "%s: %s (left in %s)", nm, strerror(errno),
+			strrchr(tmp, '/') + 1);
+		return -1;
+	}
+	rmdir(tmp);
+	if (op != OP_MOVE)
+		return 0;
+	/* A read-only folder in the original, as cp -a keeps it, would stop rm
+	 * halfway; it is being removed anyway. Only a folder: chmod follows a
+	 * link named to it, to what the link points at. */
+	int gone = tool(T_RM, ARGS("-rf", "--one-file-system", "--", src),
+		msg, sizeof msg) == 0;
+	if (!gone && isdir) {
+		tool(T_CHMOD, ARGS("-R", "u+w", "--", src), msg, sizeof msg);
+		gone = tool(T_RM, ARGS("-rf", "--one-file-system", "--", src),
+			msg, sizeof msg) == 0;
+	}
+	if (gone)
+		return 0;
+	report(out, "%s is in place as %s, but the original is not "
+		"completely removed: %s", nm, final, msg);
+	return -2;
+}
+
+/* The child that does a job, one item after the other. A NUL byte at the end
+ * tells mfm that the job ran to its end. */
+static void worker(int op, const char *sdir, char **names, int n,
+	const char *ddir, int out)
+{
+	char msg[1024];
 	setsid();               /* not killed with mfm's terminal */
 	signal(SIGCHLD, SIG_DFL);
 	signal(SIGPIPE, SIG_IGN);       /* mfm may quit; finish the job */
@@ -2057,98 +2244,10 @@ static void worker(int op, const char *sdir, char **names, int n,
 			report(out, "%s", msg);
 		n = 0;
 	}
-	for (int i = 0; i < n; i++) {
-		const char *nm = names[i];
-		struct stat st;
-		if (join(src, sdir, nm) < 0 || lstat(src, &st) < 0) {
-			report(out, "%s: %s", nm, strerror(errno));
-			continue;
-		}
-		int isdir = S_ISDIR(st.st_mode);
-		if (isdir && op != OP_COPY && is_mount(src)) {
-			report(out, "%s is a mount point, not %s", nm, op_ed[op]);
-			continue;
-		}
-		if (op == OP_DELETE) {
-			int below = isdir ? mount_below(src) : 0;
-			if (below > 0)
-				report(out, "%s has a mount point in it, not deleted",
-					nm);
-			else if (below < 0)
-				report(out, "%s: cannot check for mount points: %s",
-					nm, strerror(errno));
-			else if (tool(T_RM, "-rf", "--one-file-system", "--",
-			    src, msg, sizeof msg) < 0)
-				report(out, "%s", msg);
-			continue;
-		}
-		if (op == OP_MOVE) {
-			if (place_any(src, ddir, nm, isdir, 1, final) == 0)
-				continue;
-			/* EINVAL: into itself, which paste() rules out */
-			if (errno != EXDEV) {
-				report(out, "%s: %s", nm, strerror(errno));
-				continue;
-			}
-			/* Removing the original would empty what is mounted. */
-			int below = isdir ? mount_below(src) : 0;
-			if (below != 0) {
-				report(out, below > 0 ?
-					"%s has a mount point in it, not moved" :
-					"%s: cannot check for mount points, not moved",
-					nm);
-				continue;
-			}
-		}
-		if (join(tmp, ddir, ".mfm-XXXXXX") < 0 || !mkdtemp(tmp)) {
-			report(out, "%s: %s", nm, strerror(errno));
-			continue;
-		}
-		if (join(t, tmp, nm) < 0) {
-			report(out, "%s: %s", nm, strerror(errno));
-			rmdir(tmp);
-			continue;
-		}
-		/* A move to another file system is a copy, and the original
-		 * goes only once the copy is complete and in place. mv would
-		 * leave it unclear which side is whole when it fails. */
-		if (tool(T_CP, "-a", "--", src, t, msg, sizeof msg) < 0) {
-			/* Cleaned up, also from the read-only directories cp -a
-			 * made; the source is untouched. */
-			char why[sizeof msg];
-			snprintf(why, sizeof why, "%s", msg);
-			tool(T_CHMOD, "-R", "u+w", "--", tmp, msg, sizeof msg);
-			if (tool(T_RM, "-rf", "--", tmp, NULL, msg,
-			    sizeof msg) < 0)
-				report(out, "%s (the rest is in %s)", why,
-					strrchr(tmp, '/') + 1);
-			else
-				report(out, "%s", why);
-			continue;
-		}
-		if (place_any(t, ddir, nm, isdir, op == OP_MOVE, final) < 0) {
-			report(out, "%s: %s (left in %s)", nm, strerror(errno),
-				strrchr(tmp, '/') + 1);
-			continue;
-		}
-		rmdir(tmp);
-		if (op != OP_MOVE)
-			continue;
-		/* A read-only folder in the original, as cp -a keeps it, would
-		 * stop rm halfway; it is being removed anyway. Only a folder:
-		 * chmod follows a link named to it, to what the link points
-		 * at. */
-		int gone = tool(T_RM, "-rf", "--one-file-system", "--", src,
-			msg, sizeof msg) == 0;
-		if (!gone && isdir) {
-			tool(T_CHMOD, "-R", "u+w", "--", src, msg, sizeof msg);
-			gone = tool(T_RM, "-rf", "--one-file-system", "--", src,
-				msg, sizeof msg) == 0;
-		}
-		if (!gone)
-			report(out, "%s is in place as %s, but the original is "
-				"not completely removed: %s", nm, final, msg);
-	}
+	for (int i = 0; i < n; i++)
+		if (work_one(op, sdir, names[i], ddir, out) == -1 &&
+		    op == OP_MOVE)
+			dprintf(out, "%c%d\n", JOB_KEEP, i);
 	if (write(out, "", 1) < 0) {
 		/* mfm has quit: nobody to tell */
 	}
@@ -2198,6 +2297,10 @@ static void start_job(int op, const char *sdir, char **names, int n,
 	job.finished = 0;
 	job.outlen = 0;
 	job.cut = 0;
+	free(job.keep);
+	job.keep = op == OP_MOVE ? calloc(n, 1) : NULL;
+	job.keeping = 0;
+	job.bol = 1;
 	job.clip_gen = clip_gen;
 	snprintf(job.dir, sizeof job.dir, "%s", ddir);
 	snprintf(job.first, sizeof job.first, "%s", first ? first : "");
@@ -2224,6 +2327,26 @@ static void clip_clear(void)
 	dirty = 1;
 }
 
+/* After a move from the clipboard that failed on some items: only those
+ * stay, the ones marked in keep. */
+static void clip_keep(const char *keep)
+{
+	int k = 0;
+	for (int i = 0; i < nclip; i++) {
+		if (keep[i])
+			clip[k++] = clip[i];
+		else
+			free(clip[i]);
+	}
+	nclip = k;
+	if (!k) {
+		free(clip);
+		clip = NULL;
+	}
+	clip_gen++;
+	dirty = 1;
+}
+
 static void job_done(void)
 {
 	close(job.fd);
@@ -2234,14 +2357,24 @@ static void job_done(void)
 	if (job.cut && first == job.outlen)
 		u8_cut(job.out);
 	/* A move that worked used up the clipboard, unless it was replaced
-	 * in the meantime. */
-	if (job.op == OP_MOVE && job.finished && !job.fails &&
-	    job.clip_gen == clip_gen)
-		clip_clear();
+	 * in the meantime; after failures what is left of it is what failed.
+	 * What went, a new entry under its name must not follow. */
+	if (job.op == OP_MOVE && job.finished && job.clip_gen == clip_gen) {
+		if (!job.fails)
+			clip_clear();
+		else if (job.keep)
+			clip_keep(job.keep);
+	}
+	free(job.keep);
+	job.keep = NULL;
 	if (reload() == 0 && job.first[0] && !strcmp(cwd, job.dir))
 		select_name(job.first);
 	int ok = job.n - job.fails;
-	if (!job.finished)
+	if (!job.finished && (job.op == OP_COPY || job.op == OP_MOVE))
+		set_status(1, "%s stopped unexpectedly: a partial copy may be "
+			"left in a hidden .mfm-* folder in %s", op_ing[job.op],
+			job.dir);
+	else if (!job.finished)
 		set_status(1, "%s stopped unexpectedly, the result may be "
 			"incomplete", op_ing[job.op]);
 	else if (job.fails && job.op == OP_SEND)
@@ -2269,15 +2402,33 @@ static void job_poll(void)
 			return;
 		}
 		for (ssize_t i = 0; i < r; i++) {
-			if (!b[i]) {
+			char c = b[i];
+			int bol = job.bol;
+			job.bol = c == '\n';
+			if (!c) {
 				job.finished = 1;
 				continue;
 			}
+			if (bol && c == JOB_KEEP) {
+				job.keeping = 1;
+				job.idx = 0;
+				continue;
+			}
+			if (job.keeping) {
+				if (c >= '0' && c <= '9' && job.idx < job.n)
+					job.idx = job.idx * 10 + c - '0';
+				if (c == '\n') {
+					job.keeping = 0;
+					if (job.keep && job.idx < job.n)
+						job.keep[job.idx] = 1;
+				}
+				continue;
+			}
 			if (job.outlen < sizeof job.out - 1)
-				job.out[job.outlen++] = b[i];
+				job.out[job.outlen++] = c;
 			else
 				job.cut = 1;
-			job.fails += b[i] == '\n';
+			job.fails += c == '\n';
 		}
 	}
 }
@@ -2646,10 +2797,13 @@ static void trash(void)
 	char **v = targets(&n);
 	if (!v)
 		return;
+	/* Read once for all of them; mount_below() reads it itself without. */
+	struct mtab mt;
+	int have_mt = mtab_read(&mt) == 0;
 	for (int i = 0; i < n; i++) {
 		if (join(p, cwd, v[i]) < 0)
 			snprintf(e, sizeof e, "%s: %s", v[i], strerror(errno));
-		else if (trash_one(p, e, sizeof e) == 0) {
+		else if (trash_one(p, have_mt ? &mt : NULL, e, sizeof e) == 0) {
 			ok++;
 			continue;
 		}
@@ -2657,6 +2811,8 @@ static void trash(void)
 			snprintf(err, sizeof err, "%s", e);
 	}
 	free_names(v, n);
+	if (have_mt)
+		mtab_free(&mt);
 	reload();
 	if (ok < n)
 		set_status(1, "%d of %d not moved to the trash: %s "

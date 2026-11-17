@@ -93,6 +93,11 @@ job_settled() {
 	fail "the job did not end"
 }
 
+# Pixels of the error colour in the status line.
+err_pixels() {
+	build/pngtool count "$SHOT" "$CX" $((CY + $(get mfm h) - 40)) 600 40 8a0303 6
+}
+
 no_hidden_left() {
 	local left
 	left=$(find "$1" -maxdepth 1 -name '.mfm-*' 2>/dev/null)
@@ -196,6 +201,17 @@ job_settled
 [ ! -e "$R/wide/mnt" ] || fail "the mount point was moved"
 no_hidden_left "$R/wide" "moving a mount point"
 echo "ok: a mount point is not moved"
+# Only what failed stays to paste again: a new zm2 is not taken along. The
+# status line turns red when the paste is over.
+touch "$R/src/zm2"
+do_input move $((LISTX + 40)) "$(row_y 0)"
+do_input click left
+check "the error is cleared" 'shoot; [ "$(err_pixels)" = 0 ]'
+do_input key ctrl+v
+check "the second paste fails on the mount point" 'shoot; [ "$(err_pixels)" -gt 0 ]'
+job_settled
+[ -e "$R/src/zm2" ] || fail "a new entry under a moved name was moved too"
+echo "ok: the clipboard keeps only what failed"
 mfm_quit
 
 mfm_start "$R/src"
