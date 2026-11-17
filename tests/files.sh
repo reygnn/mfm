@@ -22,7 +22,7 @@ if [ "$MFMT_STAGE" = mounts ]; then
 	R=$MFMT_ROOT
 	mount -t tmpfs -o size=64m none "$R" || exit 1
 	mkdir -p "$R/del/outer/inner" "$R/del/precious" "$R/del2/box/m" "$R/src/mnt" \
-		"$R/dst" "$R/wide" "$R/vanish/sub"
+		"$R/dst" "$R/wide" "$R/vanish/sub" "$R/rolink" "$R/victim"
 	echo thesis >"$R/del/precious/thesis.txt"
 	mount --bind "$R/del/precious" "$R/del/outer/inner" || exit 1
 	mount -t tmpfs none "$R/del2/box/m" || exit 1
@@ -44,6 +44,9 @@ if [ "$MFMT_STAGE" = mounts ]; then
 		"$R/src/zc1"
 	chmod 555 "$R/src/rofull" "$R/src/roempty" "$R/src/rotrash" "$R/src/tree/sub"
 	chmod 000 "$R/src/tree/secret"
+	# A link in a folder it cannot be removed from, to a read-only folder.
+	ln -s "$R/victim" "$R/rolink/ln"
+	chmod 555 "$R/rolink" "$R/victim"
 	# Inside a namespace of its own the mounts cannot be undone, as for a user.
 	MFMT_STAGE=test exec unshare -U --map-user="$MFMT_UID" --map-group="$MFMT_GID" \
 		bash "$SELF"
@@ -234,6 +237,19 @@ do_input key ctrl+v
 job_settled
 wait_for "the clipboard survives a worker that died" test -e "$R/wide/slow"
 rm -rf "$R"/wide/.mfm-*
+mfm_quit
+
+# A link that cannot be removed after its move stays a link: what it points to
+# keeps its mode.
+mfm_start "$R/rolink"
+do_input key Down
+do_input key ctrl+x
+to_dir wide
+do_input key ctrl+v
+wait_for "the link is moved" test -L "$R/wide/ln"
+job_settled
+[ "$(stat -c %a "$R/victim")" = 555 ] || fail "the link's target was made writable"
+echo "ok: and what it points to keeps its mode"
 mfm_quit
 
 # ---- copy -------------------------------------------------------------------

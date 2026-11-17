@@ -2135,10 +2135,12 @@ static void worker(int op, const char *sdir, char **names, int n,
 		if (op != OP_MOVE)
 			continue;
 		/* A read-only folder in the original, as cp -a keeps it, would
-		 * stop rm halfway; it is being removed anyway. */
+		 * stop rm halfway; it is being removed anyway. Only a folder:
+		 * chmod follows a link named to it, to what the link points
+		 * at. */
 		int gone = tool(T_RM, "-rf", "--one-file-system", "--", src,
 			msg, sizeof msg) == 0;
-		if (!gone) {
+		if (!gone && isdir) {
 			tool(T_CHMOD, "-R", "u+w", "--", src, msg, sizeof msg);
 			gone = tool(T_RM, "-rf", "--one-file-system", "--", src,
 				msg, sizeof msg) == 0;
