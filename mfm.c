@@ -209,6 +209,10 @@ static struct wl_compositor *compositor;
 static struct wl_shm *shm;
 static struct wl_seat *seat;
 static uint32_t seat_global;    /* its name in the registry */
+static struct wl_registry *registry;
+/* Seats announced while one was in use, to take when that one goes. */
+static struct spare { uint32_t name, ver; } spare_seats[8];
+static int nspare_seats;
 static struct wp_viewporter *viewporter;
 static struct xdg_wm_base *wm_base;
 static struct zxdg_decoration_manager_v1 *deco_mgr;
@@ -4917,6 +4921,13 @@ static void wm_ping(void *data, struct xdg_wm_base *b, uint32_t serial)
 
 static const struct xdg_wm_base_listener wm_base_listener = { wm_ping };
 
+static void bind_seat(uint32_t name, uint32_t ver)
+{
+	seat = wl_registry_bind(registry, name, &wl_seat_interface, MIN(ver, 7));
+	seat_global = name;
+	wl_seat_add_listener(seat, &seat_listener, NULL);
+}
+
 static void registry_global(void *data, struct wl_registry *r, uint32_t name,
 	const char *iface, uint32_t ver)
 {
@@ -4927,10 +4938,12 @@ static void registry_global(void *data, struct wl_registry *r, uint32_t name,
 			MIN(ver, 6));
 	} else if (!strcmp(iface, wl_shm_interface.name)) {
 		shm = wl_registry_bind(r, name, &wl_shm_interface, 1);
-	} else if (!strcmp(iface, wl_seat_interface.name) && !seat) {
-		seat = wl_registry_bind(r, name, &wl_seat_interface, MIN(ver, 7));
-		seat_global = name;
-		wl_seat_add_listener(seat, &seat_listener, NULL);
+	} else if (!strcmp(iface, wl_seat_interface.name)) {
+		if (!seat)
+			bind_seat(name, ver);
+		else if (nspare_seats < (int)(sizeof spare_seats /
+		    sizeof *spare_seats))
+			spare_seats[nspare_seats++] = (struct spare){ name, ver };
 	} else if (!strcmp(iface, wp_viewporter_interface.name) && !viewporter) {
 		viewporter = wl_registry_bind(r, name, &wp_viewporter_interface, 1);
 	} else if (!strcmp(iface, xdg_wm_base_interface.name)) {
@@ -4943,9 +4956,15 @@ static void registry_global(void *data, struct wl_registry *r, uint32_t name,
 	}
 }
 
-/* A seat that goes is let go of, so that the next one announced is taken. */
+/* A seat that goes is let go of, and one announced before or after it is
+ * taken instead. */
 static void registry_remove(void *data, struct wl_registry *r, uint32_t name)
 {
+	for (int i = 0; i < nspare_seats; i++)
+		if (spare_seats[i].name == name) {
+			spare_seats[i] = spare_seats[--nspare_seats];
+			return;
+		}
 	if (!seat || name != seat_global)
 		return;
 	seat_capabilities(NULL, seat, 0);
@@ -4954,6 +4973,11 @@ static void registry_remove(void *data, struct wl_registry *r, uint32_t name)
 	else
 		wl_seat_destroy(seat);
 	seat = NULL;
+	if (nspare_seats) {
+		struct spare sp = spare_seats[0];
+		spare_seats[0] = spare_seats[--nspare_seats];
+		bind_seat(sp.name, sp.ver);
+	}
 }
 
 static const struct wl_registry_listener registry_listener = {
@@ -5284,9 +5308,10 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	compose_init();
-	struct wl_registry *registry = wl_display_get_registry(dpy);
+	registry = wl_display_get_registry(dpy);
 	wl_registry_add_listener(registry, &registry_listener, NULL);
-	wl_display_roundtrip(dpy);
+	if (wl_display_roundtrip(dpy) < 0)
+		lost_connection();
 	if (!compositor || !shm || !wm_base) {
 		fprintf(stderr, "mfm: the compositor lacks wl_compositor 4, wl_shm "
 			"or xdg_wm_base\n");
