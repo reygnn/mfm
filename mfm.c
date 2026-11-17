@@ -3312,9 +3312,8 @@ static int listed(const char *dir, const char *name)
 	return found;
 }
 
-static int rename_lost;         /* the status line says where the file went */
-
-/* Rename p to q in cwd by way of a temporary name. */
+/* Rename p to q in cwd by way of a temporary name. -1 with errno set, or -2
+ * if the file is stuck under the temporary name: the status line says so. */
 static int rename_via_tmp(const char *p, const char *q)
 {
 	char t[PATH_MAX], nm[64];
@@ -3338,8 +3337,8 @@ static int rename_via_tmp(const char *p, const char *q)
 	/* Put it back, which must not replace what came up under the old name
 	 * meanwhile. Failing that, say where it is. */
 	if (rename_new(t, p) < 0) {
-		rename_lost = 1;
 		set_status(1, "%s is now %s", strrchr(p, '/') + 1, nm);
+		return -2;
 	}
 	errno = e;
 	return -1;
@@ -3437,12 +3436,10 @@ static void prompt_commit(void)
 	} else {
 		r = rename_new(p, q);
 	}
-	if (r < 0) {
-		if (!rename_lost)
-			set_status(1, "cannot rename %s: %s", pold, strerror(errno));
-		rename_lost = 0;
+	if (r == -1)
+		set_status(1, "cannot rename %s: %s", pold, strerror(errno));
+	if (r < 0)
 		return;
-	}
 	int shown = reveal_new(pbuf);
 	reload();
 	select_name(pbuf);
