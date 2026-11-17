@@ -32,6 +32,9 @@ for args in --help -x "a b"; do
 		fail "$args: status $status, stdout '$out'"
 done
 echo "ok: -h on stdout, --help and the rest refused on stderr"
+want=$(sed -n 's/^#define MFM_VERSION "\(.*\)"$/mfm \1/p' "$MFM_DIR/version.h")
+out=$("$MFM" -v) && [ "$out" = "$want" ] || fail "-v: status $?, '$out', not '$want'"
+echo "ok: -v prints $want"
 
 # ---- rendering and frame ---------------------------------------------------
 
@@ -79,7 +82,7 @@ do_input key ctrl+t
 file_appears "Ctrl+T runs the terminal" "$SMOKE_DIR/term-ran"
 
 # Shift and a letter: type-ahead folds case, the keys must still reach it.
-sleep 1.1
+end_search
 do_input hold shift
 do_input key a
 do_input release shift
@@ -114,24 +117,24 @@ mfm_start "$D"
 Y=$(row_y 1)
 X=$((LISTX + 40))
 
-# Press, drag, release. Open is the first item, whatever the font's size.
-# A compositor that lets the pointer change surfaces while a button is down
-# loses the release (wlroots forgets the button): the menu then stays up and a
-# click does it.
+# menu_up <x> <y>: the menu opened at x, y is drawn, with its first item a bit below
+# and right of the corner.
+menu_up() { wait_shot_pixel "the menu is up" $(($1 + 60)) $(($2 + 14)) "$BG"; }
+# menu_still_up <what>: a key sent now comes after the release before it, so once
+# Down has lit the first item the release is known to have left the menu up. With
+# the menu gone Down would go to the list, which has no row below one.txt.
+menu_still_up() { do_input key Down; wait_shot_pixel "$1" $((X + 60)) $((Y + 14)) "$SEL"; }
+
+# Press, drag, release. Open is the first item, whatever the font's size. mwc keeps
+# the button to the popup's grab, so the release reaches the menu (where it does
+# not, a click still runs the item: CAVEATS).
 do_input move "$X" "$Y"
 do_input down right
-sleep 0.2       # the popup needs its time, and a quicker release is a click
+menu_up "$X" "$Y"
+sleep 0.3       # past MENU_CLICK_MS: a quicker release counts as a click
 do_input move $((X + 30)) $((Y + 12))
-sleep 0.2
 do_input up right
-sleep 0.3
-if [ -e "$SMOKE_DIR/opened" ]; then
-	echo "ok: press, drag and release runs Open"
-else
-	echo "note: the compositor lost the release, the menu stayed up"
-	do_input click left
-	file_appears "after a lost release a click runs Open" "$SMOKE_DIR/opened"
-fi
+file_appears "press, drag and release runs Open" "$SMOKE_DIR/opened"
 rm -f "$SMOKE_DIR/opened"
 
 # A menu that is still up would take these keys: the menu must be closed now.
@@ -147,29 +150,30 @@ file_appears "... and the name is back" "$D/one.txt"
 # A quick click leaves it open for a second click.
 do_input move "$X" "$Y"
 do_input click right
-sleep 0.4
+menu_up "$X" "$Y"
+menu_still_up "a quick click leaves the menu up"
 [ ! -e "$SMOKE_DIR/opened" ] || fail "the opening click ran an item"
 do_input move $((X + 30)) $((Y + 12))
 do_input click left
-file_appears "click, then click on an item runs it" "$SMOKE_DIR/opened"
+file_appears "a click on an item runs it" "$SMOKE_DIR/opened"
 rm -f "$SMOKE_DIR/opened"
 
 # Slow press and release without moving: the menu stays and nothing runs.
 do_input move "$X" "$Y"
 do_input down right
-sleep 0.5
+menu_up "$X" "$Y"
+sleep 0.3       # past MENU_CLICK_MS
 do_input up right
-sleep 0.2
+menu_still_up "a slow release on the corner leaves the menu up"
 [ ! -e "$SMOKE_DIR/opened" ] || fail "a release on the corner ran an item"
-do_input key Down
 do_input key Return
-file_appears "a slow click leaves it open, Down and Return run Open" "$SMOKE_DIR/opened"
+file_appears "... and Return runs the item Down lit" "$SMOKE_DIR/opened"
 rm -f "$SMOKE_DIR/opened"
 
 # Esc closes it: afterwards the key goes to the list again.
 do_input move "$X" "$Y"
 do_input click right
-sleep 0.4
+menu_up "$X" "$Y"
 do_input key Escape
 do_input key F7
 for k in a b; do do_input key "$k"; done
@@ -180,7 +184,7 @@ file_appears "Esc closes the menu" "$D/ab"
 # the menu does not get selected.
 do_input move "$X" "$Y"
 do_input click right
-sleep 0.4
+menu_up "$X" "$Y"
 do_input move "$LISTX" "$(row_y 0)"
 do_input click left
 do_input key F2
@@ -197,7 +201,7 @@ file_appears "... and the keys go to the list" "$D/cd"
 do_input key F5
 do_input move "$X" "$(row_y 3)"
 do_input click right
-sleep 0.4
+menu_up "$X" "$(row_y 3)"
 for _ in 1 2 3 4 5 6; do do_input key Down; done
 do_input key Return
 file_appears "the menu moves a file to the trash" "$XDG_DATA_HOME/Trash/files/one.txt"
@@ -212,14 +216,17 @@ mfm_start "$D"
 X=$((LISTX + 40))
 Y=$((CY + 420))    # the list ends a bit below, then comes the status line
 [ $((Y + 300)) -gt 720 ] || fail "the test expects a window near the bottom"
+menu_above() {
+	local y
+	shoot
+	for ((y = Y - 100; y < Y - 80; y++)); do
+		[ "$(pixel $((X + 6)) "$y")" = "$BG" ] && return 0
+	done
+	return 1
+}
 do_input move "$X" "$Y"
 do_input click right
-sleep 0.4
-shoot
-for ((y = Y - 100; y < Y - 80; y++)); do
-	[ "$(pixel $((X + 6)) "$y")" = "$BG" ] && break
-done
-[ "$y" -lt $((Y - 80)) ] || fail "no menu above the pointer"
+check "the menu is up, above the pointer" menu_above
 [ "$(pixel $((X + 6)) $((Y + 10)))" != "$BG" ] || fail "the menu is below the pointer"
 echo "ok: the menu flips at the bottom of the screen"
 do_input key Escape
@@ -243,19 +250,269 @@ do_input down left
 do_input move "$SBX" $((SBY + 150))
 wait_shot_pixel "dragging moves the thumb" "$SBX" "$SBY" "$TROUGH"
 
-# Leave the window with the button down and let go outside: mwc has no implicit
-# grab, so mfm never sees that release and must not stay in the drag.
+# Leave the window with the button down and let go outside: the drag must end,
+# whether the release arrives (mwc keeps the pointer with the window while a button
+# is down) or not (ptr_leave). Coming back in is an enter, and the move after it a
+# motion that would take the thumb to the bottom if the drag went on. F7's prompt
+# shows once that motion is handled.
 do_input move $((CX + W + 60)) $((SBY + 150))
 do_input up left
+do_input move "$SBX" $((CY + H - 70))
 do_input move "$SBX" $((CY + H - 80))
-sleep 0.3
+do_input key F7
+wait_shot_pixel "the prompt is up" $((CX + W - 40)) $((CY + H - 19)) f6f6f6
 shoot
-cp "$SHOT" "$SHOT.1"
-do_input move "$SBX" "$SBY"
-sleep 0.3
-shoot
-cmp -s "$SHOT" "$SHOT.1" || fail "still dragging after the button came up outside"
+at=$(pixel "$SBX" $((SBY + 150)))
+bottom=$(pixel "$SBX" $((CY + H - 80)))
+[ "$at" = "$BG" ] && [ "$bottom" = "$TROUGH" ] ||
+	fail "still dragging after the button came up outside: thumb $at, bottom $bottom"
 echo "ok: a drag ends when the pointer leaves the window"
+do_input key Escape
+mfm_quit
+
+# ---- refusals, and what is left as it was ----------------------------------
+
+# A move within a file system is a rename that never replaces: what has the name in
+# the target stays, the moved one arrives as "name (2)".
+fresh_dir samefs
+mkdir -p "$D/src/d" "$D/dst"
+echo new >"$D/src/a.txt"
+echo f >"$D/src/d/f"
+echo old >"$D/dst/a.txt"
+mfm_start "$D/src"
+do_input key ctrl+a
+do_input key ctrl+x
+do_input key BackSpace
+do_input key d
+do_input key Return
+do_input key ctrl+v
+file_appears "a move within a file system" "$D/dst/a (2).txt"
+file_appears "... of a folder too" "$D/dst/d/f"
+[ "$(cat "$D/dst/a.txt")" = old ] || fail "the move replaced a.txt"
+[ "$(cat "$D/dst/a (2).txt")" = new ] || fail "a (2).txt is not the moved file"
+[ -z "$(ls -A "$D/src")" ] || fail "left in the source: $(ls -A "$D/src")"
+echo "ok: ... keeps what was there and leaves nothing behind"
+mfm_quit
+
+# F2 onto a taken name, and onto another name of the same file, is refused.
+fresh_dir clash
+echo a >"$D/a.txt"
+echo b >"$D/b.txt"
+ln "$D/a.txt" "$D/c.txt"
+mfm_start "$D"
+do_input key Down
+do_input key F2
+do_input key b
+do_input key Return
+wait_err "F2 onto a taken name is refused"
+[ "$(cat "$D/a.txt")" = a ] && [ "$(cat "$D/b.txt")" = b ] || fail "the rename replaced b.txt"
+do_input move $((LISTX + 40)) "$(row_y 1)"
+do_input click left
+no_err "a click clears the error"
+do_input key F2
+do_input key c
+do_input key Return
+wait_err "F2 onto a hard link of the same file is refused"
+[ -e "$D/a.txt" ] && [ -e "$D/c.txt" ] || fail "a name of the hard-linked file is gone"
+mfm_quit
+
+# Shift+Delete asks; any key but y leaves the file.
+fresh_dir ask
+touch "$D/a.txt"
+mfm_start "$D"
+do_input key Down
+do_input key shift+Delete
+do_input key n
+mfm_alive "the answer is taken"
+[ -e "$D/a.txt" ] || fail "n deleted the file"
+echo "ok: Shift+Delete, then n, deletes nothing"
+mfm_quit
+
+# A folder cannot be pasted into itself or below itself.
+fresh_dir self
+mkdir -p "$D/d/sub"
+mfm_start "$D"
+do_input key Down
+do_input key ctrl+c
+do_input key Return
+do_input key Down
+do_input key Return
+do_input key ctrl+v
+wait_err "pasting a folder into its own subfolder is refused"
+mfm_alive "after the refusal"
+[ -z "$(ls -A "$D/d/sub")" ] || fail "made in the subfolder: $(ls -A "$D/d/sub")"
+echo "ok: ... and nothing is made there"
+mfm_quit
+
+# F7 and F2 in a folder that cannot be written, and F7 onto a taken name.
+fresh_dir ro
+mkdir "$D/ro"
+touch "$D/ro/f" "$D/taken"
+chmod 555 "$D/ro"
+mfm_start "$D/ro"
+do_input key F7
+do_input key x
+do_input key Return
+wait_err "F7 in a read-only folder fails"
+[ ! -e "$D/ro/x" ] || fail "F7 made a folder in a read-only one"
+do_input move $((LISTX + 40)) "$(row_y 1)"
+do_input click left
+no_err "a click clears the error"
+do_input key F2
+do_input key y
+do_input key Return
+wait_err "F2 in a read-only folder fails"
+mfm_alive "... and mfm goes on"
+[ -e "$D/ro/f" ] || fail "f is gone"
+chmod 755 "$D/ro"
+do_input key BackSpace
+no_err "going up clears the error"
+do_input key F7
+for k in t a k e n; do do_input key "$k"; done
+do_input key Return
+wait_err "F7 onto a taken name fails"
+[ -f "$D/taken" ] || fail "taken is no longer the file"
+mfm_quit
+
+# Two files of one name from two folders: both go to the trash, under two names, each
+# with its own path in its .trashinfo.
+fresh_dir trash2
+mkdir "$D/p" "$D/q"
+echo p >"$D/p/same"
+echo q >"$D/q/same"
+mfm_start "$D/p"
+do_input key Down
+do_input key Delete
+wait_for "the first goes to the trash" test ! -e "$D/p/same"
+do_input key BackSpace
+do_input key q
+do_input key Return
+do_input key Down
+do_input key Delete
+wait_for "the second goes to the trash" test ! -e "$D/q/same"
+TR=$XDG_DATA_HOME/Trash
+for w in p q; do
+	info=$(grep -l "^Path=.*/$w/same$" "$TR"/info/same*.trashinfo) ||
+		fail "no .trashinfo for $w/same"
+	[ "$(echo "$info" | wc -l)" = 1 ] || fail "two .trashinfo for $w/same: $info"
+	f=$(basename "$info" .trashinfo)
+	[ "$(cat "$TR/files/$f")" = "$w" ] || fail "$f in the trash is not $w/same"
+done
+echo "ok: two files of one name are both in the trash, each with its path"
+mfm_quit
+
+# Given a file, mfm opens its folder with the file selected: F2 renames it.
+fresh_dir argfile
+touch "$D/a.txt" "$D/b.txt"
+mfm_start "$D/b.txt"
+do_input key F2
+do_input key z
+do_input key Return
+file_appears "a file as argument is selected" "$D/z.txt"
+[ -e "$D/a.txt" ] || fail "a.txt was renamed"
+mfm_quit
+
+# A path that does not exist: mfm starts at home and says why.
+fresh_dir argmissing
+mkdir "$D/home"
+HOME=$D/home mfm_start "$D/nope"
+wait_err "a missing path is an error"
+do_input key F7
+do_input key h
+do_input key Return
+file_appears "... and mfm is at home" "$D/home/h"
+mfm_quit
+
+# A program for Return or Ctrl+S that cannot be run is an error, not the end of mfm.
+fresh_dir noprog
+touch "$D/a.txt"
+OPEN=/nonexistent/open MFM_SEND=/nonexistent/send mfm_start "$D"
+do_input key Down
+do_input key Return
+wait_err "an MFM_OPEN that cannot run is an error"
+do_input move $((LISTX + 40)) "$(row_y 1)"
+do_input click left
+no_err "a click clears the error"
+do_input key ctrl+s
+wait_err "an MFM_SEND that cannot run is an error"
+mfm_alive "... and mfm goes on"
+mfm_quit
+
+# The path field, Ctrl+L: Return goes where it says; a file there is opened, a path
+# that does not exist is an error. Before a key that moves the cursor, "/" starts over.
+fresh_dir path
+mkdir -p "$D/a/b"
+touch "$D/a/f"
+mfm_start "$D/a/b"
+do_input key ctrl+l
+do_input key BackSpace
+do_input key BackSpace
+do_input key Return
+do_input key F7
+do_input key n
+do_input key Return
+file_appears "the path field takes a path" "$D/a/n"
+do_input key ctrl+l
+do_input key End
+for k in slash z z; do do_input key "$k"; done
+do_input key Return
+wait_err "a path that does not exist is an error"
+do_input key ctrl+l
+do_input key End
+for k in slash f; do do_input key "$k"; done
+do_input key Return
+file_appears "a file in the path field is opened" "$SMOKE_DIR/opened"
+[ "$(cat "$SMOKE_DIR/opened")" = "$D/a/f" ] || fail "opened $(cat "$SMOKE_DIR/opened")"
+rm -f "$SMOKE_DIR/opened"
+mfm_quit
+
+# A name that is not UTF-8 is copied and moved byte for byte, "(copy)" after it.
+# The keys after a job wait for its end: then it selects what it made.
+fresh_dir latin
+mkdir "$D/to"
+L=$(printf 'caf\xe9')
+echo x >"$D/$L"
+mfm_start "$D"
+do_input key End
+do_input key ctrl+c
+do_input key ctrl+v
+file_appears "a Latin-1 name is copied" "$D/$L (copy)"
+job_settled
+mfm_alive "the copy is over"
+do_input key Home
+do_input key Down
+do_input key Down
+do_input key ctrl+x
+do_input key Home
+do_input key Down
+do_input key Return
+do_input key ctrl+v
+file_appears "... and moved" "$D/to/$L"
+[ ! -e "$D/$L" ] || fail "the original is still there"
+mfm_quit
+
+# Shift+click marks the range from the selection; Ctrl+A marks all, and again none.
+fresh_dir range
+touch "$D/a" "$D/b" "$D/c" "$D/d"
+mfm_start "$D"
+do_input move $((LISTX + 40)) "$(row_y 1)"
+do_input click left
+do_input hold shift
+do_input move $((LISTX + 40)) "$(row_y 3)"
+do_input click left
+do_input release shift
+do_input key Delete
+wait_for "Shift+click marks the range" test ! -e "$D/c"
+[ ! -e "$D/a" ] && [ ! -e "$D/b" ] || fail "the range missed its start"
+[ -e "$D/d" ] || fail "the range went past its end"
+# With nothing marked, Delete on ".." has nothing to take.
+do_input key ctrl+a
+do_input key ctrl+a
+do_input key Home
+do_input key Delete
+mfm_alive "Ctrl+A twice, then Delete on .."
+[ -e "$D/d" ] || fail "Ctrl+A twice left d marked"
+echo "ok: Ctrl+A again unmarks"
 mfm_quit
 
 # ---- names the protocol or Pango could trip over ---------------------------
@@ -270,9 +527,7 @@ mkdir -p "$P" || fail "cannot make the long path"
 touch "$P/inside"
 mfm_start "$P"
 do_input key F5
-sleep 0.3
-kill -0 "$MFM_PID" 2>/dev/null || fail "mfm died on a long path"
-echo "ok: a path of ${#P} bytes as a title"
+mfm_alive "a path of ${#P} bytes as a title"
 mfm_quit
 
 # A newline in a name must not make a second line, which would show on the empty
@@ -281,8 +536,7 @@ fresh_dir odd
 touch "$D/$(printf 'first\nsecond\nthird')"
 mfm_start "$D"
 do_input key F5
-sleep 0.3
-kill -0 "$MFM_PID" 2>/dev/null || fail "mfm died on odd names"
+mfm_alive "mfm survives a newline in a name"
 shoot
 for ((x = LISTX - 60; x < LISTX + 100; x += 3)); do
 	[ "$(pixel "$x" "$(row_y 2)")" = "$LIST" ] || fail "text on the empty row at x=$x"
@@ -294,9 +548,7 @@ fresh_dir odd2
 touch "$D/$(printf 'latin\xe9')" "$D/ütf ☃ 日本語.txt" "$D/$(printf 'zz\xe2\x80\xaefdp.exe')"
 mfm_start "$D"
 do_input key F5
-sleep 0.3
-kill -0 "$MFM_PID" 2>/dev/null || fail "mfm died on odd names"
-echo "ok: odd names"
+mfm_alive "odd names"
 mfm_quit
 
 # The cursor does not stop between a letter and its accent: F2 puts it behind the
@@ -484,7 +736,7 @@ rm "$SENT"
 # nothing to paste).
 do_input move $((LISTX + 40)) "$(row_y 1)"
 do_input click right
-sleep 0.4
+menu_up $((LISTX + 40)) "$(row_y 1)"
 for _ in 1 2 3 4 5; do do_input key Down; done
 do_input key Return
 file_appears "the menu sends the clicked entry" "$SENT"

@@ -13,7 +13,7 @@ MWC_DIR=${MWC_DIR:-$MFM_DIR/../mwc}
 cd "$MWC_DIR" || exit 1
 . tests/lib.sh
 
-require_tools grim
+require_tools grim pgrep
 for tool in build/vinput build/pngtool; do
 	[ -x "$tool" ] || { echo "FAIL: $MWC_DIR/$tool not built (make $tool)"; exit 1; }
 done
@@ -29,6 +29,15 @@ MFM_PID=
 BG=aeb2c3
 SEL=7387ad
 TROUGH=999dac
+ERR=8a0303      # status line text for errors, on BG
+
+# A type-ahead ends after TYPEAHEAD_MS without a key.
+TYPEAHEAD_MS=$(sed -n 's/^#define TYPEAHEAD_MS \([0-9]*\).*/\1/p' "$MFM_DIR/mfm.c")
+[ -n "$TYPEAHEAD_MS" ] || { echo "FAIL: no TYPEAHEAD_MS in mfm.c"; exit 1; }
+
+# What mfm_start runs to open a file: it writes the path to $SMOKE_DIR/opened.
+# OPEN=... before mfm_start runs that instead.
+OPENER="sh -c 'printf %s \"\$1\" > \"\$0\"' $SMOKE_DIR/opened"
 
 # ---- helpers ---------------------------------------------------------------
 
@@ -45,8 +54,7 @@ content_origin() {
 # mfm_start <directory>: run mfm there and wait until its window is up.
 mfm_start() {
 	# The marker holds the path of what was opened.
-	WAYLAND_DEBUG=${MFM_DEBUG:-} WAYLAND_DISPLAY=wayland-0 \
-		MFM_OPEN="sh -c 'printf %s \"\$1\" > \"\$0\"' $SMOKE_DIR/opened" \
+	WAYLAND_DEBUG=${MFM_DEBUG:-} WAYLAND_DISPLAY=wayland-0 MFM_OPEN=${OPEN:-$OPENER} \
 		MFM_TERMINAL="touch $SMOKE_DIR/term-ran" "$MFM" "$1" >>"$MFM_LOG" 2>&1 &
 	MFM_PID=$!
 	check "mfm has a focused window" '[ "$(get mfm kbfocus)" = 1 ]'
@@ -64,6 +72,44 @@ mfm_quit() {
 	check "the window is gone" '[ -z "$(get mfm w)" ]'
 	MFM_PID=
 }
+
+# job_settled: wait until no worker runs below mfm any more. That alone says nothing
+# about a job that has not started yet: wait for what it does first.
+job_settled() {
+	local i
+	for ((i = 0; i < 100; i++)); do
+		pgrep -P "$MFM_PID" >/dev/null || return 0
+		sleep 0.1
+	done
+	fail "the job did not end"
+}
+
+# end_search: wait until a type-ahead is over, so the next letter starts a new one
+# and BackSpace goes up instead of taking a letter.
+end_search() {
+	local ms=$((TYPEAHEAD_MS + 100))
+	sleep "$((ms / 1000)).$(printf %03d $((ms % 1000)))"
+}
+
+# mfm_alive <what>: mfm has handled what came before and still runs. Ctrl+T runs
+# MFM_TERMINAL, which leaves a file.
+mfm_alive() {
+	rm -f "$SMOKE_DIR/term-ran"
+	do_input key ctrl+t
+	file_appears "$1" "$SMOKE_DIR/term-ran"
+	kill -0 "$MFM_PID" 2>/dev/null || fail "$1: mfm is gone"
+}
+
+# Pixels of the error colour in the status line, in the last shot.
+err_pixels() {
+	build/pngtool count "$SHOT" "$CX" $((CY + $(get mfm h) - 40)) 600 40 "$ERR" 6
+}
+
+# wait_err <what>: an error shows in the status line.
+wait_err() { check "$1" 'shoot; [ "$(err_pixels)" -gt 0 ]'; }
+
+# no_err <what>: none shows.
+no_err() { check "$1" 'shoot; [ "$(err_pixels)" = 0 ]'; }
 
 shoot() { rm -f "$SHOT"; WAYLAND_DISPLAY=wayland-0 grim "$SHOT" 2>/dev/null || fail "no screenshot"; }
 

@@ -57,7 +57,6 @@ LOG=$(cd "$(dirname "$SELF")/.." && pwd)/build/files.log
 MFM_LOG=${LOG%.log}-mfm.log
 . "$(dirname "$SELF")/common.sh"
 
-require_tools pgrep
 # The socket comes before the test hooks, the startup command after them.
 start_mwc 'touch "$SMOKE_DIR/up"; exec sleep 600'
 wait_for "mwc is up" test -e "$SMOKE_DIR/up"
@@ -69,33 +68,16 @@ T=$(global theme title)
 # type_name <letters>: type-ahead to a name; a pause first ends an earlier search.
 type_name() {
 	local i
-	sleep 1.1
+	end_search
 	for ((i = 0; i < ${#1}; i++)); do do_input key "${1:i:1}"; done
 }
 
 # to_dir <name>: from a directory into a sibling of it.
 to_dir() {
-	sleep 1.1       # during a search, BackSpace is part of it
+	end_search      # during a search, BackSpace is part of it
 	do_input key BackSpace
 	type_name "$1"
 	do_input key Return
-	sleep 0.2
-}
-
-# job_settled: wait until no worker runs below mfm any more. That alone says nothing
-# about a job that has not started yet: wait for what it does first.
-job_settled() {
-	local i
-	for ((i = 0; i < 100; i++)); do
-		pgrep -P "$MFM_PID" >/dev/null || return 0
-		sleep 0.1
-	done
-	fail "the job did not end"
-}
-
-# Pixels of the error colour in the status line.
-err_pixels() {
-	build/pngtool count "$SHOT" "$CX" $((CY + $(get mfm h) - 40)) 600 40 8a0303 6
 }
 
 no_hidden_left() {
@@ -133,7 +115,7 @@ mark_names() {
 	local n
 	for n; do
 		type_name "$n"
-		sleep 1.1
+		end_search
 		do_input key space
 	done
 }
@@ -206,9 +188,9 @@ echo "ok: a mount point is not moved"
 touch "$R/src/zm2"
 do_input move $((LISTX + 40)) "$(row_y 0)"
 do_input click left
-check "the error is cleared" 'shoot; [ "$(err_pixels)" = 0 ]'
+no_err "the error is cleared"
 do_input key ctrl+v
-check "the second paste fails on the mount point" 'shoot; [ "$(err_pixels)" -gt 0 ]'
+wait_err "the second paste fails on the mount point"
 job_settled
 [ -e "$R/src/zm2" ] || fail "a new entry under a moved name was moved too"
 echo "ok: the clipboard keeps only what failed"
@@ -233,7 +215,7 @@ mkdir -p "$SHIM"
 REAL_CP=$(command -v cp)
 cat >"$SHIM/cp" <<EOS
 #!/bin/sh
-[ -e "$SHIM/hang" ] && exec sleep 300
+[ -e "$SHIM/hang" ] && { touch "$SHIM/hung"; exec sleep 300; }
 exec "$REAL_CP" "\$@"
 EOS
 chmod +x "$SHIM/cp"
@@ -243,12 +225,12 @@ type_name slow
 do_input key ctrl+x
 to_dir wide
 do_input key ctrl+v
-sleep 0.5
+file_appears "the worker hangs in cp" "$SHIM/hung"
 W=$(pgrep -P "$MFM_PID" | head -1)
 [ -n "$W" ] || fail "no worker"
 kill -9 -- "-$W"
 rm "$SHIM/hang"
-sleep 0.5
+wait_err "mfm sees the worker die"
 do_input key ctrl+v
 job_settled
 wait_for "the clipboard survives a worker that died" test -e "$R/wide/slow"
@@ -310,12 +292,16 @@ mfm_quit
 
 # ---- the directory on screen ------------------------------------------------
 
+# The next poll takes mfm up; until then F7 fails in the folder it cannot write.
 mfm_start "$R/vanish/sub"
 chmod 000 "$R/vanish/sub"
-sleep 1.5
-do_input key F7
-do_input key x
-do_input key Return
+for ((i = 0; i < 50; i++)); do
+	do_input key F7
+	do_input key x
+	do_input key Return
+	[ -e "$R/vanish/x" ] && break
+	sleep 0.1
+done
 file_appears "chmod 000 on the folder sends mfm to its parent" "$R/vanish/x"
 chmod 755 "$R/vanish/sub"
 mfm_quit
