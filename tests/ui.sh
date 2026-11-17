@@ -91,6 +91,21 @@ rm -f "$SMOKE_DIR/opened"
 
 mfm_quit
 
+# A new selection changes a few rows of pixels, and only they go to the compositor
+# as damage, not the whole window.
+fresh_dir damage
+touch "$D/a" "$D/b"
+: >"$MFM_LOG"
+MFM_DEBUG=client mfm_start "$D"
+last_damage_h() {
+	grep -o 'damage_buffer(0, [0-9]*, 680, [0-9]*)' "$MFM_LOG" | tail -1 |
+		sed 's/.*, \([0-9]*\))/\1/'
+}
+do_input key Down
+check "a new selection damages only the rows that changed" \
+	'h=$(last_damage_h); [ "${h:-480}" -lt 480 ]'
+mfm_quit
+
 # ---- context menu ----------------------------------------------------------
 
 fresh_dir menu
@@ -576,17 +591,27 @@ echo "ok: Mwm*foreground and Mwm*activeForeground"
 mfm_quit
 rm "$XDG_CONFIG_HOME/mwc/mwmrc"
 
+# The date shows where the name keeps at least as much room as the date takes: a big
+# font in the default window leaves it out. A folder has no size, so the right end
+# of its row holds only the date.
+fresh_dir dim
+mkdir "$D/a"
+touch -d 2024-01-01 "$D/a"
+dim_px() {
+	build/pngtool count "$SHOT" $((CX + $(get mfm w) - 220)) $((ROW0 + ROWH + 1)) 180 \
+		$((ROWH - 2)) 3d3e44 6
+}
+MFM_FONT="Sans Bold 24" mfm_start "$D"
+[ "$(dim_px)" = 0 ] || fail "a big font in a small window shows the date"
+echo "ok: a big font in a small window leaves the date out"
 # Dimmed text, the date here, as far as 4.5:1 allows: 3d3e44 on aeb2c3. The old 0.6
 # mix, 46474e, is lighter, and its smoothing towards the background never gets as
-# dark. The right end of the row holds only the date.
-fresh_dir dim
-touch -d 2024-01-01 "$D/a"
-MFM_FONT="Sans Bold 24" mfm_start "$D"
-W=$(get mfm w)
-shoot
-dim=$(build/pngtool count "$SHOT" $((CX + W - 220)) $((ROW0 + ROWH + 1)) 180 $((ROWH - 2)) 3d3e44 6)
-[ "$dim" -gt 0 ] || fail "no 3d3e44 in the date"
-echo "ok: dimmed text has 4.5:1"
+# dark.
+do_input key super+Up
+check "maximized" '[ "$(get mfm max)" = 1 ]'
+content_origin
+find_rows
+check "maximized it shows the date, and dimmed text has 4.5:1" 'shoot; [ "$(dim_px)" -gt 0 ]'
 mfm_quit
 
 # The error colour follows the background: light on a dark one. F2 on ".." is one.

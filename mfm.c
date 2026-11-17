@@ -187,7 +187,9 @@ struct wsurf {
 	struct wl_surface *wl;
 	struct wl_callback *frame;      /* a frame is on its way */
 	struct shmbuf *b[2];
+	struct shmbuf *shown;           /* the last one committed, if kept */
 	int scale;                      /* of the buffer last drawn */
+	int shown_scale;
 };
 
 /* Modifiers and held buttons, in the state of a pointer event. */
@@ -251,6 +253,7 @@ static uint32_t xc_fg, xc_sel, xc_dim, xc_err;
 static cairo_t *cr;             /* what fill, bevel and text draw on */
 static PangoLayout *plo;
 static int font_asc, font_desc;
+static int ell_w, date_w, size_w;       /* "...", the date and size columns */
 static int rowh, barh;
 static struct rect r_up, r_path, r_list, r_sb, r_status;
 
@@ -324,9 +327,17 @@ static struct shmbuf *buf_new(int w, int h)
  * both; its release wakes the main loop. */
 static struct shmbuf *wsurf_buffer(struct wsurf *s, int w, int h)
 {
-	s->scale = scale;
-	w *= scale;
-	h *= scale;
+	/* Cairo draws at most 32767 pixels a side, and a wl_shm pool holds
+	 * less than 2 GiB: a scale that goes past either is lowered, and past
+	 * that the buffer is cut. */
+	enum { SIDE = 32767 };
+	int sc = scale;
+	while (sc > 1 && ((long)w * sc > SIDE || (long)h * sc > SIDE ||
+	    (long)w * sc * 4 * h * sc > INT32_MAX))
+		sc--;
+	w = MIN(w * sc, SIDE);
+	h = MIN(MIN(h * sc, SIDE), INT32_MAX / 4 / MAX(w, 1));
+	s->scale = sc;
 	for (int i = 0; i < 2; i++) {
 		struct shmbuf *b = s->b[i];
 		if (!b || (b->w == w && b->h == h))
@@ -335,18 +346,25 @@ static struct shmbuf *wsurf_buffer(struct wsurf *s, int w, int h)
 			b->stale = 1;
 		else
 			buf_free(b);
+		if (s->shown == b)
+			s->shown = NULL;
 		s->b[i] = NULL;
 	}
+	/* Not the one shown, if the other is free: that keeps what the
+	 * compositor has, to compare the next frame with. */
 	struct shmbuf *b = NULL;
 	for (int i = 0; i < 2 && !b; i++)
-		if (s->b[i] && !s->b[i]->busy)
+		if (s->b[i] && !s->b[i]->busy && s->b[i] != s->shown)
 			b = s->b[i];
 	for (int i = 0; i < 2 && !b; i++)
 		if (!s->b[i])
 			b = s->b[i] = buf_new(w, h);
+	for (int i = 0; i < 2 && !b; i++)
+		if (s->b[i] && !s->b[i]->busy)
+			b = s->b[i];
 	if (b) {
 		cairo_identity_matrix(b->cr);
-		cairo_scale(b->cr, scale, scale);
+		cairo_scale(b->cr, s->scale, s->scale);
 	}
 	return b;
 }
@@ -360,6 +378,8 @@ static void frame_done(void *data, struct wl_callback *cb, uint32_t time)
 
 static const struct wl_callback_listener frame_listener = { frame_done };
 
+/* Commit b, with damage for the rows that differ from what was shown: the
+ * compositor copies and composites only those. */
 static void wsurf_present(struct wsurf *s, struct shmbuf *b)
 {
 	cairo_surface_flush(b->cs);
@@ -369,9 +389,24 @@ static void wsurf_present(struct wsurf *s, struct shmbuf *b)
 	wl_callback_add_listener(s->frame, &frame_listener, s);
 	wl_surface_set_buffer_scale(s->wl, s->scale);
 	wl_surface_attach(s->wl, b->wl, 0, 0);
-	wl_surface_damage_buffer(s->wl, 0, 0, b->w, b->h);
+	int y0 = 0, y1 = b->h;
+	const struct shmbuf *o = s->shown;
+	if (o && o != b && o->w == b->w && o->h == b->h &&
+	    s->shown_scale == s->scale) {
+		size_t row = b->size / b->h;
+		const char *p = b->data, *q = o->data;
+		while (y0 < y1 && !memcmp(p + y0 * row, q + y0 * row, row))
+			y0++;
+		while (y1 > y0 && !memcmp(p + (y1 - 1) * row,
+		    q + (y1 - 1) * row, row))
+			y1--;
+	}
+	if (y1 > y0)
+		wl_surface_damage_buffer(s->wl, 0, y0, b->w, y1 - y0);
 	wl_surface_commit(s->wl);
 	b->busy = 1;
+	s->shown = b;
+	s->shown_scale = s->scale;
 }
 
 static void wsurf_destroy(struct wsurf *s)
@@ -823,8 +858,15 @@ static void theme_init(void)
 	font_desc = PANGO_PIXELS_CEIL(pango_font_metrics_get_descent(m));
 	pango_font_metrics_unref(m);
 	pango_font_description_free(desc);
+	g_object_unref(ctx);    /* the layout holds its own */
 	rowh = font_asc + font_desc + 4;
 	barh = rowh + 6;
+	pango_layout_set_text(plo, "...", 3);
+	pango_layout_get_pixel_size(plo, &ell_w, NULL);
+	pango_layout_set_text(plo, "0000-00-00 00:00", 16);
+	pango_layout_get_pixel_size(plo, &date_w, NULL);
+	pango_layout_set_text(plo, "0000.0 M", 8);
+	pango_layout_get_pixel_size(plo, &size_w, NULL);
 }
 
 /* ---- small helpers ------------------------------------------------------ */
@@ -1009,6 +1051,16 @@ static int sel_visible(void)
 static void clamp_top(void)
 {
 	top = MAX(0, MIN(top, nents - rows_vis()));
+}
+
+/* Scroll the list; a redraw only if that moved it. */
+static void scroll_to(int t)
+{
+	int old = top;
+	top = t;
+	clamp_top();
+	if (top != old)
+		dirty = 1;
 }
 
 static void show_sel(void)
@@ -3415,26 +3467,45 @@ static void bevel(struct rect r, int raised)
 	}
 }
 
-/* textw/text take valid UTF-8 only; text_fit converts with disp(). */
-static int textw(const char *s, int n)
+/* shape, textw and text take valid UTF-8 only; text_fit converts with
+ * disp(). Shaping is the costly part of drawing: shape() once, then show()
+ * what it laid out. */
+static int shape(const char *s, int n)
 {
 	int w;
-	if (n <= 0)
-		return 0;
-	pango_layout_set_text(plo, s, n);
+	pango_layout_set_text(plo, s, MAX(n, 0));
 	pango_layout_get_pixel_size(plo, &w, NULL);
-	return w;
+	return n > 0 ? w : 0;
+}
+
+/* The text shape() laid out, at x in a line from y, h high. */
+static void show(uint32_t c, int x, int y, int h)
+{
+	int base = y + (h - (font_asc + font_desc)) / 2 + font_asc;
+	set_rgb(c);
+	cairo_move_to(cr, x, base - pango_layout_get_baseline(plo) / PANGO_SCALE);
+	pango_cairo_show_layout(cr, plo);
+}
+
+static int textw(const char *s, int n)
+{
+	return shape(s, n);
 }
 
 static void text(uint32_t c, int x, int y, int h, const char *s, int n)
 {
 	if (n <= 0)
 		return;
-	int base = y + (h - (font_asc + font_desc)) / 2 + font_asc;
-	pango_layout_set_text(plo, s, n);
-	set_rgb(c);
-	cairo_move_to(cr, x, base - pango_layout_get_baseline(plo) / PANGO_SCALE);
-	pango_cairo_show_layout(cr, plo);
+	shape(s, n);
+	show(c, x, y, h);
+}
+
+/* Right-aligned at right. */
+static void text_right(uint32_t c, int right, int y, int h, const char *s)
+{
+	int n = strlen(s);
+	if (n > 0)
+		show(c, right - shape(s, n), y, h);
 }
 
 /* A character boundary in s between lo and hi, not lo or hi themselves, near
@@ -3450,13 +3521,11 @@ static int mid_char(const char *s, int lo, int hi)
 	return m < hi ? m : -1;
 }
 
-/* Longest prefix of s[0..n) (in bytes, on a character boundary) that is
- * at most maxw wide. Shaping is too slow to go through it by the character
- * for every row. */
-static int fit_prefix(const char *s, int n, int maxw)
+/* Longest prefix of s[0..n) (in bytes, on a character boundary) that is at
+ * most maxw wide, for an s that is wider. Shaping is too slow to go through
+ * it by the character for every row. */
+static int cut_prefix(const char *s, int n, int maxw)
 {
-	if (textw(s, n) <= maxw)
-		return n;
 	int lo = 0, hi = n, m;
 	while ((m = mid_char(s, lo, hi)) >= 0) {
 		if (textw(s, m) <= maxw)
@@ -3465,6 +3534,11 @@ static int fit_prefix(const char *s, int n, int maxw)
 			hi = m;
 	}
 	return lo;
+}
+
+static int fit_prefix(const char *s, int n, int maxw)
+{
+	return textw(s, n) <= maxw ? n : cut_prefix(s, n, maxw);
 }
 
 /* Start of the longest suffix of s[0..n) that is at most maxw wide. */
@@ -3483,30 +3557,30 @@ static int fit_suffix(const char *s, int n, int maxw)
 }
 
 /* Draw s in at most maxw pixels, shortened with "..." at the end or front.
- * Returns the width drawn. */
-static int text_fit(uint32_t c, int x, int y, int h, int maxw,
+ * A name that fits, as most do, is shaped once. */
+static void text_fit(uint32_t c, int x, int y, int h, int maxw,
 	const char *raw, int cut_front)
 {
 	const char *s = disp(raw);
-	int n = strlen(s), ew = textw("...", 3);
+	int n = strlen(s);
 	if (maxw <= 0)
-		return 0;
-	if (fit_prefix(s, n, maxw) == n) {
-		text(c, x, y, h, s, n);
-		return textw(s, n);
+		return;
+	if (shape(s, n) <= maxw) {
+		show(c, x, y, h);
+		return;
 	}
-	if (maxw <= ew)
-		return 0;
+	if (maxw <= ell_w)
+		return;
 	if (!cut_front) {
-		int k = fit_prefix(s, n, maxw - ew);
-		text(c, x, y, h, s, k);
-		text(c, x + textw(s, k), y, h, "...", 3);
-		return textw(s, k) + ew;
+		int k = cut_prefix(s, n, maxw - ell_w);
+		int w = shape(s, k);
+		show(c, x, y, h);
+		text(c, x + w, y, h, "...", 3);
+		return;
 	}
-	int j = fit_suffix(s, n, maxw - ew);
+	int j = fit_suffix(s, n, maxw - ell_w);
 	text(c, x, y, h, "...", 3);
-	text(c, x + ew, y, h, s + j, n - j);
-	return ew + textw(s + j, n - j);
+	text(c, x + ell_w, y, h, s + j, n - j);
 }
 
 /* An input line in r, scrolled so the cursor (at byte cur of the raw
@@ -3521,7 +3595,7 @@ static void draw_input(struct rect r, const char *b, size_t cur,
 	const char *d = disp(b);
 	int n = strlen(d);
 	dc = MIN(dc, n);
-	int ew = textw("...", 3), maxw = r.w - 2;
+	int ew = ell_w, maxw = r.w - 2;
 	int x = r.x, start = 0, end = n;
 	if (maxw <= 2 * ew)
 		return;
@@ -3535,9 +3609,11 @@ static void draw_input(struct rect r, const char *b, size_t cur,
 			maxw - (x - r.x) - ew);
 	}
 	/* One layout for all that shows: cut at the cursor, right-to-left text
-	 * would come apart. */
+	 * would come apart. Shaping need not grow with the text, so the cut
+	 * can fall short of the cursor: it goes at the end then. */
+	end = MAX(end, dc);
 	int seg = end - start, c = dc - start;
-	PangoRectangle at;
+	PangoRectangle at = { 0 };
 	pango_layout_set_text(plo, d + start, seg);
 	pango_layout_get_cursor_pos(plo, c, &at, NULL);
 	if (selected && c > 0) {
@@ -3652,9 +3728,9 @@ static void paint(void)
 	int lw = r_list.w - 2 * BEV, vis = rows_vis();
 	fill(px_list, lx, r_list.y + BEV, lw, r_list.h - 2 * BEV);
 	bevel(r_list, 0);
-	int datew = textw("0000-00-00 00:00", 16);
-	int sizew = textw("0000.0 M", 8);
-	int show_date = lw > 420;
+	/* The date only where the name keeps at least as much room. */
+	int name_x = lx + 5 + rowh + 2, name_end = lx + lw - 8 - size_w - 14;
+	int show_date = name_end - date_w - 14 - name_x >= date_w;
 	for (int i = top; i < nents && i < top + vis; i++) {
 		const struct ent *e = &ents[i];
 		int y = ly + (i - top) * rowh;
@@ -3668,24 +3744,22 @@ static void paint(void)
 		if (e->mark)
 			fill(i == sel ? px_mark : px_sel, lx + 1, y, 3, rowh);
 		draw_icon(lx + 5, y, e);
-		int x = lx + 5 + rowh + 2, right = lx + lw - 8;
+		int x = name_x, right = lx + lw - 8;
 		if (show_date) {
 			if (!e->up) {
 				if (e->nostat)
 					snprintf(s, sizeof s, "?");
 				else
 					format_date(e->mtime, s, sizeof s);
-				text(cd, right - textw(s, strlen(s)), y, rowh,
-					s, strlen(s));
+				text_right(cd, right, y, rowh, s);
 			}
-			right -= datew + 14;
+			right -= date_w + 14;
 		}
 		if (!e->dir && !e->nostat) {
 			human(e->size, s, sizeof s);
-			int n = strlen(s);
-			text(cd, right - textw(s, n), y, rowh, s, n);
+			text_right(cd, right, y, rowh, s);
 		}
-		right -= sizew + 14;
+		right -= size_w + 14;
 		text_fit(c, x, y, rowh, right - x, e->name, 0);
 	}
 
@@ -3706,8 +3780,8 @@ static void paint(void)
 	if (prompt) {
 		const char *l = prompt == PR_RENAME ? "Rename to: " :
 			"New folder: ";
-		int lw = textw(l, strlen(l));
-		text(xc_fg, in_s.x, in_s.y, in_s.h, l, strlen(l));
+		int lw = shape(l, strlen(l));
+		show(xc_fg, in_s.x, in_s.y, in_s.h);
 		fill(px_paper, in_s.x + lw, in_s.y + BEV + 1, in_s.w - lw,
 			in_s.h - 2 * BEV - 2);
 		draw_input((struct rect){ in_s.x + lw + 3, in_s.y,
@@ -3724,9 +3798,8 @@ static void paint(void)
 			human(ents[sel].size, sz, sizeof sz);
 			snprintf(s, sizeof s, "%s   %s", p, sz);
 		}
-		rw = textw(s, strlen(s));
-		text(xc_dim, in_s.x + in_s.w - rw, in_s.y, in_s.h, s,
-			strlen(s));
+		rw = shape(s, strlen(s));
+		show(xc_dim, in_s.x + in_s.w - rw, in_s.y, in_s.h);
 		rw += 16;
 	}
 	uint32_t sc = xc_fg;
@@ -3902,8 +3975,7 @@ static int menu_draw(void)
 		}
 		const char *l = menu_label(i), *a = menu_items[i].accel;
 		text(c, BEV + 12, y, h, l, strlen(l));
-		text(c, menu_w - BEV - 12 - textw(a, strlen(a)), y, h, a,
-			strlen(a));
+		text_right(c, menu_w - BEV - 12, y, h, a);
 	}
 	wsurf_present(&menu_s, b);
 	return 1;
@@ -4313,8 +4385,8 @@ static void on_button(const struct pev *ev)
 	/* Scrolling only looks: a touchpad brushed while typing a name must
 	 * not drop it, nor answer the question before deleting. */
 	switch (ev->button) {
-	case B_WHEEL_UP: top -= 3; clamp_top(); dirty = 1; return;
-	case B_WHEEL_DOWN: top += 3; clamp_top(); dirty = 1; return;
+	case B_WHEEL_UP: scroll_to(top - 3); return;
+	case B_WHEEL_DOWN: scroll_to(top + 3); return;
 	}
 	if (pend)
 		answer_delete(0);
@@ -4345,10 +4417,8 @@ static void on_button(const struct pev *ev)
 			dragging = 1;
 			drag_off = y - sy;
 		} else {
-			top += y < sy ? -rows_vis() : rows_vis();
-			clamp_top();
+			scroll_to(top + (y < sy ? -rows_vis() : rows_vis()));
 		}
-		dirty = 1;
 	} else if (in(r_list, x, y)) {
 		int i = row_at(y);
 		if (i < 0)
@@ -4392,12 +4462,9 @@ static void on_motion(int y)
 		return;
 	int ty, th, sy, sh, vis = rows_vis();
 	sb_geom(&ty, &th, &sy, &sh);
-	if (th > sh && nents > vis) {
-		top = (int)((long)(y - drag_off - ty) * (nents - vis) /
-			(th - sh));
-		clamp_top();
-		dirty = 1;
-	}
+	if (th > sh && nents > vis)
+		scroll_to((int)((long)(y - drag_off - ty) * (nents - vis) /
+			(th - sh)));
 }
 
 static void on_release(const struct pev *ev)
