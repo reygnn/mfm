@@ -448,6 +448,17 @@ static int utf8_valid(const char *s)
 	return 1;
 }
 
+/* Text one path per line may carry it: valid UTF-8 without control
+ * characters. A newline would make two paths, and pasted into a terminal
+ * the second one runs as a command. */
+static int plain_path(const char *s)
+{
+	for (const unsigned char *u = (const unsigned char *)s; *u; u++)
+		if (*u < 0x20 || *u == 0x7f)
+			return 0;
+	return utf8_valid(s);
+}
+
 /* After a cut at a fixed length: drop a UTF-8 character the cut went into.
  * Only then, as a single high byte at the end may be a Latin-1 letter. */
 static void u8_cut(char *s)
@@ -2470,7 +2481,7 @@ static void clip_export(void)
 		fprintf(f[CB_URIS], "file://%s\r\n", url);
 		fprintf(f[CB_GNOME], "\nfile://%s", url);
 		fprintf(f[CB_PLAIN], "%s%s", i ? "\n" : "", p);
-		cb.plain &= utf8_valid(p);
+		cb.plain &= plain_path(p);
 	}
 	int bad = 0;
 	for (int i = 0; i < CB_N; i++)
@@ -2521,7 +2532,8 @@ static void clip_export(void)
 		unmark_all();
 		set_status(0, "%d item%s in the clipboard%s",
 			nnames, nnames == 1 ? "" : "s",
-			cb.plain ? "" : ", not as text: a name is not UTF-8");
+			cb.plain ? "" : ", not as text: a name is not UTF-8 or has a "
+			"control character in it");
 	} else {
 		set_status(1, "clipboard: %s", n ? msg : "no answer");
 	}

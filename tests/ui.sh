@@ -669,6 +669,16 @@ check "a Latin-1 name goes as a URL" 'clipget text/uri-list | grep -q "caf%E9"'
 check "... and not as text" '! clipget types | grep -q "^text/plain"'
 mfm_quit
 
+# A newline would make two paths of one, and the second a command in a terminal.
+fresh_dir clip3
+touch "$D/$(printf 'a\nrm -rf x')"
+mfm_start "$D"
+do_input key Down
+do_input key ctrl+shift+c
+check "a name with a newline goes as a URL" 'clipget text/uri-list | grep -q "a%0Arm"'
+check "... and not as text" '! clipget types | grep -q "^text/plain"'
+mfm_quit
+
 # ---- a scaled output ------------------------------------------------------
 
 # At scale 2 it draws twice the pixels: the first one of the selected row is the
