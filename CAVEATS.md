@@ -19,6 +19,30 @@ system included, since `rm` or emptying the trash would empty what is mounted. A
 point cannot be moved, nor can a folder with something mounted in it be moved to
 another file system. Copying works.
 
+mfm reads folders in its own process. A folder on a network file system that stops
+answering, or one that holds a link into such a file system, freezes the window until
+the file system answers or fails.
+
+A btrfs subvolume that is not mounted on its own counts as part of the mount it is in,
+except for the trash: what is in it goes to a trash at its top. Deleting a folder with
+a subvolume in it fails on the subvolume, which `rm --one-file-system` leaves alone.
+
+
+## Moves to another file system
+
+Such a move is a copy, and the original is removed once the copy is in place. A file
+added to the original folder while it is copied is removed with it, as with `mv`.
+
+FAT and exFAT keep no permissions, so copies there keep the times only. They hold no
+links either: an item with a link in it fails as a whole and is not copied.
+
+
+## Paths
+
+mfm keeps the path of a folder as it was reached, links and all, as the shell does.
+When a link on that path is pointed elsewhere while the folder is shown, what is done
+next is done in the folder it points to then.
+
 
 ## Input methods
 
