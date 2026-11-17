@@ -91,6 +91,7 @@
 
 struct ent {
 	char *name;
+	char *key;      /* strxfrm of the name: sorting compares these */
 	mode_t mode;
 	off_t size;
 	time_t mtime;
@@ -596,17 +597,24 @@ static uint32_t fold(uint32_t c)
 }
 
 /* Names from macOS and SMB are decomposed (NFD), what is typed is not:
- * both are compared composed. A name that is not UTF-8 stays as it is. */
+ * both are compared composed. pre is composed already; a name of ASCII
+ * only, as most are, is too, and needs no copy. A name that is not UTF-8
+ * stays as it is. */
 static int prefix_ci(const char *name, const char *pre)
 {
-	char *cn = g_utf8_normalize(name, -1, G_NORMALIZE_NFC);
-	char *cp = g_utf8_normalize(pre, -1, G_NORMALIZE_NFC);
-	const char *a = cn ? cn : name, *b = cp ? cp : pre;
+	const char *a = name, *b = pre;
+	char *cn = NULL;
+	for (const char *p = name; *p; p++)
+		if (*p & 0x80) {
+			a = cn = g_utf8_normalize(name, -1, G_NORMALIZE_NFC);
+			if (!cn)
+				a = name;
+			break;
+		}
 	int r = 1;
 	while (*b && r)
 		r = *a && fold(u8_next(&a)) == fold(u8_next(&b));
 	g_free(cn);
-	g_free(cp);
 	return r;
 }
 
@@ -1008,7 +1016,7 @@ static int ent_cmp(const void *a, const void *b)
 		r = x->mtime > y->mtime ? -1 : 1;
 	if (r)
 		return sort_rev ? -r : r;
-	r = strcoll(x->name, y->name);
+	r = strcmp(x->key ? x->key : x->name, y->key ? y->key : y->name);
 	if (!r)
 		r = strcmp(x->name, y->name);
 	return sort_rev && sort_by == SORT_NAME ? -r : r;
@@ -1016,9 +1024,26 @@ static int ent_cmp(const void *a, const void *b)
 
 static void free_ents(struct ent *v, int n)
 {
-	for (int i = 0; i < n; i++)
+	for (int i = 0; i < n; i++) {
 		free(v[i].name);
+		free(v[i].key);
+	}
 	free(v);
+}
+
+/* strcoll() compares in the locale's order, but it works that order out
+ * anew for each of the n log n comparisons: strxfrm() does it once per
+ * name. NULL without memory. */
+static char *coll_key(const char *s)
+{
+	size_t n = strxfrm(NULL, s, 0) + 1;
+	char *k = malloc(n);
+	if (k && strxfrm(k, s, n) >= n) {
+		free(k);
+		k = NULL;
+		errno = ENOMEM;
+	}
+	return k;
 }
 
 /* A Wayland message must fit in 4096 bytes and a path need not, so a very
@@ -1156,6 +1181,8 @@ static int load(const char *path, const char *select, int fallback)
 		if (!(e->name = strdup(nm)))
 			goto oom;
 		n++;
+		if (!(e->key = coll_key(nm)))
+			goto oom;
 		if (fstatat(fd, nm, &lst, AT_SYMLINK_NOFOLLOW) == 0) {
 			e->link = S_ISLNK(lst.st_mode);
 			if (!e->link || fstatat(fd, nm, &st, 0) != 0)
@@ -3096,14 +3123,16 @@ static void typeahead(const char *txt, int n)
 	search_ms = now;
 	last_idx = -1;
 	int start = fresh ? sel + 1 : sel;
+	char *pre = g_utf8_normalize(search, -1, G_NORMALIZE_NFC);
 	for (int k = 0; k < nents; k++) {
 		int i = (start + k) % nents;
-		if (prefix_ci(ents[i].name, search)) {
+		if (prefix_ci(ents[i].name, pre ? pre : search)) {
 			sel = i;
 			show_sel();
 			break;
 		}
 	}
+	g_free(pre);
 	dirty = 1;
 }
 
@@ -5279,9 +5308,13 @@ int main(int argc, char **argv)
 		 * (held keys, scrolling) cannot starve them. */
 		uint64_t now = now_ms();
 		job_poll();
+		/* A folder that keeps changing is read again each time: one that
+		 * takes long to read is not polled more often than leaves the
+		 * window three quarters of the time. */
 		if (now >= next_poll) {
 			poll_dir();
-			next_poll = now + POLL_MS;
+			uint64_t took = now_ms() - now;
+			next_poll = now + MAX(POLL_MS, 4 * took);
 		}
 		if (search[0] && now - search_ms >= TYPEAHEAD_MS) {
 			search[0] = 0;
