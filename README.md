@@ -56,7 +56,7 @@ folder and selects it. `-h` prints the usage, `-v` the version, which is set in
 | Delete | to the trash |
 | Shift+Delete | delete, after asking |
 | Esc | clear the search, the message or the marks |
-| Ctrl+Q, Ctrl+W | quit |
+| Ctrl+Q, Ctrl+W, Alt+F4 | quit |
 
 Commands act on the marked entries, else on the selected one. Ctrl+C and Ctrl+X keep
 the entries inside mfm; Ctrl+Shift+C offers them to other programs, for example to

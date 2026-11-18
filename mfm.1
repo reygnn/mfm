@@ -1,4 +1,4 @@
-.TH MFM 1 2026-11-15 mfm "User Commands"
+.TH MFM 1 2026-11-18 mfm "User Commands"
 .SH NAME
 mfm \- minimal file manager for Wayland
 .SH SYNOPSIS
@@ -134,8 +134,8 @@ In the input fields for the path, a rename and a new folder, Left, Right, Home a
 move the cursor, Backspace and Delete delete, Ctrl+U clears, Return confirms and Esc
 cancels.
 .PP
-Only moving and typing repeat when held: the arrow keys, PgUp and PgDn in the list,
-letters, and in input fields also Backspace, Delete, Left and Right.
+Only moving and typing repeat when held: Up and Down, in the list and the menu,
+letters, and in input fields also PgUp, PgDn, Left, Right, Backspace and Delete.
 During a search Backspace and Space repeat too.
 Everything else acts once per press: holding Backspace goes up one folder, holding
 Space marks one entry.
@@ -157,16 +157,17 @@ On a marked entry the marks stay: the commands act on all of them, while Open an
 Rename are offered only with at most one mark.
 On any other entry the menu selects just that one.
 On empty space it acts on the marks, else on the folder.
-While a copy or move runs, Paste, Rename, Move to trash, Delete and New folder are off.
+While a background job runs (see below), Paste, Rename, Move to trash, Delete, New
+folder and Send are off.
 .PP
 Press, drag onto a command and release, or click it; Up, Down and Return work too.
 Esc or a click elsewhere closes the menu.
 If the listing changed while the menu was open, the command does nothing.
 .SH FILES AND FOLDERS
 .SS Background work
-Copying, moving and permanent deletion run in a background process, and the window
-stays usable.
-Another such action, F2 and F7 included, waits until the running one is done.
+Copying, moving, permanent deletion and Ctrl+S run in a background process, and the
+window stays usable.
+Another such action, F2 and F7 included, is refused until the running one is done.
 Quitting mfm does not stop it.
 The status line shows the result or the first error.
 After Ctrl+X the remembered entries that could not be moved stay, to paste again;
