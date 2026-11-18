@@ -86,6 +86,10 @@
 #define POLL_MS 1000
 #define MAX_STEPS 20    /* wheel steps in one frame */
 #define MENU_CLICK_MS 300       /* a quicker click leaves the menu open */
+/* The widest that format_date() and human() give: the columns' widths. */
+#define DATE_WIDEST "0000-00-00 00:00"
+#define SIZE_WIDEST "0000.0 M"
+#define HIDE_HIDDEN "Hide hidden files"         /* the longer of the two */
 #ifndef MAX            /* glib has them too */
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -169,8 +173,8 @@ static struct {
 	size_t outlen;
 	int cut;                /* out is full, more was dropped */
 	char *keep;             /* a move: the items to try again, if known */
-	int keeping, idx;       /* in a JOB_KEEP line, and its index so far */
-	int bol;                /* at the start of a line */
+	char line[1300];        /* the line being read: report() keeps to 1200 */
+	size_t linelen;
 } job = { .fd = -1 };
 
 /* ---- Wayland ------------------------------------------------------------ */
@@ -626,25 +630,13 @@ static uint32_t fold(uint32_t c)
 	return c;
 }
 
-/* Names from macOS and SMB are decomposed (NFD), what is typed is not:
- * both are compared composed. pre is composed already; a name of ASCII
- * only, as most are, is too, and needs no copy. A name that is not UTF-8
- * stays as it is. */
+/* Does name start with pre, case folded? Both are composed (NFC) already. */
 static int prefix_ci(const char *name, const char *pre)
 {
 	const char *a = name, *b = pre;
-	char *cn = NULL;
-	for (const char *p = name; *p; p++)
-		if (*p & 0x80) {
-			a = cn = g_utf8_normalize(name, -1, G_NORMALIZE_NFC);
-			if (!cn)
-				a = name;
-			break;
-		}
 	int r = 1;
 	while (*b && r)
 		r = *a && fold(u8_next(&a)) == fold(u8_next(&b));
-	g_free(cn);
 	return r;
 }
 
@@ -860,6 +852,8 @@ static uint32_t setting(const char *env, const char *res, uint32_t def)
 	return def;
 }
 
+static int shape(const char *s, int n);
+
 static void theme_init(void)
 {
 	uint32_t bg = setting("MWC_INACTIVE", "background", 0xaeb2c3);
@@ -918,12 +912,9 @@ static void theme_init(void)
 	g_object_unref(ctx);    /* the layout holds its own */
 	rowh = font_asc + font_desc + 4;
 	barh = rowh + 6;
-	pango_layout_set_text(plo, "...", 3);
-	pango_layout_get_pixel_size(plo, &ell_w, NULL);
-	pango_layout_set_text(plo, "0000-00-00 00:00", 16);
-	pango_layout_get_pixel_size(plo, &date_w, NULL);
-	pango_layout_set_text(plo, "0000.0 M", 8);
-	pango_layout_get_pixel_size(plo, &size_w, NULL);
+	ell_w = shape("...", 3);
+	date_w = shape(DATE_WIDEST, strlen(DATE_WIDEST));
+	size_w = shape(SIZE_WIDEST, strlen(SIZE_WIDEST));
 }
 
 /* ---- small helpers ------------------------------------------------------ */
@@ -1017,6 +1008,7 @@ static int normalize(const char *in, char *out)
 	return 0;
 }
 
+/* At most as wide as SIZE_WIDEST. */
 static void human(off_t s, char *o, size_t n)
 {
 	const char *u = "BKMGTP";
@@ -2263,14 +2255,15 @@ static void report(int out, const char *fmt, ...)
 enum { T_CP, T_RM, T_CHMOD, T_N };
 
 /* Run cp, rm or chmod (looked up once) with the arguments in args, which ends
- * with NULL. */
+ * with NULL; at most TOOL_ARGS of them. */
 #define ARGS(...) ((const char *const []){ __VA_ARGS__, NULL })
+enum { TOOL_ARGS = 6 };
 static int tool(int which, const char *const *args, char *msg, size_t msz)
 {
 	static const char *const names[T_N] = { "cp", "rm", "chmod" };
 	static char path[T_N][PATH_MAX];
 	static int err[T_N] = { -1, -1, -1 };
-	char *argv[8];
+	char *argv[TOOL_ARGS + 2];
 	int n = 0;
 	if (err[which] < 0)
 		err[which] = find_prog(names[which], path[which]);
@@ -2280,8 +2273,13 @@ static int tool(int which, const char *const *args, char *msg, size_t msz)
 		return -1;
 	}
 	argv[n++] = (char *)names[which];
-	while (*args && n < 7)
+	while (*args) {
+		if (n > TOOL_ARGS) {
+			snprintf(msg, msz, "%s: too many arguments", names[which]);
+			return -1;
+		}
 		argv[n++] = (char *)*args++;
+	}
 	argv[n] = NULL;
 	return wait_prog(path[which], argv, msg, msz);
 }
@@ -2500,8 +2498,7 @@ static void start_job(int op, const char *sdir, char **names, int n,
 	job.cut = 0;
 	free(job.keep);
 	job.keep = op == OP_MOVE ? calloc(n, 1) : NULL;
-	job.keeping = 0;
-	job.bol = 1;
+	job.linelen = 0;
 	job.clip_gen = clip_gen;
 	snprintf(job.dir, sizeof job.dir, "%s", ddir);
 	snprintf(job.first, sizeof job.first, "%s", first ? first : "");
@@ -2588,6 +2585,29 @@ static void job_done(void)
 			job.op == OP_DELETE ? " permanently" : "");
 }
 
+/* A whole line from the worker: an item to keep, or a failure. */
+static void job_line(void)
+{
+	char *l = job.line;
+	size_t n = job.linelen;
+	job.linelen = 0;
+	l[n] = 0;
+	if (l[0] == JOB_KEEP) {
+		char *end;
+		long i = strtol(l + 1, &end, 10);
+		if (job.keep && end != l + 1 && i >= 0 && i < job.n)
+			job.keep[i] = 1;
+		return;
+	}
+	for (size_t k = 0; k <= n; k++) {
+		if (job.outlen < sizeof job.out - 1)
+			job.out[job.outlen++] = k < n ? l[k] : '\n';
+		else
+			job.cut = 1;
+	}
+	job.fails++;
+}
+
 /* Read what the worker reports, without blocking. */
 static void job_poll(void)
 {
@@ -2603,33 +2623,12 @@ static void job_poll(void)
 			return;
 		}
 		for (ssize_t i = 0; i < r; i++) {
-			char c = b[i];
-			int bol = job.bol;
-			job.bol = c == '\n';
-			if (!c) {
+			if (!b[i])
 				job.finished = 1;
-				continue;
-			}
-			if (bol && c == JOB_KEEP) {
-				job.keeping = 1;
-				job.idx = 0;
-				continue;
-			}
-			if (job.keeping) {
-				if (c >= '0' && c <= '9' && job.idx < job.n)
-					job.idx = job.idx * 10 + c - '0';
-				if (c == '\n') {
-					job.keeping = 0;
-					if (job.keep && job.idx < job.n)
-						job.keep[job.idx] = 1;
-				}
-				continue;
-			}
-			if (job.outlen < sizeof job.out - 1)
-				job.out[job.outlen++] = c;
-			else
-				job.cut = 1;
-			job.fails += c == '\n';
+			else if (b[i] == '\n')
+				job_line();
+			else if (job.linelen < sizeof job.line - 1)
+				job.line[job.linelen++] = b[i];
 		}
 	}
 }
@@ -2956,8 +2955,9 @@ static void paste(void)
  * first error line in the status line. */
 static void send_files(void)
 {
-	char b[2048], *av[34], name[256], cb[1024];
-	const char *src, *cmd = conf("MFM_SEND", "send", cb, sizeof cb, &src);
+	char b[2048], *av[34], name[256], cmdbuf[1024];
+	const char *src, *cmd = conf("MFM_SEND", "send", cmdbuf, sizeof cmdbuf,
+		&src);
 	if (!cmd) {
 		set_status(1, "nothing to send with: set Mfm*send in "
 			"~/.config/mfm/mfmrc or MFM_SEND");
@@ -3666,7 +3666,7 @@ static void bevel(struct rect r, int raised)
 	}
 }
 
-/* shape, textw and text take valid UTF-8 only; text_fit converts with
+/* shape and text take valid UTF-8 only; text_fit converts with
  * disp(). Shaping is the costly part of drawing: shape() once, then show()
  * what it laid out. */
 static int shape(const char *s, int n)
@@ -3684,11 +3684,6 @@ static void show(uint32_t c, int x, int y, int h)
 	set_rgb(c);
 	cairo_move_to(cr, x, base - pango_layout_get_baseline(plo) / PANGO_SCALE);
 	pango_cairo_show_layout(cr, plo);
-}
-
-static int textw(const char *s, int n)
-{
-	return shape(s, n);
 }
 
 static void text(uint32_t c, int x, int y, int h, const char *s, int n)
@@ -3755,7 +3750,7 @@ static int cut_prefix(const char *s, int n, int maxw)
 {
 	int lo = 0, hi = n, m;
 	while ((m = mid_char(s, lo, hi)) >= 0) {
-		if (textw(s, m) <= maxw)
+		if (shape(s, m) <= maxw)
 			lo = m;
 		else
 			hi = m;
@@ -3765,17 +3760,17 @@ static int cut_prefix(const char *s, int n, int maxw)
 
 static int fit_prefix(const char *s, int n, int maxw)
 {
-	return textw(s, n) <= maxw ? n : cut_prefix(s, n, maxw);
+	return shape(s, n) <= maxw ? n : cut_prefix(s, n, maxw);
 }
 
 /* Start of the longest suffix of s[0..n) that is at most maxw wide. */
 static int fit_suffix(const char *s, int n, int maxw)
 {
-	if (textw(s, n) <= maxw)
+	if (shape(s, n) <= maxw)
 		return 0;
 	int lo = 0, hi = n, m;
 	while ((m = mid_char(s, lo, hi)) >= 0) {
-		if (textw(s + m, n - m) <= maxw)
+		if (shape(s + m, n - m) <= maxw)
 			hi = m;
 		else
 			lo = m;
@@ -3867,7 +3862,7 @@ static void draw_input(struct rect r, const char *b, size_t cur,
 	text(xc_fg, x, r.y, r.h, d + start, seg);
 	pango_layout_set_attributes(plo, NULL);
 	if (end < n)
-		text(xc_fg, x + textw(d + start, seg), r.y, r.h, "...", 3);
+		text(xc_fg, x + shape(d + start, seg), r.y, r.h, "...", 3);
 	fill(px_fg, x + PANGO_PIXELS(at.x), r.y + 3, 1, r.h - 6);
 }
 
@@ -3957,9 +3952,13 @@ static void paint(void)
 	int lw = r_list.w - 2 * BEV, vis = rows_vis();
 	fill(px_list, lx, r_list.y + BEV, lw, r_list.h - 2 * BEV);
 	bevel(r_list, 0);
-	/* The date only where the name keeps at least as much room. */
-	int name_x = lx + 5 + rowh + 2, name_end = lx + lw - 8 - size_w - 14;
-	int show_date = name_end - date_w - 14 - name_x >= date_w;
+	/* Columns from the right: the date, if the name keeps at least as much
+	 * room as it takes, then the size, then the name. */
+	enum { GAP = 14, RIGHT = 8 };
+	int name_x = lx + 5 + rowh + 2, date_r = lx + lw - RIGHT;
+	int show_date = date_r - date_w - GAP - size_w - GAP - name_x >= date_w;
+	int size_r = show_date ? date_r - date_w - GAP : date_r;
+	int name_r = size_r - size_w - GAP;
 	for (int i = top; i < nents && i < top + vis; i++) {
 		const struct ent *e = &ents[i];
 		int y = ly + (i - top) * rowh;
@@ -3973,23 +3972,18 @@ static void paint(void)
 		if (e->mark)
 			fill(i == sel ? px_mark : px_sel, lx + 1, y, 3, rowh);
 		draw_icon(lx + 5, y, e);
-		int x = name_x, right = lx + lw - 8;
-		if (show_date) {
-			if (!e->up) {
-				if (e->nostat)
-					snprintf(s, sizeof s, "?");
-				else
-					format_date(e->mtime, s, sizeof s);
-				text_right(cd, right, y, rowh, s);
-			}
-			right -= date_w + 14;
+		if (show_date && !e->up) {
+			if (e->nostat)
+				snprintf(s, sizeof s, "?");
+			else
+				format_date(e->mtime, s, sizeof s);
+			text_right(cd, date_r, y, rowh, s);
 		}
 		if (!e->dir && !e->nostat) {
 			human(e->size, s, sizeof s);
-			text_right(cd, right, y, rowh, s);
+			text_right(cd, size_r, y, rowh, s);
 		}
-		right -= size_w + 14;
-		text_fit(c, x, y, rowh, right - x, e->name, 0);
+		text_fit(c, name_x, y, rowh, name_r - name_x, e->name, 0);
 	}
 
 	/* scrollbar */
@@ -4009,12 +4003,12 @@ static void paint(void)
 	if (prompt) {
 		const char *l = prompt == PR_RENAME ? "Rename to: " :
 			"New folder: ";
-		int lw = shape(l, strlen(l));
+		int labelw = shape(l, strlen(l));
 		show(xc_fg, in_s.x, in_s.y, in_s.h);
-		fill(px_paper, in_s.x + lw, in_s.y + BEV + 1, in_s.w - lw,
-			in_s.h - 2 * BEV - 2);
-		draw_input((struct rect){ in_s.x + lw + 3, in_s.y,
-			in_s.w - lw - 3, in_s.h }, pbuf, pcur, pfresh);
+		fill(px_paper, in_s.x + labelw, in_s.y + BEV + 1,
+			in_s.w - labelw, in_s.h - 2 * BEV - 2);
+		draw_input((struct rect){ in_s.x + labelw + 3, in_s.y,
+			in_s.w - labelw - 3, in_s.h }, pbuf, pcur, pfresh);
 		return;
 	}
 	if (!pend && !status_msg[0] && !search[0] && sel < nents &&
@@ -4159,7 +4153,7 @@ static void set_sort(int by)
 static const char *menu_label(int i)
 {
 	if (menu_items[i].id == M_HIDDEN && show_hidden)
-		return "Hide hidden files";
+		return HIDE_HIDDEN;
 	return menu_items[i].label;
 }
 
@@ -4291,7 +4285,7 @@ static void menu_enable(int row)
 static void menu_open(int px, int py, uint32_t serial, uint32_t t, int row)
 {
 	int ih = rowh + 4, aw = 0;
-	int lw = textw("Hide hidden files", strlen("Hide hidden files"));
+	int lw = shape(HIDE_HIDDEN, strlen(HIDE_HIDDEN));
 	menu_y[0] = BEV + 2;
 	for (int i = 0; i < NMENU; i++) {
 		int sep = menu_items[i].id == M_SEP;
@@ -4299,9 +4293,9 @@ static void menu_open(int px, int py, uint32_t serial, uint32_t t, int row)
 		menu_y[i + 1] = menu_y[i] + (gone ? 0 : sep ? 8 : ih);
 		if (sep || gone)
 			continue;
-		lw = MAX(lw, textw(menu_items[i].label,
+		lw = MAX(lw, shape(menu_items[i].label,
 			strlen(menu_items[i].label)));
-		aw = MAX(aw, textw(menu_items[i].accel,
+		aw = MAX(aw, shape(menu_items[i].accel,
 			strlen(menu_items[i].accel)));
 	}
 	int w = 2 * (BEV + 12) + lw + 32 + aw, h = menu_y[NMENU] + BEV + 2;
