@@ -551,16 +551,47 @@ static int is_bidi_control(uint32_t c)
 }
 
 /* Characters that do not show: a name could hide behind them. Format
- * characters (soft hyphen, word joiner, tags) and the Hangul fillers, which
- * look like nothing; not the joiners emoji are made with. */
+ * characters (soft hyphen, joiners, tags) and the Hangul fillers, which look
+ * like nothing; not the Arabic and Syriac marks of that class, which are
+ * drawn. joins() keeps those that join something. */
 static int is_invisible(uint32_t c)
 {
 	if (c < 0x20 || (c >= 0x7f && c <= 0x9f) || c == 0x2028 ||
 	    c == 0x2029 || c == 0x34f || c == 0x115f || c == 0x1160 ||
 	    c == 0x3164 || c == 0xffa0)
 		return 1;
-	return c >= 0xa0 && c != 0x200c && c != 0x200d &&
-		g_unichar_type(c) == G_UNICODE_FORMAT;
+	if ((c >= 0x600 && c <= 0x605) || c == 0x6dd || c == 0x70f ||
+	    c == 0x890 || c == 0x891 || c == 0x8e2 || c == 0x110bd ||
+	    c == 0x110cd)
+		return 0;
+	return c >= 0xa0 && g_unichar_type(c) == G_UNICODE_FORMAT;
+}
+
+/* Emoji and what goes between them in a sequence. */
+static int is_pict(uint32_t c)
+{
+	return (c >= 0x1f000 && c <= 0x1faff) || (c >= 0x2600 && c <= 0x27bf) ||
+		(c >= 0x2b00 && c <= 0x2bff) || c == 0xfe0f;
+}
+
+/* Scripts whose letters join, where a zero-width non-joiner keeps two apart. */
+static int is_joining(uint32_t c)
+{
+	return (c >= 0x600 && c <= 0x8ff) || (c >= 0x900 && c <= 0xdff);
+}
+
+/* Is the invisible c between prev and next part of what shows: a joiner in
+ * an emoji sequence or between joining letters, or a tag of a flag (black
+ * flag, then tags)? Elsewhere it would only hide. */
+static int joins(uint32_t prev, uint32_t c, uint32_t next)
+{
+	if (c == 0x200d)
+		return is_pict(prev) && is_pict(next);
+	if (c == 0x200c)
+		return is_joining(prev) && is_joining(next);
+	if (c >= 0xe0020 && c <= 0xe007f)
+		return prev == 0x1f3f4 || (prev >= 0xe0020 && prev <= 0xe007e);
+	return 0;
 }
 
 /* A valid UTF-8 copy of s for drawing (static buffer): Latin-1 bytes are
@@ -570,10 +601,16 @@ static const char *disp(const char *s)
 {
 	static char out[3 * PATH_MAX + 8];
 	size_t o = 0;
+	uint32_t prev = 0;
 	while (*s && o + 4 < sizeof out) {
-		uint32_t cp;
+		uint32_t cp, next = 0;
 		int n = u8_len((const unsigned char *)s, &cp);
-		if (n && (is_bidi_control(cp) || is_invisible(cp))) {
+		if (n && !u8_len((const unsigned char *)s + n, &next))
+			next = 0;
+		uint32_t before = prev;
+		prev = n ? cp : 0;
+		if (n && (is_bidi_control(cp) ||
+		    (is_invisible(cp) && !joins(before, cp, next)))) {
 			memcpy(out + o, "\xef\xbf\xbd", 3);
 			o += 3;
 			s += n;
@@ -3337,15 +3374,32 @@ static void typeahead(const char *txt, int n)
  * pressed on the way to "/" or "~" must not.
  */
 /* The cursor position before (dir < 0) or after c in b: a whole grapheme, a
- * flag or a letter with its marks, as Pango tells them apart. Text that is
- * not UTF-8 goes by a letter and the combining marks after it. */
+ * flag or a letter with its marks, as Pango tells them apart. Next to a byte
+ * that is not UTF-8 it goes by a letter and the combining marks after it. */
 static size_t grapheme_step(const char *b, size_t c, int dir)
 {
 	size_t len = strlen(b);
 	const char *p;
 	if (dir < 0 ? c == 0 : c >= len)
 		return c;
-	if (!g_utf8_validate(b, len, NULL)) {
+	/* The valid UTF-8 around c, between bytes that are not: a Latin-1
+	 * byte elsewhere in a path must not cost the rest its graphemes. */
+	size_t lo = 0, hi = len;
+	for (size_t i = 0; i < len;) {
+		uint32_t cp;
+		int l = u8_len((const unsigned char *)b + i, &cp);
+		if (!l) {
+			if (i < c) {
+				lo = i + 1;
+			} else {
+				hi = i;
+				break;
+			}
+			l = 1;
+		}
+		i += l;
+	}
+	if (dir < 0 ? c == lo : c == hi) {
 		if (dir < 0) {
 			while (c) {
 				c = u8_prev(b, c);
@@ -3856,6 +3910,10 @@ static void draw_input(struct rect r, const char *b, size_t cur,
 	if (maxw <= 2 * ew)
 		return;
 	stops_of(d, n);
+	/* What disp() replaced can make other graphemes than the raw text
+	 * has: the cursor goes to the start of the one it is in. */
+	while (dc > 0 && !cut_stop[dc])
+		dc--;
 	if (fit_prefix(d, n, maxw) < n) {
 		if (fit_prefix(d, dc, maxw - ew) < dc) {
 			start = fit_suffix(d, dc, maxw - 2 * ew);
