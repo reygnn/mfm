@@ -21,7 +21,7 @@ done
 export MWC_TEST_STATE=$SMOKE_DIR/state
 export XDG_DATA_HOME=$SMOKE_DIR/data
 export LC_ALL=C.UTF-8
-unset MFM_OPEN MFM_TERMINAL MFM_FONT MFM_SEND
+unset MFM_OPEN MFM_TERMINAL MFM_FONT MFM_SEND MWC_TERMINAL MFMT_TERMINAL
 SHOT=$SMOKE_DIR/ui.png
 MFM_PID=
 : >"$MFM_LOG"
@@ -36,7 +36,8 @@ TYPEAHEAD_MS=$(sed -n 's/^#define TYPEAHEAD_MS \([0-9]*\).*/\1/p' "$MFM_DIR/mfm.
 [ -n "$TYPEAHEAD_MS" ] || { echo "FAIL: no TYPEAHEAD_MS in mfm.c"; exit 1; }
 
 # What mfm_start runs to open a file: it writes the path to $SMOKE_DIR/opened.
-# OPEN=... before mfm_start runs that instead.
+# OPEN=... before mfm_start runs that instead, and MFMT_TERMINAL=... another
+# MFM_TERMINAL, none if empty.
 OPENER="sh -c 'printf %s \"\$1\" > \"\$0\"' $SMOKE_DIR/opened"
 
 # ---- helpers ---------------------------------------------------------------
@@ -51,15 +52,21 @@ content_origin() {
 	CY=$(($(get mfm y) + T + B))
 }
 
+# mfm_up: wait until the window of a mfm started by hand is up.
+mfm_up() {
+	check "mfm has a focused window" '[ "$(get mfm kbfocus)" = 1 ]'
+	content_origin
+	wait_shot_pixel "the window is drawn" $((CX + 1)) $((CY + 1)) "$BG"
+}
+
 # mfm_start <directory>: run mfm there and wait until its window is up.
 mfm_start() {
 	# The marker holds the path of what was opened.
 	WAYLAND_DEBUG=${MFM_DEBUG:-} WAYLAND_DISPLAY=wayland-0 MFM_OPEN=${OPEN:-$OPENER} \
-		MFM_TERMINAL="touch $SMOKE_DIR/term-ran" "$MFM" "$1" >>"$MFM_LOG" 2>&1 &
+		MFM_TERMINAL=${MFMT_TERMINAL-"touch $SMOKE_DIR/term-ran"} "$MFM" "$1" \
+		>>"$MFM_LOG" 2>&1 &
 	MFM_PID=$!
-	check "mfm has a focused window" '[ "$(get mfm kbfocus)" = 1 ]'
-	content_origin
-	wait_shot_pixel "the window is drawn" $((CX + 1)) $((CY + 1)) "$BG"
+	mfm_up
 	find_rows
 }
 
@@ -73,15 +80,25 @@ mfm_quit() {
 	MFM_PID=
 }
 
-# job_settled: wait until no worker runs below mfm any more. That alone says nothing
-# about a job that has not started yet: wait for what it does first.
+# job_settled: wait until no worker runs below mfm any more; the clipboard's helper,
+# mfm-clip, does not count. That alone says nothing about a job that has not started
+# yet: wait for what it does first.
 job_settled() {
-	local i
+	local i p busy
 	for ((i = 0; i < 100; i++)); do
-		pgrep -P "$MFM_PID" >/dev/null || return 0
+		busy=
+		for p in $(pgrep -P "$MFM_PID"); do
+			[ "$(cat "/proc/$p/comm" 2>/dev/null)" = mfm-clip ] || busy=1
+		done
+		[ -z "$busy" ] && return 0
 		sleep 0.1
 	done
 	fail "the job did not end"
+}
+
+# trashed_from <end of a path>: the trash holds what was at a path that ends so.
+trashed_from() {
+	grep -lq "^Path=.*$1\$" "$XDG_DATA_HOME"/Trash/info/*.trashinfo 2>/dev/null
 }
 
 # end_search: wait until a type-ahead is over, so the next letter starts a new one
@@ -100,9 +117,12 @@ mfm_alive() {
 	kill -0 "$MFM_PID" 2>/dev/null || fail "$1: mfm is gone"
 }
 
-# Pixels of the error colour in the status line, in the last shot.
+# Pixels of the error colour in the status line, in the last shot: the bar at the
+# bottom, PAD from the edge and ROWH + 6 high. The Shift+Delete question has that
+# colour too.
 err_pixels() {
-	build/pngtool count "$SHOT" "$CX" $((CY + $(get mfm h) - 40)) 600 40 "$ERR" 6
+	build/pngtool count "$SHOT" "$CX" $((CY + $(get mfm h) - 6 - ROWH - 6 + 2)) 600 \
+		$((ROWH + 2)) "$ERR" 6
 }
 
 # wait_err <what>: an error shows in the status line.

@@ -1,7 +1,7 @@
 #!/bin/bash
 # What file operations do around mounts, full disks and read-only directories, with
-# real mounts in a private namespace, driven through mfm under a headless mwc. Skipped
-# where unprivileged user namespaces are not available. See common.sh for the rest of
+# real mounts in a private namespace, driven through mfm under a headless mwc. Needs
+# unprivileged user namespaces, and fails without them. See common.sh for the rest of
 # what it needs. Output goes to build/files.log and build/files-mfm.log.
 #
 # It runs in three stages: this script, again as root of a user namespace to set up
@@ -9,7 +9,9 @@
 SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 
 if [ -z "${MFMT_STAGE:-}" ]; then
-	unshare -Urm true 2>/dev/null || { echo "SKIP: no user namespaces here"; exit 0; }
+	# Not a skip: a green run must have tried the file operations.
+	unshare -Urm true 2>/dev/null ||
+		{ echo "FAIL: no user namespaces here (make test-docker has them)"; exit 1; }
 	MFMT_ROOT=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/mfmt.XXXXXX") || exit 1
 	MFMT_STAGE=mounts MFMT_ROOT=$MFMT_ROOT MFMT_UID=$(id -u) MFMT_GID=$(id -g) \
 		unshare -Urm bash "$SELF"
@@ -44,6 +46,19 @@ if [ "$MFMT_STAGE" = mounts ]; then
 		"$R/src/zc1"
 	chmod 555 "$R/src/rofull" "$R/src/roempty" "$R/src/rotrash" "$R/src/tree/sub"
 	chmod 000 "$R/src/tree/secret"
+	echo u >"$R/src/umask640"
+	chmod 640 "$R/src/umask640"
+	# File systems of their own with a shared trash an administrator made, sticky as
+	# it has to be, and one that is not sticky and so must not be used.
+	mkdir -p "$R/shared" "$R/nosticky"
+	mount -t tmpfs none "$R/shared" || exit 1
+	mount -t tmpfs none "$R/nosticky" || exit 1
+	mkdir "$R/shared/.Trash" "$R/nosticky/.Trash"
+	chmod 1777 "$R/shared/.Trash"
+	chmod 777 "$R/nosticky/.Trash"
+	echo s >"$R/shared/s1"
+	echo n >"$R/nosticky/n1"
+	chmod 777 "$R/shared" "$R/nosticky"
 	# A link in a folder it cannot be removed from, to a read-only folder.
 	ln -s "$R/victim" "$R/rolink/ln"
 	chmod 555 "$R/rolink" "$R/victim"
@@ -288,6 +303,40 @@ wait_for "... and the original goes" test ! -e "$R/src/rofull"
 job_settled
 [ "$(stat -c %a "$R/dst/rofull")" = 555 ] || fail "the moved folder lost its mode"
 no_hidden_left "$R/dst" "moving a read-only folder with a file in it"
+mfm_quit
+
+# A umask that takes the owner's bits must not look like FAT: the temporary folder
+# is made usable, and the copy keeps its mode.
+umask 0277
+mfm_start "$R/src"
+umask 022
+type_name uma
+do_input key ctrl+c
+to_dir wide
+do_input key ctrl+v
+wait_for "a copy under umask 0277" test -e "$R/wide/umask640"
+job_settled
+[ "$(stat -c %a "$R/wide/umask640")" = 640 ] || fail "the copy lost its mode"
+echo "ok: ... keeps its mode"
+mfm_quit
+
+# ---- trash at the top of a file system ---------------------------------------
+
+mfm_start "$R/shared"
+do_input key Down
+do_input key Delete
+wait_for "a file goes to the trash on its file system" test ! -e "$R/shared/s1"
+[ -e "$R/shared/.Trash/$(id -u)/files/s1" ] || fail "not in the shared .Trash/\$uid"
+echo "ok: ... into the shared .Trash/\$uid"
+mfm_quit
+
+mfm_start "$R/nosticky"
+do_input key Down
+do_input key Delete
+wait_for "a file goes to the trash on its file system" test ! -e "$R/nosticky/n1"
+[ -e "$R/nosticky/.Trash-$(id -u)/files/n1" ] || fail "not in .Trash-\$uid"
+[ ! -e "$R/nosticky/.Trash/$(id -u)" ] || fail "a .Trash that is not sticky was used"
+echo "ok: ... into .Trash-\$uid when .Trash is not sticky"
 mfm_quit
 
 # ---- the directory on screen ------------------------------------------------

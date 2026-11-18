@@ -76,8 +76,8 @@ uninstall:
 		$(DESTDIR)$(PREFIX)/share/applications/mfm.desktop \
 		$(DESTDIR)$(PREFIX)/share/man/man1/mfm.1
 
-# Needs a built mwc next to this directory, or in MWC_DIR, and grim. files.sh also
-# needs unprivileged user namespaces, and is skipped without them.
+# Needs a built mwc next to this directory, or in MWC_DIR, grim and pgrep. files.sh
+# also needs unprivileged user namespaces, and fails without them.
 test: mfm build/clipget
 	tests/ui.sh
 	tests/files.sh

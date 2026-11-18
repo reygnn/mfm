@@ -119,8 +119,9 @@ design and review the changes; Claude writes most of the code and the tests. The
 
 runs mfm under a headless mwc with a simulated mouse and keyboard and checks files and
 screenshots (`tests/ui.sh`), and file operations with real mounts in a private
-namespace (`tests/files.sh`, skipped without user namespaces). It needs a built mwc with
-`build/vinput` and `build/pngtool` in `MWC_DIR` (by default `../mwc`), and grim.
+namespace (`tests/files.sh`, which fails without user namespaces). It needs a built mwc
+with `build/vinput` and `build/pngtool` in `MWC_DIR` (by default `../mwc`), grim and
+pgrep.
 
     make test-docker
 

@@ -104,9 +104,17 @@ last_damage_h() {
 	grep -o 'damage_buffer(0, [0-9]*, 680, [0-9]*)' "$MFM_LOG" | tail -1 |
 		sed 's/.*, \([0-9]*\))/\1/'
 }
+# How many rectangles the last commit with damage of the window had.
+damage_rects() {
+	awk '/damage_buffer\(0, [0-9]+, 680, [0-9]+\)/ { n++ }
+	/wl_surface#[0-9]+\.commit\(\)/ { if (n) last = n; n = 0 }
+	END { print last + 0 }' "$MFM_LOG"
+}
 do_input key Down
 check "a new selection damages only the rows that changed" \
 	'h=$(last_damage_h); [ "${h:-480}" -lt 480 ]'
+check "... the rows near the top and the status line as two rectangles" \
+	'[ "$(damage_rects)" -ge 2 ]'
 mfm_quit
 
 # ---- context menu ----------------------------------------------------------
@@ -204,7 +212,7 @@ do_input click right
 menu_up "$X" "$(row_y 3)"
 for _ in 1 2 3 4 5 6; do do_input key Down; done
 do_input key Return
-file_appears "the menu moves a file to the trash" "$XDG_DATA_HOME/Trash/files/one.txt"
+wait_for "the menu moves a file to the trash" trashed_from /menu/one.txt
 [ ! -e "$D/one.txt" ] || fail "one.txt still there"
 
 mfm_quit
@@ -515,6 +523,280 @@ mfm_alive "Ctrl+A twice, then Delete on .."
 echo "ok: Ctrl+A again unmarks"
 mfm_quit
 
+# ---- keys and settings -------------------------------------------------------
+
+# Ctrl+T without MFM_TERMINAL takes mwc's terminal, a command for sh as mwc runs it:
+# MWC_TERMINAL, else Mwm*terminal from mwmrc.
+fresh_dir term
+MFMT_TERMINAL= MWC_TERMINAL="X=1 touch '$SMOKE_DIR/mwc term'" mfm_start "$D"
+do_input key ctrl+t
+file_appears "MWC_TERMINAL runs with sh -c" "$SMOKE_DIR/mwc term"
+mfm_quit
+mkdir -p "$XDG_CONFIG_HOME/mwc"
+printf 'Mwm*terminal: touch %s/mwmt\n' "$SMOKE_DIR" >"$XDG_CONFIG_HOME/mwc/mwmrc"
+MFMT_TERMINAL= mfm_start "$D"
+do_input key ctrl+t
+file_appears "... and Mwm*terminal after it" "$SMOKE_DIR/mwmt"
+mfm_quit
+rm "$XDG_CONFIG_HOME/mwc/mwmrc"
+
+# Up and Down repeat when held.
+fresh_dir repeat
+for i in $(seq 10 39); do touch "$D/f$i"; done
+mfm_start "$D"
+do_input press Down
+sleep 1.2       # past the repeat delay
+do_input lift Down
+do_input key F2
+do_input key z
+do_input key Return
+file_appears "Down held moves on" "$D/z"
+[ -e "$D/f10" ] && [ -e "$D/f11" ] || fail "Down held moved one row"
+echo "ok: ... several rows"
+mfm_quit
+
+# PgDn goes a page down, PgUp a page up, back to "..".
+fresh_dir pages
+for i in $(seq 10 59); do touch "$D/f$i"; done
+mfm_start "$D"
+do_input key Next
+do_input key F2
+do_input key z
+do_input key Return
+file_appears "PgDn goes a page down" "$D/z"
+[ -e "$D/f10" ] && [ -e "$D/f12" ] || fail "PgDn moved too little"
+for _ in 1 2 3 4; do do_input key Prior; done
+do_input key F2
+wait_err "PgUp goes back up to .., which F2 cannot rename"
+mfm_quit
+
+# Esc takes back one thing at a time: the marks, the search, the message.
+fresh_dir esc
+touch "$D/a" "$D/b"
+mfm_start "$D"
+do_input hold ctrl
+do_input move $((LISTX + 40)) "$(row_y 2)"
+do_input click left
+do_input release ctrl
+do_input key Escape
+do_input key Up
+do_input key Delete
+wait_for "Esc unmarks: Delete takes the selection" test ! -e "$D/a"
+[ -e "$D/b" ] || fail "Esc left b marked"
+do_input key b
+do_input key Escape
+do_input key BackSpace
+do_input key F7
+for k in e s c n; do do_input key "$k"; done
+do_input key Return
+file_appears "Esc ends the search: BackSpace goes up" "$(dirname "$D")/escn"
+do_input key Home
+do_input key F2
+wait_err "F2 on .. is an error"
+do_input key Escape
+no_err "Esc clears the message"
+mfm_quit
+
+# Shift+Delete takes j as well as y.
+fresh_dir jdel
+touch "$D/a"
+mfm_start "$D"
+do_input key Down
+do_input key shift+Delete
+do_input key j
+wait_for "Shift+Delete, then j, deletes" test ! -e "$D/a"
+mfm_quit
+
+# Going up skips a folder that can be passed but not listed, and says so.
+fresh_dir skip
+mkdir -p "$D/a/b"
+chmod 111 "$D/a"
+mfm_start "$D/a/b"
+do_input key BackSpace
+wait_err "going up past a folder that cannot be listed says so"
+do_input key F7
+for k in s k; do do_input key "$k"; done
+do_input key Return
+file_appears "... and lands above it" "$D/sk"
+chmod 755 "$D/a"
+mfm_quit
+
+# Alt+Up, Ctrl+Shift+N, Right on a folder, Alt+Home and the parent button.
+fresh_dir nav
+mkdir -p "$D/home" "$D/a/b"
+HOME=$D/home mfm_start "$D/a/b"
+do_input key alt+Up
+do_input key ctrl+shift+n
+do_input key x
+do_input key Return
+file_appears "Alt+Up goes up, Ctrl+Shift+N makes a folder" "$D/a/x"
+do_input key Home
+do_input key Down
+do_input key Right
+do_input key F7
+do_input key r
+do_input key Return
+file_appears "Right opens a folder" "$D/a/b/r"
+do_input key alt+Home
+do_input key F7
+do_input key h
+do_input key Return
+file_appears "Alt+Home goes home" "$D/home/h"
+do_input move $((CX + 6 + (ROWH + 6) / 2)) $((CY + 6 + (ROWH + 6) / 2))
+do_input click left
+do_input key F7
+do_input key p
+do_input key Return
+file_appears "the parent button goes up" "$D/p"
+mfm_quit
+
+# A double click opens; Ctrl+W quits.
+fresh_dir dclick
+touch "$D/f.txt"
+mfm_start "$D"
+rm -f "$SMOKE_DIR/opened"
+do_input move $((LISTX + 40)) "$(row_y 1)"
+do_input click left
+do_input click left
+file_appears "a double click opens" "$SMOKE_DIR/opened"
+[ "$(cat "$SMOKE_DIR/opened")" = "$D/f.txt" ] || fail "opened $(cat "$SMOKE_DIR/opened")"
+rm -f "$SMOKE_DIR/opened"
+do_input key ctrl+w
+wait "$MFM_PID"
+status=$?
+[ "$status" = 0 ] || fail "Ctrl+W: mfm exited with status $status"
+check "Ctrl+W quits" '[ -z "$(get mfm w)" ]'
+MFM_PID=
+
+# Ctrl+R reads the folder again, also when its time says it did not change.
+fresh_dir reread
+touch "$D/a"
+touch -d 2020-01-01 "$D"
+mfm_start "$D"
+touch "$D/zz"
+touch -d 2020-01-01 "$D"
+do_input key ctrl+r
+do_input key z
+do_input key z
+do_input key F2
+do_input key q
+do_input key Return
+file_appears "Ctrl+R shows what came" "$D/q"
+mfm_quit
+
+# Esc in F2 renames nothing; Ctrl+U empties the field.
+fresh_dir prompt
+touch "$D/a.txt"
+mfm_start "$D"
+do_input key Down
+do_input key F2
+do_input key x
+do_input key Escape
+mfm_alive "Esc closes the prompt"
+[ -e "$D/a.txt" ] && [ ! -e "$D/x.txt" ] || fail "Esc renamed"
+do_input key F2
+do_input key End
+do_input key ctrl+u
+for k in n e w; do do_input key "$k"; done
+do_input key Return
+file_appears "Ctrl+U empties the field" "$D/new"
+mfm_quit
+
+# Mfm*sortReverse in mfmrc, and words for values that mean nothing.
+fresh_dir rcsort
+touch "$D/a" "$D/b"
+mkdir -p "$XDG_CONFIG_HOME/mfm"
+printf 'Mfm*sortReverse: true\nMfm*showHidden: ture\n' >"$XDG_CONFIG_HOME/mfm/mfmrc"
+mfm_start "$D"
+do_input key Down
+do_input key F2
+do_input key z
+do_input key Return
+file_appears "Mfm*sortReverse puts b first" "$D/z"
+[ -e "$D/a" ] || fail "a came first"
+grep -qF 'ignoring Mfm*showHidden "ture"' "$MFM_LOG" || fail "no word about showHidden: ture"
+echo "ok: ... and a boolean that means nothing is said so"
+mfm_quit
+printf 'Mfm*sort: sideways\n' >"$XDG_CONFIG_HOME/mfm/mfmrc"
+mfm_start "$D"
+grep -qF 'ignoring Mfm*sort "sideways"' "$MFM_LOG" || fail "no word about sort: sideways"
+do_input key Down
+do_input key F2
+do_input key y
+do_input key Return
+file_appears "a bad Mfm*sort sorts by name" "$D/y"
+[ -e "$D/z" ] || fail "z came first"
+mfm_quit
+rm "$XDG_CONFIG_HOME/mfm/mfmrc"
+
+# A folder whose name starts with "-" as ./-name.
+fresh_dir dash
+mkdir "$D/-x"
+(cd "$D" && exec env WAYLAND_DISPLAY=wayland-0 MFM_OPEN="$OPENER" \
+	MFM_TERMINAL="touch $SMOKE_DIR/term-ran" "$MFM" ./-x) >>"$MFM_LOG" 2>&1 &
+MFM_PID=$!
+mfm_up
+do_input key F7
+do_input key n
+do_input key Return
+file_appears "mfm ./-x opens it" "$D/-x/n"
+mfm_quit
+
+# What is in the trash is not trashed again.
+fresh_dir intrash
+touch "$D/trashme"
+mfm_start "$D"
+do_input key Down
+do_input key Delete
+wait_for "trashme goes to the trash" test ! -e "$D/trashme"
+mfm_quit
+mfm_start "$XDG_DATA_HOME/Trash/files"
+for k in t r a s h m e; do do_input key "$k"; done
+do_input key Delete
+wait_err "Delete in the trash is refused"
+[ -e "$XDG_DATA_HOME/Trash/files/trashme" ] || fail "trashme left the trash"
+mfm_quit
+
+# ---- names that hide or run together ----------------------------------------
+
+# A soft hyphen does not show: it shows as U+FFFD, so a<SHY>b does not look like ab.
+fresh_dir invisible
+touch "$D/ab" "$D/$(printf 'a\xc2\xadb')"
+MFM_FONT="DejaVu Sans Bold 24" mfm_start "$D"
+ink() {
+	build/pngtool count "$SHOT" $((CX + 20)) $((ROW0 + $1 * ROWH + 1)) 300 $((ROWH - 2)) \
+		000000
+}
+[ "$(ink 2)" -gt "$(ink 1)" ] ||
+	fail "a soft hyphen hides: the rows have $(ink 1) and $(ink 2) dark pixels"
+echo "ok: a soft hyphen shows"
+mfm_quit
+
+# A flag is two code points and one character: Backspace takes it whole.
+fresh_dir flag
+mkdir "$D/x$(printf '\xf0\x9f\x87\xa9\xf0\x9f\x87\xaa')"
+mfm_start "$D"
+do_input key Down
+do_input key F2
+do_input key End
+do_input key BackSpace
+do_input key Return
+file_appears "Backspace takes a flag whole" "$D/x"
+mfm_quit
+
+# A long name in Latin-1: bytes from 0x80 to 0xbf are letters there, and the stem
+# of a copy keeps as many as fit.
+fresh_dir latinlong
+L=$(printf '\xb0%.0s' $(seq 1 255))
+K=$(printf '\xb0%.0s' $(seq 1 248))
+echo x >"$D/$L"
+mfm_start "$D"
+do_input key Down
+do_input key ctrl+c
+do_input key ctrl+v
+file_appears "a long Latin-1 name keeps its stem in a copy" "$D/$K (copy)"
+mfm_quit
+
 # ---- names the protocol or Pango could trip over ---------------------------
 
 # Latin-1 doubles in length for display, which would make a title longer than
@@ -821,7 +1103,9 @@ rm "$XDG_CONFIG_HOME/mfm/mfmrc"
 # rgb: takes hex digits only, as mwc: no sign, blank or 0x. Each gives the default.
 for c in rgb:-1/0/0 rgb:-f/0/0 'rgb: f/0/0' rgb:0xf/0/0; do
 	MWC_INACTIVE=$c mfm_start "$D"
-	echo "ok: $c is no colour"
+	grep -qF "ignoring MWC_INACTIVE \"$c\": not a colour" "$MFM_LOG" ||
+		fail "$c: no word about it on stderr"
+	echo "ok: $c is no colour, and mfm says so"
 	mfm_quit
 done
 
@@ -853,7 +1137,9 @@ dim_px() {
 	build/pngtool count "$SHOT" $((CX + $(get mfm w) - 220)) $((ROW0 + ROWH + 1)) 180 \
 		$((ROWH - 2)) 3d3e44 6
 }
-MFM_FONT="Sans Bold 24" mfm_start "$D"
+MFM_FONT="DejaVu Sans Bold 24" mfm_start "$D"
+name=$(build/pngtool count "$SHOT" $((CX + 20)) $((ROW0 + ROWH + 1)) 200 $((ROWH - 2)) 000000)
+[ "$name" -gt 0 ] || fail "no name in the row the date is looked for in"
 [ "$(dim_px)" = 0 ] || fail "a big font in a small window shows the date"
 echo "ok: a big font in a small window leaves the date out"
 # Dimmed text, the date here, as far as 4.5:1 allows: 3d3e44 on aeb2c3. The old 0.6
@@ -896,7 +1182,7 @@ clipget() { WAYLAND_DISPLAY=wayland-0 "$CLIPGET" "$@" 2>>"$LOG"; }
 # Only this test's own: the box may share the host's processes.
 clip_procs() {
 	local p
-	for p in $(pgrep -x mfm); do
+	for p in $(pgrep -x mfm-clip); do
 		[ "$p" = "$MFM_PID" ] && continue
 		{ tr '\0' '\n' <"/proc/$p/environ"; } 2>/dev/null | grep -qx "SMOKE_DIR=$SMOKE_DIR" &&
 			echo "$p"
@@ -911,7 +1197,7 @@ do_input key Down
 do_input key ctrl+c
 do_input key ctrl+v
 file_appears "Ctrl+C, Ctrl+V" "$D/zz (copy).txt"
-check "plain Ctrl+C leaves the clipboard alone" '! clipget types >/dev/null'
+check "plain Ctrl+C leaves the clipboard alone" 'clipget types >/dev/null; [ $? = 3 ]'
 do_input key Home
 do_input key Down
 do_input key ctrl+shift+c
@@ -955,6 +1241,56 @@ do_input key ctrl+shift+c
 check "a name with a newline goes as a URL" 'clipget text/uri-list | grep -q "a%0Arm"'
 check "... and not as text" '! clipget types | grep -q "^text/plain"'
 mfm_quit
+
+# ---- file descriptors --------------------------------------------------------
+
+# Started with stdin, stdout and stderr closed, mfm must not hand its Wayland
+# connection to a job: quitting during one would leave the window up.
+fresh_dir fds
+touch "$D/a.txt"
+SHIM=$SMOKE_DIR/shim
+mkdir -p "$SHIM"
+REAL_CP=$(command -v cp)
+cat >"$SHIM/cp" <<EOS
+#!/bin/sh
+[ -e "$SHIM/hang" ] && { echo \$\$ >"$SHIM/hung.tmp"; mv "$SHIM/hung.tmp" "$SHIM/hung"; exec sleep 300; }
+exec "$REAL_CP" "\$@"
+EOS
+chmod +x "$SHIM/cp"
+touch "$SHIM/hang"
+PATH=$SHIM:$PATH WAYLAND_DISPLAY=wayland-0 "$MFM" "$D" <&- >&- 2>&- &
+MFM_PID=$!
+mfm_up
+do_input key Down
+do_input key ctrl+c
+do_input key ctrl+v
+file_appears "the copy hangs in cp" "$SHIM/hung"
+do_input key ctrl+q
+wait "$MFM_PID"
+MFM_PID=
+check "quit during a job, the window goes" '[ -z "$(get mfm w)" ]'
+kill "$(cat "$SHIM/hung")"
+rm -f "$SHIM/hang" "$SHIM/hung"
+
+# The clipboard's helper outlives mfm, but not as a writer of mfm's output: what
+# reads that gets its end when mfm quits.
+fresh_dir helperout
+touch "$D/a.txt"
+mkfifo "$SMOKE_DIR/out.fifo"
+cat "$SMOKE_DIR/out.fifo" >/dev/null &
+READER=$!
+WAYLAND_DISPLAY=wayland-0 "$MFM" "$D" >"$SMOKE_DIR/out.fifo" 2>&1 &
+MFM_PID=$!
+mfm_up
+do_input key Down
+do_input key ctrl+shift+c
+check "the helper has the clipboard" 'clipget types | grep -qx text/uri-list'
+do_input key ctrl+q
+wait "$MFM_PID"
+MFM_PID=
+check "the window is gone" '[ -z "$(get mfm w)" ]'
+wait_for "what reads mfm's output gets its end" eval '! kill -0 "$READER" 2>/dev/null'
+rm "$SMOKE_DIR/out.fifo"
 
 # ---- a scaled output ------------------------------------------------------
 

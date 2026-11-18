@@ -13,7 +13,7 @@ CLAUDE.md.
 | `make test-docker` | the same in a Podman container, image `mfm-test` |
 
 Use `make test-docker`: the host lacks grim, and Ubuntu's AppArmor blocks the user
-namespaces `tests/files.sh` needs, which skips it. `make test` needs a built mwc with
+namespaces `tests/files.sh` needs, which then fails. `make test` needs a built mwc with
 `build/vinput` and `build/pngtool` in `MWC_DIR` (default `../mwc`).
 
 Polling helpers: `check`, `wait_for`, `pixel_is`, `reload_mwc` from mwc's

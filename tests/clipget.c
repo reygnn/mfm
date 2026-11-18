@@ -4,7 +4,8 @@
  *   clipget types          prints the offered types, one per line
  *   clipget TYPE           writes the clipboard as TYPE to stdout
  *
- * Exits 1 when the clipboard is empty or does not have that type.
+ * Exits 3 when the clipboard is empty, 1 when it does not have that type or
+ * clipget fails.
  */
 #define _GNU_SOURCE
 #include <stdbool.h>
@@ -107,9 +108,9 @@ int main(int argc, char *argv[])
 	ext_data_control_device_v1_add_listener(device, &device_listener, NULL);
 	while (!got_selection && wl_display_roundtrip(display) >= 0)
 		;
-	if (!selection) {
+	if (!selection) {       /* not a failure of clipget: 3 tells them apart */
 		fprintf(stderr, "clipget: the clipboard is empty\n");
-		return 1;
+		return 3;
 	}
 	if (strcmp(argv[1], "types") == 0) {
 		for (int i = 0; i < n_types; i++)
