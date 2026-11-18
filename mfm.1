@@ -312,7 +312,9 @@ or
 .B Mwm*terminal
 in mwmrc, which runs with
 .BR "sh \-c" ,
-as mwc runs it;
+as mwc runs it, with only the absolute entries of
+.BR $PATH ;
+as with mwc, a failure of that command does not show;
 else the first found of foot, xterm, uxterm, x\-terminal\-emulator, urxvt, alacritty,
 konsole, kitty, xfce4\-terminal and gnome\-terminal.
 .TP

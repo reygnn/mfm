@@ -1363,6 +1363,29 @@ static int find_prog(const char *prog, char *out)
 	return err;
 }
 
+/* $PATH without its empty and relative entries, which find_prog skips. */
+static void abs_path(char *out, size_t n)
+{
+	const char *path = getenv("PATH");
+	size_t o = 0;
+	if (!path || !*path)
+		path = "/usr/local/bin:/usr/bin:/bin";
+	out[0] = 0;
+	for (const char *p = path;;) {
+		size_t len = strcspn(p, ":");
+		if (len > 0 && p[0] == '/' && o + len + 2 < n) {
+			if (o)
+				out[o++] = ':';
+			memcpy(out + o, p, len);
+			o += len;
+			out[o] = 0;
+		}
+		if (!p[len])
+			break;
+		p += len + 1;
+	}
+}
+
 /* Split "xterm -fa 'DejaVu Sans Mono'" into words; quotes group, nothing
  * else is special. Returns the word count, or -1 if malformed or too long. */
 static int split_cmd(const char *cmd, char *b, size_t bsz, char **argv,
@@ -1399,8 +1422,9 @@ static int split_cmd(const char *cmd, char *b, size_t bsz, char **argv,
 	return argc;
 }
 
-/* fork + exec; returns the exec errno, or 0 once the program runs. */
-static int spawn(const char *prog, char *const argv[])
+/* fork + exec; returns the exec errno, or 0 once the program runs. With
+ * path, the child's $PATH is that. */
+static int spawn(const char *prog, char *const argv[], const char *path)
 {
 	/* Start in the browsed directory if we may, else somewhere sane. */
 	const char *dir = cwd;
@@ -1431,6 +1455,8 @@ static int spawn(const char *prog, char *const argv[])
 		}
 		/* The logical path, so a shell shows the symlinked name. */
 		setenv("PWD", dir, 1);
+		if (path)
+			setenv("PATH", path, 1);
 		execv(prog, argv);
 		int e = errno;
 		if (write(p[1], &e, sizeof e) < 0) {
@@ -1462,7 +1488,7 @@ static int run(const char *cmd, const char *arg, char *name, size_t nsz)
 		argv[argc] = NULL;
 	}
 	int e = find_prog(argv[0], prog);
-	return e ? e : spawn(prog, argv);
+	return e ? e : spawn(prog, argv, NULL);
 }
 
 static void open_file(const char *path)
@@ -1504,9 +1530,13 @@ static void open_terminal(void)
 			var = "Mwm*terminal";
 		}
 		if (t && *t) {
+			/* sh looks the command up itself, from the folder shown:
+			 * only the absolute entries of $PATH, as find_prog. */
+			char path[4096];
+			abs_path(path, sizeof path);
 			char *const argv[] = { "sh", "-c", (char *)t, NULL };
 			snprintf(name, sizeof name, "/bin/sh");
-			e = spawn("/bin/sh", argv);
+			e = spawn("/bin/sh", argv, path);
 			goto done;
 		}
 		t = terms[0];
