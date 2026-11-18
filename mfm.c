@@ -528,11 +528,17 @@ static int is_bidi_control(uint32_t c)
 		(c >= 0x202a && c <= 0x202e) || (c >= 0x2066 && c <= 0x2069);
 }
 
-/* Characters that do not show: a name could hide behind them. */
+/* Characters that do not show: a name could hide behind them. Format
+ * characters (soft hyphen, word joiner, tags) and the Hangul fillers, which
+ * look like nothing; not the joiners emoji are made with. */
 static int is_invisible(uint32_t c)
 {
-	return c < 0x20 || (c >= 0x7f && c <= 0x9f) || c == 0x200b ||
-		c == 0x2028 || c == 0x2029 || c == 0xfeff;
+	if (c < 0x20 || (c >= 0x7f && c <= 0x9f) || c == 0x2028 ||
+	    c == 0x2029 || c == 0x34f || c == 0x115f || c == 0x1160 ||
+	    c == 0x3164 || c == 0xffa0)
+		return 1;
+	return c >= 0xa0 && c != 0x200c && c != 0x200d &&
+		g_unichar_type(c) == G_UNICODE_FORMAT;
 }
 
 /* A valid UTF-8 copy of s for drawing (static buffer): Latin-1 bytes are
@@ -1579,9 +1585,18 @@ static int u8_fit(const char *s, int n, int max)
 {
 	if (n <= max)
 		return n;
-	while (max > 0 && (s[max] & 0xc0) == 0x80)
-		max--;
-	return max;
+	/* From the front: a byte from 0x80 to 0xbf is only part of a UTF-8
+	 * character after a lead byte, else a Latin-1 letter of its own. */
+	int fit = 0;
+	for (int i = 0; i < n;) {
+		uint32_t cp;
+		int l = u8_len((const unsigned char *)s + i, &cp);
+		i += l ? l : 1;
+		if (i > max)
+			break;
+		fit = i;
+	}
+	return fit;
 }
 
 /* Where `path` is: the mount, by its ID where the kernel reports one (it
@@ -3233,39 +3248,65 @@ static void typeahead(const char *txt, int n)
  * One line of input with a cursor at byte *cur, shared by the path field
  * and the prompt. Returns 1 for Return, -1 for Escape, else 0.
  * While *fresh, the text before the cursor counts as selected: with
- * `sel`, typing replaces it and Backspace/Delete remove it; without (the
+ * `selects`, typing replaces it and Backspace/Delete remove it; without (the
  * path field), only "/" or "~" start over. Only keys that change the text
  * or move the cursor end the fresh state; Shift, AltGr or a dead key
  * pressed on the way to "/" or "~" must not.
  */
-static int line_key(char *b, size_t sz, size_t *cur, int *fresh, int sel,
+/* The cursor position before (dir < 0) or after c in b: a whole grapheme, a
+ * flag or a letter with its marks, as Pango tells them apart. Text that is
+ * not UTF-8 goes by a letter and the combining marks after it. */
+static size_t grapheme_step(const char *b, size_t c, int dir)
+{
+	size_t len = strlen(b);
+	const char *p;
+	if (dir < 0 ? c == 0 : c >= len)
+		return c;
+	if (!g_utf8_validate(b, len, NULL)) {
+		if (dir < 0) {
+			while (c) {
+				c = u8_prev(b, c);
+				p = b + c;
+				if (!is_combining(u8_next(&p)))
+					break;
+			}
+			return c;
+		}
+		p = b + c;
+		u8_next(&p);
+		for (const char *q = p; *q && is_combining(u8_next(&q));)
+			p = q;
+		return p - b;
+	}
+	glong nch = g_utf8_strlen(b, len);
+	PangoLogAttr *a = g_new(PangoLogAttr, nch + 1);
+	pango_get_log_attrs(b, len, -1, pango_language_get_default(), a,
+		nch + 1);
+	glong i = g_utf8_pointer_to_offset(b, b + c);
+	do
+		i += dir < 0 ? -1 : 1;
+	while (i > 0 && i < nch && !a[i].is_cursor_position);
+	g_free(a);
+	return g_utf8_offset_to_pointer(b, i) - b;
+}
+
+static int line_key(char *b, size_t sz, size_t *cur, int *fresh, int selects,
 	xkb_keysym_t ks, const char *txt, int n, int ctrl)
 {
 	size_t len = strlen(b), c = MIN(*cur, len);
 	const char *p;
-	int cut = *fresh && sel && c > 0;       /* a selection to replace */
+	int cut = *fresh && selects && c > 0;       /* a selection to replace */
 	switch (ks) {
 	case XKB_KEY_Return: case XKB_KEY_KP_Enter:
 		return 1;
 	case XKB_KEY_Escape:
 		return -1;
-	/* The cursor stays out of a letter and its combining marks. */
+	/* The cursor stays out of a grapheme. */
 	case XKB_KEY_Left: case XKB_KEY_KP_Left:
-		while (c) {
-			c = u8_prev(b, c);
-			p = b + c;
-			if (!is_combining(u8_next(&p)))
-				break;
-		}
+		c = grapheme_step(b, c, -1);
 		break;
 	case XKB_KEY_Right: case XKB_KEY_KP_Right:
-		if (c < len) {
-			p = b + c;
-			u8_next(&p);
-			for (const char *q = p; *q && is_combining(u8_next(&q));)
-				p = q;
-			c = p - b;
-		}
+		c = grapheme_step(b, c, 1);
 		break;
 	case XKB_KEY_Home: case XKB_KEY_KP_Home:
 		c = 0;
@@ -3277,14 +3318,8 @@ static int line_key(char *b, size_t sz, size_t *cur, int *fresh, int sel,
 		if (cut) {
 			memmove(b, b + c, len - c + 1);
 			c = 0;
-		} else if (c) {         /* the letter with its marks */
-			size_t q = c;
-			while (q) {
-				q = u8_prev(b, q);
-				p = b + q;
-				if (!is_combining(u8_next(&p)))
-					break;
-			}
+		} else if (c) {         /* the whole grapheme */
+			size_t q = grapheme_step(b, c, -1);
 			memmove(b + q, b + c, len - c + 1);
 			c = q;
 		}
@@ -3294,11 +3329,8 @@ static int line_key(char *b, size_t sz, size_t *cur, int *fresh, int sel,
 			memmove(b, b + c, len - c + 1);
 			c = 0;
 		} else if (c < len) {
-			p = b + c;
-			u8_next(&p);
-			for (const char *q = p; *q && is_combining(u8_next(&q));)
-				p = q;
-			memmove(b + c, p, len - (p - b) + 1);
+			size_t q = grapheme_step(b, c, 1);
+			memmove(b + c, b + q, len - q + 1);
 		}
 		break;
 	default:
@@ -3316,7 +3348,7 @@ static int line_key(char *b, size_t sz, size_t *cur, int *fresh, int sel,
 			memmove(b, b + c, len - c + 1);
 			len -= c;
 			c = 0;
-		} else if (*fresh && !sel && (txt[0] == '/' || txt[0] == '~')) {
+		} else if (*fresh && !selects && (txt[0] == '/' || txt[0] == '~')) {
 			b[0] = 0;
 			len = c = 0;
 		}
@@ -3625,15 +3657,43 @@ static void text_right(uint32_t c, int right, int y, int h, const char *s)
 		show(c, right - shape(s, n), y, h);
 }
 
-/* A character boundary in s between lo and hi, not lo or hi themselves, near
- * the middle; -1 if there is none. */
+/* Where text that is being cut may be cut: grapheme boundaries of the string
+ * stops_of() was given last, by byte; a flag or an accent stays whole. */
+static unsigned char cut_stop[3 * PATH_MAX + 16];
+static const char *cut_base;
+static int cut_len;
+
+static void stops_of(const char *s, int n)
+{
+	glong nch = g_utf8_strlen(s, n);
+	PangoLogAttr *a = g_new(PangoLogAttr, nch + 1);
+	pango_get_log_attrs(s, n, -1, pango_language_get_default(), a, nch + 1);
+	memset(cut_stop, 0, n + 1);
+	const char *p = s;
+	for (glong i = 0; i <= nch; i++, p = g_utf8_next_char(p))
+		cut_stop[p - s] = a[i].is_cursor_position || i == nch;
+	g_free(a);
+	cut_base = s;
+	cut_len = n;
+}
+
+static int stop_at(const char *s, int m)
+{
+	long at = s - cut_base + m;
+	if (cut_base && at >= 0 && at <= cut_len)
+		return cut_stop[at];
+	return (s[m] & 0xc0) != 0x80;
+}
+
+/* A place to cut s between lo and hi, not lo or hi themselves, near the
+ * middle; -1 if there is none. */
 static int mid_char(const char *s, int lo, int hi)
 {
 	int m = lo + (hi - lo) / 2;
-	while (m > lo && (s[m] & 0xc0) == 0x80)
+	while (m > lo && !stop_at(s, m))
 		m--;
 	if (m == lo)
-		for (m = lo + 1; m < hi && (s[m] & 0xc0) == 0x80; m++)
+		for (m = lo + 1; m < hi && !stop_at(s, m); m++)
 			;
 	return m < hi ? m : -1;
 }
@@ -3688,6 +3748,7 @@ static void text_fit(uint32_t c, int x, int y, int h, int maxw,
 	}
 	if (maxw <= ell_w)
 		return;
+	stops_of(s, n);
 	if (!cut_front) {
 		int k = cut_prefix(s, n, maxw - ell_w);
 		int w = shape(s, k);
@@ -3716,6 +3777,7 @@ static void draw_input(struct rect r, const char *b, size_t cur,
 	int x = r.x, start = 0, end = n;
 	if (maxw <= 2 * ew)
 		return;
+	stops_of(d, n);
 	if (fit_prefix(d, n, maxw) < n) {
 		if (fit_prefix(d, dc, maxw - ew) < dc) {
 			start = fit_suffix(d, dc, maxw - 2 * ew);

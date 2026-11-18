@@ -232,7 +232,8 @@ leads back to the folder the link is in, and a terminal from Ctrl+T gets that pa
 .BR $PWD .
 .PP
 File names that are not valid UTF\-8 are shown as Latin\-1.
-Bidirectional control characters show as U+FFFD, so that a name cannot pose as one with
+Control characters, bidirectional controls and characters that do not show, such as a
+soft hyphen, show as U+FFFD, so that a name cannot pose as another one or as one with
 another extension.
 .SH CONFIGURATION
 .B $XDG_CONFIG_HOME/mfm/mfmrc
