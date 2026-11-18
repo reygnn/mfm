@@ -792,27 +792,46 @@ static const char *conf(const char *env, const char *res, char *buf,
 	return mfmrc_get(res, buf, n);
 }
 
+/* A value that is set but means nothing is said so, as mwc says it. */
 static int rc_bool(const char *key)
 {
 	char v[64];
 	if (!mfmrc_get(key, v, sizeof v))
 		return 0;
-	return !strcasecmp(v, "true") || !strcasecmp(v, "yes") ||
-		!strcasecmp(v, "on") || !strcmp(v, "1");
+	if (!strcasecmp(v, "true") || !strcasecmp(v, "yes") ||
+	    !strcasecmp(v, "on") || !strcmp(v, "1"))
+		return 1;
+	if (strcasecmp(v, "false") && strcasecmp(v, "no") &&
+	    strcasecmp(v, "off") && strcmp(v, "0"))
+		fprintf(stderr, "mfm: ignoring Mfm*%s \"%s\": it takes true or "
+			"false\n", key, v);
+	return 0;
+}
+
+static int color_of(const char *what, const char *res, const char *v,
+	uint32_t *out)
+{
+	if (!v || !*v)
+		return 0;
+	if (parse_color(v, out))
+		return 1;
+	fprintf(stderr, "mfm: ignoring %s%s \"%s\": not a colour\n", what,
+		res, v);
+	return 0;
 }
 
 /* A colour from mfmrc, else from mwmrc. */
 static int rc_color(const char *res, uint32_t *out)
 {
 	char v[256];
-	return parse_color(mfmrc_get(res, v, sizeof v), out) ||
-		parse_color(mwmrc_get(res, v, sizeof v), out);
+	return color_of("Mfm*", res, mfmrc_get(res, v, sizeof v), out) ||
+		color_of("Mwm*", res, mwmrc_get(res, v, sizeof v), out);
 }
 
 static uint32_t setting(const char *env, const char *res, uint32_t def)
 {
 	uint32_t rgb;
-	if (parse_color(getenv(env), &rgb) || rc_color(res, &rgb))
+	if (color_of(env, "", getenv(env), &rgb) || rc_color(res, &rgb))
 		return rgb;
 	return def;
 }
