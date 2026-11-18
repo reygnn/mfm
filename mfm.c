@@ -59,6 +59,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -2331,6 +2332,7 @@ static void worker(int op, const char *sdir, char **names, int n,
 	const char *ddir, int out)
 {
 	char msg[1024];
+	prctl(PR_SET_NAME, "mfm-job");  /* for ps, and to tell it apart */
 	setsid();               /* not killed with mfm's terminal */
 	signal(SIGCHLD, SIG_DFL);
 	signal(SIGPIPE, SIG_IGN);       /* mfm may quit; finish the job */
@@ -2348,6 +2350,17 @@ static void worker(int op, const char *sdir, char **names, int n,
 		/* mfm has quit: nobody to tell */
 	}
 	_exit(0);
+}
+
+/* A child keeps nothing of mfm from fd lo on. close_range is from Linux 5.9
+ * on; without it, one by one. */
+static void close_from(int lo)
+{
+	if (close_range(lo, ~0U, 0) == 0)
+		return;
+	long max = sysconf(_SC_OPEN_MAX);
+	for (long fd = lo; fd < (max > 0 ? max : 1024); fd++)
+		close(fd);
 }
 
 static int busy(void)
@@ -2381,7 +2394,7 @@ static void start_job(int op, const char *sdir, char **names, int n,
 		if (p[1] != 3 && dup2(p[1], 3) < 0)
 			_exit(1);
 		fcntl(3, F_SETFD, FD_CLOEXEC);
-		close_range(4, ~0U, 0);
+		close_from(4);
 		worker(op, sdir, names, n, ddir, 3);
 	}
 	close(p[1]);
@@ -2668,7 +2681,15 @@ static const struct wl_registry_listener cb_registry_listener = {
 static _Noreturn void cb_child(int fd)
 {
 	signal(SIGPIPE, SIG_IGN);       /* a reader may leave early */
+	prctl(PR_SET_NAME, "mfm-clip");
 	setsid();                       /* the terminal may go, too */
+	/* It outlives mfm: holding mfm's stdout or stderr would keep a pipe
+	 * that reads them from its end. */
+	int nul = open("/dev/null", O_RDWR);
+	for (int i = 0; nul >= 0 && i < 3; i++)
+		dup2(nul, i);
+	if (nul > 2)
+		close(nul);
 	struct wl_display *d = wl_display_connect(NULL);
 	if (!d) {
 		dprintf(fd, "no connection to the compositor\n");
@@ -2744,7 +2765,7 @@ static void clip_export(void)
 		/* Nothing of mfm's own connection: see start_job. */
 		if (pp[1] != 3 && dup2(pp[1], 3) < 0)
 			_exit(1);
-		close_range(4, ~0U, 0);
+		close_from(4);
 		cb_child(3);
 	}
 	if (pid < 0) {
@@ -2756,6 +2777,10 @@ static void clip_export(void)
 		goto out;
 	}
 	close(pp[1]);
+	/* A helper that died at once is gone under SIG_IGN, and its pid may be
+	 * someone else's by the time it is killed: a pidfd stays its own. */
+	int pfd = syscall(SYS_pidfd_open, pid, 0);
+	int pgone = pfd < 0 && errno == ESRCH;
 	/* The answer comes after one roundtrip; don't wait on a stuck one. */
 	char msg[128];
 	size_t n = 0;
@@ -2773,8 +2798,12 @@ static void clip_export(void)
 	close(pp[0]);
 	msg[n] = 0;
 	msg[strcspn(msg, "\n")] = 0;
-	if (!n)                 /* it must not take the clipboard after all */
+	if (!n && pfd >= 0)     /* it must not take the clipboard after all */
+		syscall(SYS_pidfd_send_signal, pfd, SIGKILL, NULL, 0);
+	else if (!n && !pgone)
 		kill(pid, SIGKILL);
+	if (pfd >= 0)
+		close(pfd);
 	if (n && !msg[0]) {
 		/* The marks have done their job; after a failure they stay
 		 * for another try. */
@@ -5288,6 +5317,14 @@ static void lost_connection(void)
 
 int main(int argc, char **argv)
 {
+	/* Started with stdin, stdout or stderr closed, the Wayland socket would
+	 * get that number, and children that keep 0 to 2 would hold it or write
+	 * into it. */
+	int nul;
+	while ((nul = open("/dev/null", O_RDWR)) >= 0 && nul < 3)
+		;
+	if (nul >= 0)
+		close(nul);
 	if (argc == 2 && !strcmp(argv[1], "-v")) {
 		puts("mfm " MFM_VERSION);
 		return 0;

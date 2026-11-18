@@ -72,4 +72,5 @@ context menu press, drag and release does not run the command, a click still doe
 Ctrl+Shift+C needs ext-data-control-v1, which mwc, sway and other wlroots compositors
 offer. A small helper process of mfm holds the clipboard, since on Wayland the program
 that copied hands the data out. It stays after mfm quits, until something else is
-copied or the compositor ends.
+copied or the compositor ends. It connects through `WAYLAND_DISPLAY`: a mfm started
+with only `WAYLAND_SOCKET` cannot hand anything to the clipboard.
