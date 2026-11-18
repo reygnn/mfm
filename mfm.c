@@ -407,28 +407,33 @@ static void wsurf_present(struct wsurf *s, struct shmbuf *b)
 	if (o && o != b && o->w == b->w && o->h == b->h &&
 	    s->shown_scale == s->scale) {
 		/* Runs of changed rows, a few at most: the last one takes in
-		 * the rest. A gap of a few rows is not worth a rectangle. */
+		 * the rest. A gap of a few rows is not worth a rectangle. The
+		 * ends are trimmed first, so only what lies between the first
+		 * and the last change is read for gaps. */
 		enum { RECTS = 4, GAP = 8 };
 		size_t row = b->size / b->h;
 		const char *p = b->data, *q = o->data;
-		int n = 0, start = -1, last = -1;
-		for (int y = 0; y < b->h; y++) {
+		int y0 = 0, y1 = b->h;
+		while (y0 < y1 && !memcmp(p + y0 * row, q + y0 * row, row))
+			y0++;
+		while (y1 > y0 && !memcmp(p + (y1 - 1) * row,
+		    q + (y1 - 1) * row, row))
+			y1--;
+		int n = 0, start = y0, last = y0;
+		for (int y = y0 + 1; y < y1 && n < RECTS - 1; y++) {
 			if (!memcmp(p + y * row, q + y * row, row))
 				continue;
-			if (start >= 0 && (y - last > GAP * s->scale &&
-			    n < RECTS - 1)) {
+			if (y - last > GAP * s->scale) {
 				wl_surface_damage_buffer(s->wl, 0, start, b->w,
 					last + 1 - start);
 				n++;
-				start = -1;
-			}
-			if (start < 0)
 				start = y;
+			}
 			last = y;
 		}
-		if (start >= 0)
+		if (y1 > y0)
 			wl_surface_damage_buffer(s->wl, 0, start, b->w,
-				last + 1 - start);
+				y1 - start);
 	} else {
 		wl_surface_damage_buffer(s->wl, 0, 0, b->w, b->h);
 	}
@@ -2513,11 +2518,24 @@ static void worker(int op, const char *sdir, char **names, int n,
 }
 
 /* A child keeps nothing of mfm from fd lo on. close_range is from Linux 5.9
- * on; without it, one by one. */
+ * on; without it, the ones /proc/self/fd lists, as the limit can be a
+ * million; without /proc, up to the limit after all. */
 static void close_from(int lo)
 {
 	if (close_range(lo, ~0U, 0) == 0)
 		return;
+	DIR *d = opendir("/proc/self/fd");
+	if (d) {
+		int self = dirfd(d);
+		struct dirent *de;
+		while ((de = readdir(d))) {
+			int fd = atoi(de->d_name);
+			if (fd >= lo && fd != self)
+				close(fd);
+		}
+		closedir(d);
+		return;
+	}
 	long max = sysconf(_SC_OPEN_MAX);
 	for (long fd = lo; fd < (max > 0 ? max : 1024); fd++)
 		close(fd);
@@ -3415,16 +3433,17 @@ static size_t grapheme_step(const char *b, size_t c, int dir)
 			p = q;
 		return p - b;
 	}
-	glong nch = g_utf8_strlen(b, len);
+	const char *r = b + lo;
+	glong nch = g_utf8_strlen(r, hi - lo);
 	PangoLogAttr *a = g_new(PangoLogAttr, nch + 1);
-	pango_get_log_attrs(b, len, -1, pango_language_get_default(), a,
+	pango_get_log_attrs(r, hi - lo, -1, pango_language_get_default(), a,
 		nch + 1);
-	glong i = g_utf8_pointer_to_offset(b, b + c);
+	glong i = g_utf8_pointer_to_offset(r, b + c);
 	do
 		i += dir < 0 ? -1 : 1;
 	while (i > 0 && i < nch && !a[i].is_cursor_position);
 	g_free(a);
-	return g_utf8_offset_to_pointer(b, i) - b;
+	return g_utf8_offset_to_pointer(r, i) - b;
 }
 
 static int line_key(char *b, size_t sz, size_t *cur, int *fresh, int selects,
