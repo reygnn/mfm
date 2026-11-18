@@ -2094,11 +2094,17 @@ static int trash_one(const char *path, const struct mtab *mt, char *err,
 	char par[PATH_MAX], rpar[PATH_MAX], orig[PATH_MAX], t[PATH_MAX];
 	char topdir[PATH_MAX];
 	const char *base = strrchr(path, '/') + 1;
-	struct mnt mnt, tm;
+	struct mnt mnt, pm, tm;
+	struct stat st;
 	snprintf(par, sizeof par, "%s", path);
 	parent_of(par);
-	if (!realpath(par, rpar) || mount_id(path, 0, &mnt) < 0)
+	/* Which trash goes by the folder the entry is in: on overlayfs a file
+	 * from a lower layer on another file system shows that one's device,
+	 * though it is renamed within the overlay. */
+	if (!realpath(par, rpar) || mount_id(path, 0, &mnt) < 0 ||
+	    mount_id(rpar, 1, &pm) < 0 || lstat(path, &st) < 0)
 		goto fail;
+	int isdir = S_ISDIR(st.st_mode);
 	if (in_trash(rpar)) {
 		snprintf(err, esz, "%s is already in the trash", base);
 		return -1;
@@ -2107,19 +2113,16 @@ static int trash_one(const char *path, const struct mtab *mt, char *err,
 		snprintf(err, esz, "%s is a mount point", base);
 		return -1;
 	}
-	/* A btrfs subvolume: on a device of its own, in the mount of its
-	 * folder. Renaming it into a trash outside it fails, and a trash at
-	 * its top is inside it. */
-	struct mnt pm;
-	if (mount_id(rpar, 1, &pm) == 0 && pm.dev != mnt.dev) {
+	/* A btrfs subvolume: a folder on a device of its own, in the mount of
+	 * its folder. Renaming it into a trash outside it fails, and a trash
+	 * at its top is inside it. */
+	if (isdir && pm.dev != mnt.dev) {
 		snprintf(err, esz, "%s is a subvolume, on a file system of its own",
 			base);
 		return -1;
 	}
 	/* Emptying the trash later would empty what is mounted in it. */
-	struct stat st;
-	int below = lstat(path, &st) == 0 && S_ISDIR(st.st_mode) ?
-		mount_below(path, mt) : 0;
+	int below = isdir ? mount_below(path, mt) : 0;
 	if (below > 0) {
 		snprintf(err, esz, "%s has a mount point in it", base);
 		return -1;
@@ -2133,13 +2136,13 @@ static int trash_one(const char *path, const struct mtab *mt, char *err,
 	if (join(orig, rpar, base) < 0)
 		goto fail;
 	if (home_trash(t, 1) == 0 && mount_id(t, 1, &tm) == 0 &&
-	    same_mnt(tm, mnt)) {
+	    same_mnt(tm, pm)) {
 		if (trash_into(t, path, orig) == 0)
 			return 0;
 		if (errno != EXDEV)
 			goto fail;
 	}
-	if (topdir_trash(rpar, mnt, topdir, t) < 0)
+	if (topdir_trash(rpar, pm, topdir, t) < 0)
 		goto fail;
 	/* In a topdir trash the path is relative to the topdir, so it still
 	 * holds when the medium is mounted somewhere else. */
