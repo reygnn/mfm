@@ -304,8 +304,13 @@ the status line shows success or its first error line.
 .TP
 .B MFM_TERMINAL
 Ctrl+T.
-Default
-.BR MWC_TERMINAL ,
+Default mwc's terminal,
+.B MWC_TERMINAL
+or
+.B Mwm*terminal
+in mwmrc, which runs with
+.BR "sh \-c" ,
+as mwc runs it;
 else the first found of foot, xterm, uxterm, x\-terminal\-emulator, urxvt, alacritty,
 konsole, kitty, xfce4\-terminal and gnome\-terminal.
 .TP

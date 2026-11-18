@@ -34,10 +34,11 @@
  * symlinked directory, ".." leads back to where the link is.
  *
  * Files open with $MFM_OPEN (default xdg-open); the terminal is
- * $MFM_TERMINAL, else $MWC_TERMINAL, else the first one found of foot,
- * xterm, uxterm, x-terminal-emulator, ... Both commands are split at blanks
- * (quotes group words; no other shell syntax), and the program is looked
- * up in $PATH, never in the directory being browsed.
+ * $MFM_TERMINAL, else mwc's ($MWC_TERMINAL, Mwm*terminal, run with sh -c as
+ * mwc runs it), else the first one found of foot, xterm, uxterm,
+ * x-terminal-emulator, ... mfm's own commands are split at blanks (quotes
+ * group words; no other shell syntax), and the program is looked up in
+ * $PATH, never in the directory being browsed.
  */
 #define _GNU_SOURCE
 #include <cairo.h>
@@ -1435,6 +1436,9 @@ static void open_file(const char *path)
 		set_status(0, "opened %s", base);
 }
 
+/* Ctrl+T: MFM_TERMINAL or Mfm*terminal, split into words as MFM_OPEN is; else
+ * mwc's own, MWC_TERMINAL or Mwm*terminal, which mwc runs with sh -c and so
+ * does mfm; else the first terminal found. */
 static void open_terminal(void)
 {
 	static const char *const terms[] = { "foot", "xterm", "uxterm",
@@ -1443,17 +1447,29 @@ static void open_terminal(void)
 	char p[PATH_MAX], name[256], tb[1024];
 	const char *var, *t = conf("MFM_TERMINAL", "terminal", tb, sizeof tb,
 		&var);
-	if (!t || !*t)
-		t = getenv(var = "MWC_TERMINAL");
+	int e;
 	if (!t || !*t) {
+		t = getenv(var = "MWC_TERMINAL");
+		if (!t || !*t) {
+			t = mwmrc_get("terminal", tb, sizeof tb);
+			var = "Mwm*terminal";
+		}
+		if (t && *t) {
+			char *const argv[] = { "sh", "-c", (char *)t, NULL };
+			snprintf(name, sizeof name, "/bin/sh");
+			e = spawn("/bin/sh", argv);
+			goto done;
+		}
 		t = terms[0];
+		var = "MFM_TERMINAL";
 		for (size_t i = 0; i < sizeof terms / sizeof *terms; i++)
 			if (find_prog(terms[i], p) == 0) {
 				t = terms[i];
 				break;
 			}
 	}
-	int e = run(t, NULL, name, sizeof name);
+	e = run(t, NULL, name, sizeof name);
+done:
 	if (e < 0)
 		set_status(1, "%s: cannot parse the command", var);
 	else if (e)
@@ -4607,12 +4623,24 @@ static int key_repeats(uint32_t kc)
 
 /* With Ctrl or Alt, a key that gives no Latin letter on the active layout
  * (Cyrillic, Greek) acts as it does on the first layout where it gives one:
- * else Ctrl+C would only ever see a "с". */
+ * else Ctrl+C would only ever see a "с". A digit counts as on its level with
+ * Shift too: AZERTY has "&" there without it, and Ctrl+1 would never sort. */
 static xkb_keysym_t shortcut_sym(uint32_t kc, xkb_keysym_t ks)
 {
-	if (ks < 0x100)
+	if (ks < 0x80 && isalnum((int)ks))
 		return ks;
 	xkb_layout_index_t n = xkb_keymap_num_layouts_for_key(kb_map, kc);
+	for (xkb_layout_index_t l = 0; l < n; l++)
+		for (xkb_level_index_t lv = 0; lv < 2; lv++) {
+			const xkb_keysym_t *syms;
+			if (xkb_keymap_key_get_syms_by_level(kb_map, kc, l, lv,
+			    &syms) == 1 && syms[0] < 0x80 &&
+			    (isdigit((int)syms[0]) || (lv == 0 &&
+			    isalpha((int)syms[0]))))
+				return syms[0];
+		}
+	if (ks < 0x100)
+		return ks;
 	for (xkb_layout_index_t l = 0; l < n; l++) {
 		const xkb_keysym_t *syms;
 		if (xkb_keymap_key_get_syms_by_level(kb_map, kc, l, 0,
