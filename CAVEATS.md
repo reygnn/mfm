@@ -24,8 +24,9 @@ answering, or one that holds a link into such a file system, freezes the window 
 the file system answers or fails.
 
 A btrfs subvolume that is not mounted on its own counts as part of the mount it is in,
-except for the trash: what is in it goes to a trash at its top. Deleting a folder with
-a subvolume in it fails on the subvolume, which `rm --one-file-system` leaves alone.
+except for the trash: what is in it goes to a trash at its top, and the subvolume
+itself is not trashed. Deleting a folder with a subvolume in it fails on the
+subvolume, which `rm --one-file-system` leaves alone.
 
 
 ## Moves to another file system

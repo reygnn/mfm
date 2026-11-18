@@ -1921,21 +1921,21 @@ static int own_dir(const char *p)
  * top directory of that mount goes to top, the trash to out. That is
  * $topdir/.Trash/$uid if the administrator set up a shared .Trash (a real
  * directory with the sticky bit), else $topdir/.Trash-$uid. */
-static int topdir_trash(const char *rpar, struct mnt mnt, char *top,
+static int topdir_trash(const char *rpar, struct mnt mnt, char *topdir,
 	char *out)
 {
 	char up[PATH_MAX];
 	struct stat st;
 	struct mnt id;
-	snprintf(top, PATH_MAX, "%s", rpar);
-	while (strcmp(top, "/")) {
-		snprintf(up, sizeof up, "%s", top);
+	snprintf(topdir, PATH_MAX, "%s", rpar);
+	while (strcmp(topdir, "/")) {
+		snprintf(up, sizeof up, "%s", topdir);
 		parent_of(up);
 		if (mount_id(up, 1, &id) < 0 || !same_mnt(id, mnt))
 			break;
-		snprintf(top, PATH_MAX, "%s", up);
+		snprintf(topdir, PATH_MAX, "%s", up);
 	}
-	const char *tp = strcmp(top, "/") ? top : "";
+	const char *tp = strcmp(topdir, "/") ? topdir : "";
 	unsigned uid = getuid();
 	if (strlen(tp) >= PATH_MAX - 32) {
 		errno = ENAMETOOLONG;
@@ -2053,7 +2053,7 @@ static int trash_one(const char *path, const struct mtab *mt, char *err,
 	size_t esz)
 {
 	char par[PATH_MAX], rpar[PATH_MAX], orig[PATH_MAX], t[PATH_MAX];
-	char top[PATH_MAX];
+	char topdir[PATH_MAX];
 	const char *base = strrchr(path, '/') + 1;
 	struct mnt mnt, tm;
 	snprintf(par, sizeof par, "%s", path);
@@ -2066,6 +2066,15 @@ static int trash_one(const char *path, const struct mtab *mt, char *err,
 	}
 	if (is_mount(path)) {
 		snprintf(err, esz, "%s is a mount point", base);
+		return -1;
+	}
+	/* A btrfs subvolume: on a device of its own, in the mount of its
+	 * folder. Renaming it into a trash outside it fails, and a trash at
+	 * its top is inside it. */
+	struct mnt pm;
+	if (mount_id(rpar, 1, &pm) == 0 && pm.dev != mnt.dev) {
+		snprintf(err, esz, "%s is a subvolume, on a file system of its own",
+			base);
 		return -1;
 	}
 	/* Emptying the trash later would empty what is mounted in it. */
@@ -2091,11 +2100,12 @@ static int trash_one(const char *path, const struct mtab *mt, char *err,
 		if (errno != EXDEV)
 			goto fail;
 	}
-	if (topdir_trash(rpar, mnt, top, t) < 0)
+	if (topdir_trash(rpar, mnt, topdir, t) < 0)
 		goto fail;
-	/* In a topdir trash the path is relative to the top, so it still
+	/* In a topdir trash the path is relative to the topdir, so it still
 	 * holds when the medium is mounted somewhere else. */
-	const char *rel = orig + (strcmp(top, "/") ? strlen(top) : 0) + 1;
+	const char *rel = orig + (strcmp(topdir, "/") ? strlen(topdir) : 0) +
+		1;
 	if (trash_into(t, path, rel) == 0)
 		return 0;
 fail:
