@@ -93,7 +93,8 @@
 
 struct ent {
 	char *name;
-	char *key;      /* strxfrm of the name: sorting compares these */
+	char *key;      /* strxfrm of the name, while load() sorts */
+	char *nfc;      /* the name composed, for type-ahead, once asked */
 	mode_t mode;
 	off_t size;
 	time_t mtime;
@@ -329,18 +330,20 @@ static struct shmbuf *buf_new(int w, int h)
 	return b;
 }
 
-/* A buffer of this size in surface pixels to draw on, at the current scale and
- * with its Cairo context scaled to match, or NULL while the compositor holds
- * both; its release wakes the main loop. */
+/* A buffer of this size in surface pixels to draw on, with its Cairo context
+ * scaled to match, or NULL while the compositor holds both; its release wakes
+ * the main loop. The scale is s->scale: the output's, unless the buffer would
+ * be too large. */
 static struct shmbuf *wsurf_buffer(struct wsurf *s, int w, int h)
 {
 	/* Cairo draws at most 32767 pixels a side, and a wl_shm pool holds
 	 * less than 2 GiB: a scale that goes past either is lowered, and past
-	 * that the buffer is cut. */
+	 * that the buffer is cut, smaller than a maximized window should be.
+	 * No output is that large. */
 	enum { SIDE = 32767 };
 	int sc = scale;
-	while (sc > 1 && ((long)w * sc > SIDE || (long)h * sc > SIDE ||
-	    (long)w * sc * 4 * h * sc > INT32_MAX))
+	while (sc > 1 && ((int64_t)w * sc > SIDE || (int64_t)h * sc > SIDE ||
+	    (int64_t)w * sc * 4 * h * sc > INT32_MAX))
 		sc--;
 	w = MIN(w * sc, SIDE);
 	h = MIN(MIN(h * sc, SIDE), INT32_MAX / 4 / MAX(w, 1));
@@ -349,12 +352,12 @@ static struct shmbuf *wsurf_buffer(struct wsurf *s, int w, int h)
 		struct shmbuf *b = s->b[i];
 		if (!b || (b->w == w && b->h == h))
 			continue;
+		if (s->shown == b)
+			s->shown = NULL;
 		if (b->busy)
 			b->stale = 1;
 		else
 			buf_free(b);
-		if (s->shown == b)
-			s->shown = NULL;
 		s->b[i] = NULL;
 	}
 	/* Not the one shown, if the other is free: that keeps what the
@@ -396,20 +399,35 @@ static void wsurf_present(struct wsurf *s, struct shmbuf *b)
 	wl_callback_add_listener(s->frame, &frame_listener, s);
 	wl_surface_set_buffer_scale(s->wl, s->scale);
 	wl_surface_attach(s->wl, b->wl, 0, 0);
-	int y0 = 0, y1 = b->h;
 	const struct shmbuf *o = s->shown;
 	if (o && o != b && o->w == b->w && o->h == b->h &&
 	    s->shown_scale == s->scale) {
+		/* Runs of changed rows, a few at most: the last one takes in
+		 * the rest. A gap of a few rows is not worth a rectangle. */
+		enum { RECTS = 4, GAP = 8 };
 		size_t row = b->size / b->h;
 		const char *p = b->data, *q = o->data;
-		while (y0 < y1 && !memcmp(p + y0 * row, q + y0 * row, row))
-			y0++;
-		while (y1 > y0 && !memcmp(p + (y1 - 1) * row,
-		    q + (y1 - 1) * row, row))
-			y1--;
+		int n = 0, start = -1, last = -1;
+		for (int y = 0; y < b->h; y++) {
+			if (!memcmp(p + y * row, q + y * row, row))
+				continue;
+			if (start >= 0 && (y - last > GAP * s->scale &&
+			    n < RECTS - 1)) {
+				wl_surface_damage_buffer(s->wl, 0, start, b->w,
+					last + 1 - start);
+				n++;
+				start = -1;
+			}
+			if (start < 0)
+				start = y;
+			last = y;
+		}
+		if (start >= 0)
+			wl_surface_damage_buffer(s->wl, 0, start, b->w,
+				last + 1 - start);
+	} else {
+		wl_surface_damage_buffer(s->wl, 0, 0, b->w, b->h);
 	}
-	if (y1 > y0)
-		wl_surface_damage_buffer(s->wl, 0, y0, b->w, y1 - y0);
 	wl_surface_commit(s->wl);
 	b->busy = 1;
 	s->shown = b;
@@ -1058,6 +1076,7 @@ static void free_ents(struct ent *v, int n)
 	for (int i = 0; i < n; i++) {
 		free(v[i].name);
 		free(v[i].key);
+		g_free(v[i].nfc);
 	}
 	free(v);
 }
@@ -1067,13 +1086,21 @@ static void free_ents(struct ent *v, int n)
  * name. NULL without memory. */
 static char *coll_key(const char *s)
 {
-	size_t n = strxfrm(NULL, s, 0) + 1;
-	char *k = malloc(n);
-	if (k && strxfrm(k, s, n) >= n) {
-		free(k);
-		k = NULL;
-		errno = ENOMEM;
+	static char *kb;
+	static size_t cap;
+	size_t n = cap ? strxfrm(kb, s, cap) : (size_t)-1;
+	if (n >= cap) {         /* rarely: a longer key than any before */
+		n = strxfrm(NULL, s, 0);
+		char *nb = realloc(kb, n + 64);
+		if (!nb)
+			return NULL;
+		kb = nb;
+		cap = n + 64;
+		strxfrm(kb, s, cap);
 	}
+	char *k = malloc(n + 1);
+	if (k)
+		memcpy(k, kb, n + 1);
 	return k;
 }
 
@@ -1232,6 +1259,11 @@ static int load(const char *path, const char *select, int fallback)
 	rerr = errno;
 	closedir(d);
 	qsort(v, n, sizeof *v, ent_cmp);
+	/* Only for that: a sort later reads the folder again. */
+	for (int i = 0; i < n; i++) {
+		free(v[i].key);
+		v[i].key = NULL;
+	}
 
 	cwd_mtime = mt;
 	cwd_unsure = unsure;
@@ -3215,6 +3247,24 @@ static void poll_dir(void)
 		climb();
 }
 
+/* Names from macOS and SMB are decomposed (NFD), what is typed is not: both
+ * are compared composed. A name of ASCII only, as most are, is so already;
+ * others are composed once and kept. One that is not UTF-8 stays as it is. */
+static const char *ent_nfc(struct ent *e)
+{
+	if (e->nfc)
+		return e->nfc;
+	const char *p = e->name;
+	while (*p && !(*p & 0x80))
+		p++;
+	if (!*p)
+		return e->name;
+	e->nfc = g_utf8_normalize(e->name, -1, G_NORMALIZE_NFC);
+	if (!e->nfc)
+		e->nfc = g_strdup(e->name);
+	return e->nfc ? e->nfc : e->name;
+}
+
 static void typeahead(const char *txt, int n)
 {
 	size_t len = strlen(search);
@@ -3232,7 +3282,7 @@ static void typeahead(const char *txt, int n)
 	char *pre = g_utf8_normalize(search, -1, G_NORMALIZE_NFC);
 	for (int k = 0; k < nents; k++) {
 		int i = (start + k) % nents;
-		if (prefix_ci(ents[i].name, pre ? pre : search)) {
+		if (prefix_ci(ent_nfc(&ents[i]), pre ? pre : search)) {
 			sel = i;
 			show_sel();
 			break;
