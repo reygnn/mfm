@@ -2193,6 +2193,20 @@ static int tool(int which, const char *const *args, char *msg, size_t msz)
 	return wait_prog(path[which], argv, msg, msz);
 }
 
+/* Does the file system of the directory d (ours, empty) keep modes? Both
+ * changes have to work and show: FAT refuses some and shows others as the
+ * mount's mask has it. It is left at 0700, which the umask had no say in. */
+static int keeps_modes(const char *d)
+{
+	struct stat st;
+	int ok = chmod(d, 0755) == 0 && stat(d, &st) == 0 &&
+		(st.st_mode & 07777) == 0755;
+	if (chmod(d, 0700) != 0 || stat(d, &st) != 0 ||
+	    (st.st_mode & 07777) != 0700)
+		ok = 0;
+	return ok;
+}
+
 /* Lines from the worker that start with this byte are no failures: they name
  * an item of a move that failed with its original still whole, by index. */
 #define JOB_KEEP '\001'
@@ -2269,9 +2283,8 @@ static int work_one(int op, const char *sdir, const char *nm,
 	 * once the copy is complete and in place. mv would leave it unclear
 	 * which side is whole when it fails. FAT and exFAT keep no modes, and
 	 * cp -a fails on every one it cannot set: there the copy keeps the
-	 * times only. They show as the mount's mode, not the 0700 asked for. */
-	struct stat tst;
-	int modes = stat(tmp, &tst) < 0 || (tst.st_mode & 0777) == 0700;
+	 * times only. */
+	int modes = keeps_modes(tmp);
 	if (tool(T_CP, modes ? ARGS("-a", "--", src, t) :
 	    ARGS("-R", "--preserve=timestamps", "--", src, t),
 	    msg, sizeof msg) < 0) {
