@@ -8,7 +8,7 @@ renames, trashes and deletes, and leaves the rest to a terminal.
 
 ## Build
 
-On Ubuntu 26.04; mfm needs Linux 5.9 and glibc 2.34 or later:
+On Ubuntu 26.04; mfm needs glibc 2.34 or later:
 
     sudo apt install build-essential pkg-config libwayland-dev wayland-protocols \
         libxkbcommon-dev libcairo2-dev libpango1.0-dev

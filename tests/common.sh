@@ -52,7 +52,8 @@ content_origin() {
 	CY=$(($(get mfm y) + T + B))
 }
 
-# mfm_up: wait until the window of a mfm started by hand is up.
+# mfm_up: wait until the window of a mfm started by hand is up. ROW0 and ROWH stay
+# those of the last mfm_start.
 mfm_up() {
 	check "mfm has a focused window" '[ "$(get mfm kbfocus)" = 1 ]'
 	content_origin

@@ -59,6 +59,17 @@ if [ "$MFMT_STAGE" = mounts ]; then
 	echo s >"$R/shared/s1"
 	echo n >"$R/nosticky/n1"
 	chmod 777 "$R/shared" "$R/nosticky"
+	# An overlay with its lower layer on another file system than its upper one:
+	# files from below show the lower one's device, folders the overlay's.
+	mkdir -p "$R/ovll/sub" "$R/ovlu" "$R/ovl"
+	echo f >"$R/ovll/f1"
+	echo g >"$R/ovll/sub/g1"
+	chmod 777 "$R/ovll" "$R/ovll/sub"
+	mount -t tmpfs none "$R/ovlu" || exit 1
+	mkdir "$R/ovlu/up" "$R/ovlu/work"
+	chmod 777 "$R/ovlu/up"
+	mount -t overlay none -o "lowerdir=$R/ovll,upperdir=$R/ovlu/up,workdir=$R/ovlu/work" \
+		"$R/ovl" || exit 1
 	# A link in a folder it cannot be removed from, to a read-only folder.
 	ln -s "$R/victim" "$R/rolink/ln"
 	chmod 555 "$R/rolink" "$R/victim"
@@ -307,9 +318,10 @@ mfm_quit
 
 # A umask that takes the owner's bits must not look like FAT: the temporary folder
 # is made usable, and the copy keeps its mode.
+old_umask=$(umask)
 umask 0277
 mfm_start "$R/src"
-umask 022
+umask "$old_umask"
 type_name uma
 do_input key ctrl+c
 to_dir wide
@@ -337,6 +349,23 @@ wait_for "a file goes to the trash on its file system" test ! -e "$R/nosticky/n1
 [ -e "$R/nosticky/.Trash-$(id -u)/files/n1" ] || fail "not in .Trash-\$uid"
 [ ! -e "$R/nosticky/.Trash/$(id -u)" ] || fail "a .Trash that is not sticky was used"
 echo "ok: ... into .Trash-\$uid when .Trash is not sticky"
+mfm_quit
+
+# On the overlay, files from the lower layer are trashed like any, to the top of the
+# overlay, also from a folder below it.
+mfm_start "$R/ovl"
+type_name f1
+do_input key Delete
+wait_for "a file from an overlay's lower layer goes to the trash" test ! -e "$R/ovl/f1"
+[ -e "$R/ovl/.Trash-$(id -u)/files/f1" ] || fail "f1 is not in the overlay's trash"
+type_name sub
+do_input key Return
+type_name g1
+do_input key Delete
+wait_for "... from a folder below the top too" test ! -e "$R/ovl/sub/g1"
+[ -e "$R/ovl/.Trash-$(id -u)/files/g1" ] || fail "g1 is not in the trash at the top"
+[ ! -e "$R/ovl/sub/.Trash-$(id -u)" ] || fail "a trash was made in the folder"
+echo "ok: ... into the trash at the overlay's top"
 mfm_quit
 
 # ---- the directory on screen ------------------------------------------------

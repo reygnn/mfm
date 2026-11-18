@@ -540,6 +540,19 @@ file_appears "... and Mwm*terminal after it" "$SMOKE_DIR/mwmt"
 mfm_quit
 rm "$XDG_CONFIG_HOME/mwc/mwmrc"
 
+# That sh looks its command up only in the absolute entries of $PATH: a program of
+# that name in the folder shown is not it, though $PATH has "." and an empty entry.
+fresh_dir termpath
+printf '#!/bin/sh\ntouch "%s/wrong-term"\n' "$SMOKE_DIR" >"$D/mfmt-term"
+chmod +x "$D/mfmt-term"
+PATH=".::$PATH" MFMT_TERMINAL= \
+	MWC_TERMINAL="mfmt-term; touch '$SMOKE_DIR/sh-done'" mfm_start "$D"
+do_input key ctrl+t
+file_appears "the shell ran" "$SMOKE_DIR/sh-done"
+[ ! -e "$SMOKE_DIR/wrong-term" ] || fail "the terminal was taken from the folder shown"
+echo "ok: ... not from the folder shown"
+mfm_quit
+
 # Up and Down repeat when held.
 fresh_dir repeat
 for i in $(seq 10 39); do touch "$D/f$i"; done
@@ -614,11 +627,11 @@ chmod 111 "$D/a"
 mfm_start "$D/a/b"
 do_input key BackSpace
 wait_err "going up past a folder that cannot be listed says so"
+chmod 755 "$D/a"
 do_input key F7
 for k in s k; do do_input key "$k"; done
 do_input key Return
 file_appears "... and lands above it" "$D/sk"
-chmod 755 "$D/a"
 mfm_quit
 
 # Alt+Up, Ctrl+Shift+N, Right on a folder, Alt+Home and the parent button.
@@ -717,9 +730,10 @@ file_appears "Mfm*sortReverse puts b first" "$D/z"
 grep -qF 'ignoring Mfm*showHidden "ture"' "$MFM_LOG" || fail "no word about showHidden: ture"
 echo "ok: ... and a boolean that means nothing is said so"
 mfm_quit
-printf 'Mfm*sort: sideways\n' >"$XDG_CONFIG_HOME/mfm/mfmrc"
+printf 'Mfm*sort: sideways\nMfm*sortReverse:\n' >"$XDG_CONFIG_HOME/mfm/mfmrc"
 mfm_start "$D"
 grep -qF 'ignoring Mfm*sort "sideways"' "$MFM_LOG" || fail "no word about sort: sideways"
+! grep -qF 'ignoring Mfm*sortReverse' "$MFM_LOG" || fail "a word about an empty value"
 do_input key Down
 do_input key F2
 do_input key y
@@ -752,6 +766,12 @@ wait_for "trashme goes to the trash" test ! -e "$D/trashme"
 mfm_quit
 mfm_start "$XDG_DATA_HOME/Trash/files"
 for k in t r a s h m e; do do_input key "$k"; done
+rm -f "$SMOKE_DIR/opened"
+do_input key Return
+file_appears "trashme is selected in the trash" "$SMOKE_DIR/opened"
+[ "$(cat "$SMOKE_DIR/opened")" = "$XDG_DATA_HOME/Trash/files/trashme" ] ||
+	fail "opened $(cat "$SMOKE_DIR/opened")"
+rm -f "$SMOKE_DIR/opened"
 do_input key Delete
 wait_err "Delete in the trash is refused"
 [ -e "$XDG_DATA_HOME/Trash/files/trashme" ] || fail "trashme left the trash"
@@ -761,7 +781,7 @@ mfm_quit
 
 # A soft hyphen does not show: it shows as U+FFFD, so a<SHY>b does not look like ab.
 fresh_dir invisible
-touch "$D/ab" "$D/$(printf 'a\xc2\xadb')"
+touch "$D/ab" "$D/$(printf 'a\xc2\xadb')" "$D/$(printf 'a\xe2\x80\x8db')"
 MFM_FONT="DejaVu Sans Bold 24" mfm_start "$D"
 ink() {
 	build/pngtool count "$SHOT" $((CX + 20)) $((ROW0 + $1 * ROWH + 1)) 300 $((ROWH - 2)) \
@@ -770,6 +790,9 @@ ink() {
 [ "$(ink 2)" -gt "$(ink 1)" ] ||
 	fail "a soft hyphen hides: the rows have $(ink 1) and $(ink 2) dark pixels"
 echo "ok: a soft hyphen shows"
+[ "$(ink 3)" -gt "$(ink 1)" ] ||
+	fail "a joiner between letters hides: the rows have $(ink 1) and $(ink 3) dark pixels"
+echo "ok: ... and a joiner that joins nothing"
 mfm_quit
 
 # A flag is two code points and one character: Backspace takes it whole.
@@ -782,6 +805,18 @@ do_input key End
 do_input key BackSpace
 do_input key Return
 file_appears "Backspace takes a flag whole" "$D/x"
+mfm_quit
+
+# ... also when a byte elsewhere in the name is not UTF-8.
+fresh_dir flag2
+mkdir "$D/$(printf '\xe9x\xf0\x9f\x87\xa9\xf0\x9f\x87\xaa')"
+mfm_start "$D"
+do_input key Down
+do_input key F2
+do_input key End
+do_input key BackSpace
+do_input key Return
+file_appears "... next to a Latin-1 byte too" "$D/$(printf '\xe9x')"
 mfm_quit
 
 # A long name in Latin-1: bytes from 0x80 to 0xbf are letters there, and the stem
@@ -1282,6 +1317,7 @@ READER=$!
 WAYLAND_DISPLAY=wayland-0 "$MFM" "$D" >"$SMOKE_DIR/out.fifo" 2>&1 &
 MFM_PID=$!
 mfm_up
+rm "$SMOKE_DIR/out.fifo"        # both ends are open
 do_input key Down
 do_input key ctrl+shift+c
 check "the helper has the clipboard" 'clipget types | grep -qx text/uri-list'
@@ -1290,7 +1326,6 @@ wait "$MFM_PID"
 MFM_PID=
 check "the window is gone" '[ -z "$(get mfm w)" ]'
 wait_for "what reads mfm's output gets its end" eval '! kill -0 "$READER" 2>/dev/null'
-rm "$SMOKE_DIR/out.fifo"
 
 # ---- a scaled output ------------------------------------------------------
 
