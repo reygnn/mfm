@@ -26,8 +26,8 @@ MFM_LIBS = $(shell $(PKG_CONFIG) --libs $(PKGS)) -lm
 
 all: mfm
 
-mfm: mfm.c version.h $(PROTO_H) $(PROTO_C)
-	$(CC) $(MFM_CFLAGS) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ mfm.c $(PROTO_C) \
+mfm: mfm.c seats.c seats.h version.h $(PROTO_H) $(PROTO_C)
+	$(CC) $(MFM_CFLAGS) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ mfm.c seats.c $(PROTO_C) \
 		$(MFM_LIBS) $(LDLIBS)
 
 build:
@@ -63,6 +63,17 @@ build/clipget: tests/clipget.c build/ext-data-control-v1-client-protocol.h \
 	$(CC) $(MFM_CFLAGS) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tests/clipget.c \
 		build/ext-data-control-v1-protocol.c $(MFM_LIBS) $(LDLIBS)
 
+# The modules without Wayland, each under ASan and UBSan.
+UNIT_CFLAGS = -std=c11 -Wall -Wextra -g -O1 -fsanitize=address,undefined \
+	-fno-sanitize-recover=all
+UNITS = build/test_seats
+
+build/test_seats: tests/test_seats.c seats.c seats.h | build
+	$(CC) $(UNIT_CFLAGS) -I. -o $@ tests/test_seats.c seats.c
+
+check: $(UNITS)
+	@for t in $(UNITS); do echo "$$t"; ./$$t || exit 1; done
+
 install: mfm
 	install -Dm755 mfm $(DESTDIR)$(PREFIX)/bin/mfm
 	install -d $(DESTDIR)$(PREFIX)/share/applications
@@ -89,4 +100,4 @@ test-docker:
 clean:
 	rm -rf mfm build
 
-.PHONY: all install uninstall test test-docker clean
+.PHONY: all install uninstall check test test-docker clean

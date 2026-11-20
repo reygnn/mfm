@@ -9,8 +9,9 @@ CLAUDE.md.
 | Target | |
 |---|---|
 | `make` | mfm |
+| `make check` | the seat list (`seats.c`) under ASan and UBSan, no compositor |
 | `make test` | `tests/ui.sh` and `tests/files.sh` under a headless mwc; logs in `build/` |
-| `make test-docker` | the same in a Podman container, image `mfm-test` |
+| `make test-docker` | `make check` and `make test` in a Podman container, image `mfm-test` |
 
 Use `make test-docker`: the host lacks grim, and Ubuntu's AppArmor blocks the user
 namespaces `tests/files.sh` needs, which then fails. `make test` needs a built mwc with

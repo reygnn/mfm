@@ -75,3 +75,9 @@ offer. A small helper process of mfm holds the clipboard, since on Wayland the p
 that copied hands the data out. It stays after mfm quits, until something else is
 copied or the compositor ends. It connects through `WAYLAND_DISPLAY`: a mfm started
 with only `WAYLAND_SOCKET` cannot hand anything to the clipboard.
+
+
+## Seats
+
+mfm keeps the first eight seats the compositor announces and uses the oldest one left.
+One beyond that is taken only if it is announced again after the others went.

@@ -76,6 +76,7 @@
 #include "viewporter-client-protocol.h"
 #include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
+#include "seats.h"
 #include "version.h"
 
 #define BEV 2           /* bevel width, as in mwm */
@@ -217,9 +218,8 @@ static struct wl_shm *shm;
 static struct wl_seat *seat;
 static uint32_t seat_global;    /* its name in the registry */
 static struct wl_registry *registry;
-/* Seats announced while one was in use, to take when that one goes. */
-static struct spare { uint32_t name, ver; } spare_seats[8];
-static int nspare_seats;
+/* Every seat announced, the bound one too: the next is taken when it goes. */
+static struct seats seats;
 static struct wp_viewporter *viewporter;
 static struct xdg_wm_base *wm_base;
 static struct zxdg_decoration_manager_v1 *deco_mgr;
@@ -5251,11 +5251,8 @@ static void registry_global(void *data, struct wl_registry *r, uint32_t name,
 	} else if (!strcmp(iface, wl_shm_interface.name)) {
 		shm = wl_registry_bind(r, name, &wl_shm_interface, 1);
 	} else if (!strcmp(iface, wl_seat_interface.name)) {
-		if (!seat)
+		if (seats_add(&seats, name, ver) && !seat)
 			bind_seat(name, ver);
-		else if (nspare_seats < (int)(sizeof spare_seats /
-		    sizeof *spare_seats))
-			spare_seats[nspare_seats++] = (struct spare){ name, ver };
 	} else if (!strcmp(iface, wp_viewporter_interface.name) && !viewporter) {
 		viewporter = wl_registry_bind(r, name, &wp_viewporter_interface, 1);
 	} else if (!strcmp(iface, xdg_wm_base_interface.name)) {
@@ -5268,15 +5265,10 @@ static void registry_global(void *data, struct wl_registry *r, uint32_t name,
 	}
 }
 
-/* A seat that goes is let go of, and one announced before or after it is
- * taken instead. */
+/* A seat that goes is let go of, and the oldest one left is taken instead. */
 static void registry_remove(void *data, struct wl_registry *r, uint32_t name)
 {
-	for (int i = 0; i < nspare_seats; i++)
-		if (spare_seats[i].name == name) {
-			spare_seats[i] = spare_seats[--nspare_seats];
-			return;
-		}
+	seats_remove(&seats, name);
 	if (!seat || name != seat_global)
 		return;
 	seat_capabilities(NULL, seat, 0);
@@ -5285,11 +5277,9 @@ static void registry_remove(void *data, struct wl_registry *r, uint32_t name)
 	else
 		wl_seat_destroy(seat);
 	seat = NULL;
-	if (nspare_seats) {
-		struct spare sp = spare_seats[0];
-		spare_seats[0] = spare_seats[--nspare_seats];
-		bind_seat(sp.name, sp.ver);
-	}
+	unsigned next, ver;
+	if (seats_next(&seats, &next, &ver))
+		bind_seat(next, ver);
 }
 
 static const struct wl_registry_listener registry_listener = {

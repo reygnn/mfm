@@ -26,4 +26,5 @@ exec "$engine" run --rm --network=none --security-opt seccomp=unconfined \
 		rm -rf .git
 		make -s clean
 		make -s
+		make -s check
 		MWC_DIR=~/w/mwc make -s test'
