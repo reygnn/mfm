@@ -14,17 +14,17 @@ static void readable_all(uint32_t bg, uint32_t act, const uint32_t *fg,
 {
 	struct theme t;
 	theme_make(&t, bg, act, fg, sel_fg);
-	/* The user's own colours are taken as they are: what comes of them is
-	 * theirs, and left out here. */
+	/* The user's own colours are taken as they are on their own face: what
+	 * comes of them there is theirs, and left out here. */
 	const struct { const char *what; uint32_t c, face; int user; } pairs[] = {
 		{ "err on bg", t.err, t.bg, 0 },
 		{ "paper_fg on paper", t.paper_fg, t.paper, 0 },
 		{ "fg on bg", t.fg, t.bg, !!fg },
 		{ "dim on bg", t.dim, t.bg, !!fg },
-		{ "list_fg on list", t.list_fg, t.list, !!fg },
-		{ "list_dim on list", t.list_dim, t.list, !!fg },
-		{ "mark_fg on mark", t.mark_fg, t.mark, !!fg },
-		{ "mark_dim on mark", t.mark_dim, t.mark, !!fg },
+		{ "list_fg on list", t.list_fg, t.list, 0 },
+		{ "list_dim on list", t.list_dim, t.list, 0 },
+		{ "mark_fg on mark", t.mark_fg, t.mark, 0 },
+		{ "mark_dim on mark", t.mark_dim, t.mark, 0 },
 		{ "sel_fg on sel", t.sel_fg, t.sel, !!sel_fg },
 	};
 	for (size_t i = 0; i < sizeof pairs / sizeof *pairs; i++) {
@@ -66,13 +66,23 @@ int main(void)
 		for (size_t a = 0; a < sizeof hue / sizeof *hue; a++)
 			readable_all(hue[h], hue[a], NULL, NULL);
 
-	/* The user's colours stay as they are where they are drawn on the
-	 * theme; on paper, which is light whatever the theme, a light one
-	 * goes dark. */
+	/* The user's colours stay as they are on their own face, and where
+	 * they read; on another face they are moved as far as they need. */
 	uint32_t red = 0xc00000, green = 0x00c000, white = 0xffffff;
-	theme_make(&t, 0xaeb2c3, 0x7387ad, &red, &green);
-	CHECK(t.fg == red && t.list_fg == red && t.mark_fg == red &&
-		t.sel_fg == green && t.paper_fg == red);
+	uint32_t grey = 0xa0a0a0, dark = 0x202020;
+	theme_make(&t, 0xaeb2c3, 0x7387ad, &grey, &green);
+	CHECK(t.fg == grey && t.sel_fg == green);
+	CHECK(t.list_fg != grey && contrast_ratio(t.list_fg, t.list) >= 4.5f);
+	CHECK(t.mark_fg != grey && contrast_ratio(t.mark_fg, t.mark) >= 4.5f);
+	/* moved no further than it needs: the step before falls short */
+	int k = 1;
+	while (k < 20 && mix(grey, contrast(t.list), k / 20.0f) != t.list_fg)
+		k++;
+	CHECK(k < 20 && contrast_ratio(mix(grey, contrast(t.list),
+		(k - 1) / 20.0f), t.list) < 4.5f);
+	theme_make(&t, 0xaeb2c3, 0x7387ad, &dark, &green);
+	CHECK(t.fg == dark && t.list_fg == dark && t.mark_fg == dark &&
+		t.paper_fg == dark);
 	for (uint32_t g = 0; g < 256; g += 5) {
 		readable_all(g * 0x010101, 0x7387ad, &white, &white);
 		readable_all(g * 0x010101, 0x7387ad, &red, &green);

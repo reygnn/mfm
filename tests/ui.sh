@@ -1159,7 +1159,9 @@ done
 
 # The text colours of mwc's titles: Mwm*foreground and Mwm*activeForeground, else
 # black or white. A big bold font has strokes wider than the edge smoothing; the
-# tolerance is small, as the smoothing passes through many colours.
+# tolerance is small, as the smoothing passes through many colours. On its own
+# face a colour stays as set, the red on the status line; on the list, where
+# c00000 has 3.9:1, it goes as far towards black as 4.5:1 needs, to ad0000.
 fresh_dir fgres
 touch "$D/a"
 mkdir -p "$XDG_CONFIG_HOME/mwc"
@@ -1167,11 +1169,14 @@ printf 'Mwm*foreground: #c00000\nMwm*activeForeground: #00c000\n' \
 	>"$XDG_CONFIG_HOME/mwc/mwmrc"
 MFM_FONT="Sans Bold 24" mfm_start "$D"
 shoot
-red=$(build/pngtool count "$SHOT" $((CX + 20)) $((ROW0 + ROWH + 1)) 400 $((ROWH - 2)) c00000 6)
+H=$(get mfm h)
+red=$(build/pngtool count "$SHOT" "$CX" $((CY + H - 60)) 400 60 c00000 6)
+moved=$(build/pngtool count "$SHOT" $((CX + 20)) $((ROW0 + ROWH + 1)) 400 $((ROWH - 2)) ad0000 6)
+unmoved=$(build/pngtool count "$SHOT" $((CX + 20)) $((ROW0 + ROWH + 1)) 400 $((ROWH - 2)) c00000 6)
 green=$(build/pngtool count "$SHOT" $((CX + 20)) $((ROW0 + 1)) 400 $((ROWH - 2)) 00c000 6)
-[ "$red" -gt 0 ] && [ "$green" -gt 0 ] ||
-	fail "foreground: $red red pixels on a row, $green green on the selected one"
-echo "ok: Mwm*foreground and Mwm*activeForeground"
+[ "$red" -gt 0 ] && [ "$moved" -gt 0 ] && [ "$unmoved" = 0 ] && [ "$green" -gt 0 ] ||
+	fail "foreground: $red red on the status line, $moved ad0000 and $unmoved c00000 on a row, $green green on the selected one"
+echo "ok: Mwm*foreground and Mwm*activeForeground, moved on the list"
 mfm_quit
 rm "$XDG_CONFIG_HOME/mwc/mwmrc"
 

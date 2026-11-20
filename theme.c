@@ -80,14 +80,14 @@ void theme_make(struct theme *t, uint32_t bg, uint32_t act, const uint32_t *fg,
 	t->folder = 0xc9a85c;
 	t->paper = 0xf6f6f6;
 
-	/* The user's colours as they are, as mwc takes them for its titles;
-	 * else black or white by the face the text is on, which for the list
-	 * is lighter than bg. */
+	/* The user's colours as they are on their own face, as mwc takes them
+	 * for its titles; on another face moved as far as it needs to read
+	 * there, as pulseControl does. Else black or white by the face the
+	 * text is on, which for the list is lighter than bg. */
 	t->fg = fg ? *fg : contrast(bg);
-	t->list_fg = fg ? *fg : contrast(t->list);
-	t->mark_fg = fg ? *fg : contrast(t->mark);
 	t->sel_fg = sel_fg ? *sel_fg : contrast(act);
-	/* Paper is light whatever the theme: a light fg goes dark there. */
+	t->list_fg = fg ? readable(t->list, *fg) : contrast(t->list);
+	t->mark_fg = fg ? readable(t->mark, *fg) : contrast(t->mark);
 	t->paper_fg = readable(t->paper, t->fg);
 	t->dim = dimmed(bg, t->fg);
 	t->list_dim = dimmed(t->list, t->list_fg);

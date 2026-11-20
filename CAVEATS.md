@@ -85,7 +85,6 @@ One beyond that is taken only if it is announced again after the others went.
 
 ## Colours
 
-Text that mfm picks itself has at least 4.5:1 on what it is drawn on. A
-foreground or activeForeground that is set is taken as it is, as mwc takes it
-for its titles, and can read badly on the list or a marked row. Only input
-fields, which are light in every theme, darken it.
+Text has at least 4.5:1 on what it is drawn on, with one exception: a foreground
+or activeForeground that is set stays as it is on the window and on the
+selection, as mwc takes it for its titles, and can read badly there.
