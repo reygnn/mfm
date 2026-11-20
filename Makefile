@@ -26,8 +26,8 @@ MFM_LIBS = $(shell $(PKG_CONFIG) --libs $(PKGS)) -lm
 
 all: mfm
 
-mfm: mfm.c seats.c seats.h version.h $(PROTO_H) $(PROTO_C)
-	$(CC) $(MFM_CFLAGS) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ mfm.c seats.c $(PROTO_C) \
+mfm: mfm.c seats.c seats.h theme.c theme.h version.h $(PROTO_H) $(PROTO_C)
+	$(CC) $(MFM_CFLAGS) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ mfm.c seats.c theme.c $(PROTO_C) \
 		$(MFM_LIBS) $(LDLIBS)
 
 build:
@@ -66,10 +66,13 @@ build/clipget: tests/clipget.c build/ext-data-control-v1-client-protocol.h \
 # The modules without Wayland, each under ASan and UBSan.
 UNIT_CFLAGS = -std=c11 -Wall -Wextra -g -O1 -fsanitize=address,undefined \
 	-fno-sanitize-recover=all
-UNITS = build/test_seats
+UNITS = build/test_seats build/test_theme
 
 build/test_seats: tests/test_seats.c seats.c seats.h | build
 	$(CC) $(UNIT_CFLAGS) -I. -o $@ tests/test_seats.c seats.c
+
+build/test_theme: tests/test_theme.c theme.c theme.h | build
+	$(CC) $(UNIT_CFLAGS) -I. -o $@ tests/test_theme.c theme.c -lm
 
 check: $(UNITS)
 	@for t in $(UNITS); do echo "$$t"; ./$$t || exit 1; done

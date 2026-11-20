@@ -77,6 +77,7 @@
 #include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 #include "seats.h"
+#include "theme.h"
 #include "version.h"
 
 #define BEV 2           /* bevel width, as in mwm */
@@ -262,6 +263,8 @@ static int W = 680, H = 480;
 static uint32_t px_bg, px_top, px_bot, px_list, px_sel, px_trough,
 	px_fg, px_folder, px_paper, px_mark;
 static uint32_t xc_fg, xc_sel, xc_dim, xc_err;
+/* text on the list, on a marked row, in an input field */
+static uint32_t xc_lfg, xc_ldim, xc_mfg, xc_mdim, xc_pfg;
 static cairo_t *cr;             /* what fill, bevel and text draw on */
 static PangoLayout *plo;
 static int font_asc, font_desc;
@@ -682,54 +685,7 @@ static int prefix_ci(const char *name, const char *pre)
 	return r;
 }
 
-/* ---- colours (same rules as mwm's draw.c) ------------------------------- */
-
-static uint32_t mix(uint32_t rgb, uint32_t to, float f)
-{
-	uint32_t out = 0;
-	for (int sh = 0; sh <= 16; sh += 8) {
-		float c = (rgb >> sh) & 0xff, t = (to >> sh) & 0xff;
-		out |= (uint32_t)(c + (t - c) * f + 0.5f) << sh;
-	}
-	return out;
-}
-
-/* An sRGB channel as linear light. */
-static float linear(unsigned c)
-{
-	float v = c / 255.0f;
-	return v <= 0.04045f ? v / 12.92f : powf((v + 0.055f) / 1.055f, 2.4f);
-}
-
-/* Black or white, whichever has the higher WCAG contrast on bg. The two are equal
- * at a relative luminance of sqrt(1.05 * 0.05) - 0.05, a grey of about 0x76: a
- * mid-tone such as mwc's activeBackground gets black. */
-static float luminance(uint32_t c)
-{
-	return 0.2126f * linear((c >> 16) & 0xff) +
-		0.7152f * linear((c >> 8) & 0xff) + 0.0722f * linear(c & 0xff);
-}
-
-static uint32_t contrast(uint32_t bg)
-{
-	float l = luminance(bg);
-	return (l + 0.05f) * (l + 0.05f) > 1.05f * 0.05f ? 0x000000 : 0xffffff;
-}
-
-/* Dimmed towards fg, but no further than WCAG AA's 4.5:1 for small text
- * allows; fg itself if even that falls short. The same steps as the dock
- * tools, so they match. */
-static uint32_t dimmed(uint32_t bg, uint32_t fg)
-{
-	float lb = luminance(bg) + 0.05f;
-	for (int k = 12; k < 20; k++) {
-		uint32_t c = mix(bg, fg, k / 20.0f);
-		float lc = luminance(c) + 0.05f;
-		if ((lb > lc ? lb / lc : lc / lb) >= 4.5f)
-			return c;
-	}
-	return fg;
-}
+/* ---- colours (theme.c has the rules) ------------------------------------ */
 
 /* What mwc reads: "#rrggbb", names like "gold", and rgb:r/g/b with 1 to 4 hex
  * digits per channel. */
@@ -900,27 +856,32 @@ static void theme_init(void)
 {
 	uint32_t bg = setting("MWC_INACTIVE", "background", 0xaeb2c3);
 	uint32_t act = setting("MWC_ACTIVE", "activeBackground", 0x7387ad);
-	uint32_t fg;
+	uint32_t fg, sel_fg;
 	/* Text as mwc's titles: the resource if set, else black or white. */
-	if (!rc_color("foreground", &fg))
-		fg = contrast(bg);
+	int has_fg = rc_color("foreground", &fg);
+	int has_sel = rc_color("activeForeground", &sel_fg);
+	struct theme t;
+	theme_make(&t, bg, act, has_fg ? &fg : NULL, has_sel ? &sel_fg : NULL);
 
-	px_bg = bg;
-	px_top = mix(bg, 0xffffff, 0.55f);
-	px_bot = mix(bg, 0x000000, 0.5f);
-	px_list = mix(bg, 0xffffff, 0.3f);
-	px_trough = mix(bg, 0x000000, 0.12f);
-	px_sel = act;
-	px_mark = mix(mix(bg, 0xffffff, 0.3f), act, 0.4f);
-	px_fg = fg;
-	px_folder = 0xc9a85c;
-	px_paper = 0xf6f6f6;
-	xc_fg = fg;
-	if (!rc_color("activeForeground", &xc_sel))
-		xc_sel = contrast(act);
-	xc_dim = dimmed(bg, fg);
-	/* by the background, not fg: readable on dark themes */
-	xc_err = contrast(bg) == 0xffffff ? 0xffa0a0 : 0x8a0303;
+	px_bg = t.bg;
+	px_top = t.top;
+	px_bot = t.bot;
+	px_list = t.list;
+	px_trough = t.trough;
+	px_sel = t.sel;
+	px_mark = t.mark;
+	px_fg = t.fg;
+	px_folder = t.folder;
+	px_paper = t.paper;
+	xc_fg = t.fg;
+	xc_sel = t.sel_fg;
+	xc_dim = t.dim;
+	xc_err = t.err;
+	xc_lfg = t.list_fg;
+	xc_ldim = t.list_dim;
+	xc_mfg = t.mark_fg;
+	xc_mdim = t.mark_dim;
+	xc_pfg = t.paper_fg;
 
 	/* fontconfig patterns (Sans:bold:size=10, as mfm-x11 took them) mean
 	 * nothing to Pango, which would quietly pick some other font. */
@@ -3936,7 +3897,7 @@ static void draw_input(struct rect r, const char *b, size_t cur,
 	if (fit_prefix(d, n, maxw) < n) {
 		if (fit_prefix(d, dc, maxw - ew) < dc) {
 			start = fit_suffix(d, dc, maxw - 2 * ew);
-			text(xc_fg, x, r.y, r.h, "...", 3);
+			text(xc_pfg, x, r.y, r.h, "...", 3);
 			x += ew;
 		}
 		end = start + fit_prefix(d + start, n - start,
@@ -3969,11 +3930,11 @@ static void draw_input(struct rect r, const char *b, size_t cur,
 		pango_layout_set_attributes(plo, attrs);
 		pango_attr_list_unref(attrs);
 	}
-	text(xc_fg, x, r.y, r.h, d + start, seg);
+	text(xc_pfg, x, r.y, r.h, d + start, seg);
 	pango_layout_set_attributes(plo, NULL);
 	if (end < n)
-		text(xc_fg, x + shape(d + start, seg), r.y, r.h, "...", 3);
-	fill(px_fg, x + PANGO_PIXELS(at.x), r.y + 3, 1, r.h - 6);
+		text(xc_pfg, x + shape(d + start, seg), r.y, r.h, "...", 3);
+	fill(xc_pfg, x + PANGO_PIXELS(at.x), r.y + 3, 1, r.h - 6);
 }
 
 static void draw_icon(int x, int y, const struct ent *e)
@@ -4054,7 +4015,7 @@ static void paint(void)
 		draw_input((struct rect){ in_p.x + 4, in_p.y, in_p.w - 8,
 			in_p.h }, edit, edit_cur, 0);
 	else
-		text_fit(xc_fg, in_p.x + 4, in_p.y, in_p.h, in_p.w - 10, cwd,
+		text_fit(xc_lfg, in_p.x + 4, in_p.y, in_p.h, in_p.w - 10, cwd,
 			1);
 
 	/* list */
@@ -4072,12 +4033,14 @@ static void paint(void)
 	for (int i = top; i < nents && i < top + vis; i++) {
 		const struct ent *e = &ents[i];
 		int y = ly + (i - top) * rowh;
-		uint32_t c = xc_fg, cd = xc_dim;
+		uint32_t c = xc_lfg, cd = xc_ldim;
 		if (i == sel) {
 			fill(px_sel, lx + 1, y, lw - 2, rowh);
 			c = cd = xc_sel;
 		} else if (e->mark) {
 			fill(px_mark, lx + 1, y, lw - 2, rowh);
+			c = xc_mfg;
+			cd = xc_mdim;
 		}
 		if (e->mark)
 			fill(i == sel ? px_mark : px_sel, lx + 1, y, 3, rowh);

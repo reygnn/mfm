@@ -1183,21 +1183,22 @@ mkdir "$D/a"
 touch -d 2024-01-01 "$D/a"
 dim_px() {
 	build/pngtool count "$SHOT" $((CX + $(get mfm w) - 220)) $((ROW0 + ROWH + 1)) 180 \
-		$((ROWH - 2)) 3d3e44 6
+		$((ROWH - 2)) "$1" 6
 }
 MFM_FONT="DejaVu Sans Bold 24" mfm_start "$D"
 name=$(build/pngtool count "$SHOT" $((CX + 20)) $((ROW0 + ROWH + 1)) 200 $((ROWH - 2)) 000000)
 [ "$name" -gt 0 ] || fail "no name in the row the date is looked for in"
-[ "$(dim_px)" = 0 ] || fail "a big font in a small window shows the date"
+[ "$(dim_px 4f5055)" = 0 ] || fail "a big font in a small window shows the date"
 echo "ok: a big font in a small window leaves the date out"
-# Dimmed text, the date here, as far as 4.5:1 allows: 3d3e44 on aeb2c3. The old 0.6
-# mix, 46474e, is lighter, and its smoothing towards the background never gets as
-# dark.
+# Dimmed text, the date here, as far as 4.5:1 allows on the list it is drawn on:
+# 4f5055 on c6c9d5. 3d3e44, dimmed for the window's background, is darker than
+# the smoothing of 4f5055 ever gets.
 do_input key super+Up
 check "maximized" '[ "$(get mfm max)" = 1 ]'
 content_origin
 find_rows
-check "maximized it shows the date, and dimmed text has 4.5:1" 'shoot; [ "$(dim_px)" -gt 0 ]'
+check "maximized it shows the date, and dimmed text has 4.5:1" 'shoot; [ "$(dim_px 4f5055)" -gt 0 ]'
+[ "$(dim_px 3d3e44)" = 0 ] || fail "the date is dimmed for the background, not the list"
 mfm_quit
 
 # The error colour follows the background: light on a dark one. F2 on ".." is one.
@@ -1209,6 +1210,32 @@ H=$(get mfm h)
 do_input key F2
 check "an error on a dark background is light" \
 	'shoot; [ "$(build/pngtool count "$SHOT" $CX $((CY + H - 60)) 600 60 ffa0a0 6)" -gt 0 ]'
+mfm_quit
+
+# Text goes by the face it is on. On #008080 the window's text is white, the
+# lighter list's black; on a dark one the input field, light whatever the theme,
+# gets dark text, 666666 there.
+fresh_dir faces
+touch "$D/a" "$D/b"
+BG=008080
+MWC_INACTIVE=#008080 MFM_FONT="Sans Bold 24" mfm_start "$D"
+BG=aeb2c3
+shoot
+black=$(build/pngtool count "$SHOT" $((CX + 20)) $((ROW0 + ROWH + 1)) 200 $((ROWH - 2)) 000000 6)
+[ "$black" -gt 0 ] || fail "#008080: no black text on the list"
+echo "ok: text on the list goes by the list, not the background"
+mfm_quit
+BG=202020
+MWC_INACTIVE=#202020 MFM_FONT="Sans Bold 24" mfm_start "$D"
+BG=aeb2c3
+H=$(get mfm h)
+# The label's white text smooths through 666666 too: only the field right of it
+# counts, filled with w's.
+do_input key F7
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do do_input key w; done
+check "an input field on a dark theme has dark text" \
+	'shoot; [ "$(build/pngtool count "$SHOT" $((CX + 260)) $((CY + H - 60)) 300 60 666666 0)" -gt 0 ]'
+do_input key Escape
 mfm_quit
 
 # mfm has to read mwmrc as mwc does.

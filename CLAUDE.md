@@ -9,7 +9,7 @@ CLAUDE.md.
 | Target | |
 |---|---|
 | `make` | mfm |
-| `make check` | the seat list (`seats.c`) under ASan and UBSan, no compositor |
+| `make check` | the seat list (`seats.c`) and the colours (`theme.c`) under ASan and UBSan, no compositor |
 | `make test` | `tests/ui.sh` and `tests/files.sh` under a headless mwc; logs in `build/` |
 | `make test-docker` | `make check` and `make test` in a Podman container, image `mfm-test` |
 

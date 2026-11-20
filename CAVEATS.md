@@ -81,3 +81,11 @@ with only `WAYLAND_SOCKET` cannot hand anything to the clipboard.
 
 mfm keeps the first eight seats the compositor announces and uses the oldest one left.
 One beyond that is taken only if it is announced again after the others went.
+
+
+## Colours
+
+Text that mfm picks itself has at least 4.5:1 on what it is drawn on. A
+foreground or activeForeground that is set is taken as it is, as mwc takes it
+for its titles, and can read badly on the list or a marked row. Only input
+fields, which are light in every theme, darken it.
