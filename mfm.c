@@ -5588,19 +5588,22 @@ static void lost_connection(void)
 	exit(1);
 }
 
+/* stdout to a file is fully buffered: without the flush a full disk or a
+ * closed stdout would go unnoticed and -v or -h would still exit 0. */
+static int
+stdout_done(void)
+{
+	if (fflush(stdout) == 0 && !ferror(stdout))
+		return 0;
+	fprintf(stderr, "mfm: stdout: %s\n", strerror(errno));
+	return 1;
+}
+
 int main(int argc, char **argv)
 {
-	/* Started with stdin, stdout or stderr closed, the Wayland socket would
-	 * get that number, and children that keep 0 to 2 would hold it or write
-	 * into it. */
-	int nul;
-	while ((nul = open("/dev/null", O_RDWR)) >= 0 && nul < 3)
-		;
-	if (nul >= 0)
-		close(nul);
 	if (argc == 2 && !strcmp(argv[1], "-v")) {
 		puts("mfm " MFM_VERSION);
-		return 0;
+		return stdout_done();
 	}
 	int help = argc == 2 && !strcmp(argv[1], "-h");
 	/* -h alone asks for it, on stdout, as mwc's does; any other option,
@@ -5614,8 +5617,16 @@ int main(int argc, char **argv)
 			"MFM_FONT (default \"Sans 10\"), "
 			"MWC_INACTIVE, MWC_ACTIVE;\n"
 			"or the same in ~/.config/mfm/mfmrc (see the README).\n");
-		return help ? 0 : 1;
+		return help ? stdout_done() : 1;
 	}
+	/* Started with stdin, stdout or stderr closed, the Wayland socket would
+	 * get that number, and children that keep 0 to 2 would hold it or write
+	 * into it. Only after -v and -h: for them a closed stdout is an error. */
+	int nul;
+	while ((nul = open("/dev/null", O_RDWR)) >= 0 && nul < 3)
+		;
+	if (nul >= 0)
+		close(nul);
 	setlocale(LC_ALL, "");
 	signal(SIGCHLD, SIG_IGN);
 

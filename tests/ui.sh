@@ -35,6 +35,19 @@ echo "ok: -h on stdout, --help and the rest refused on stderr"
 want=$(sed -n 's/^#define MFM_VERSION "\(.*\)"$/mfm \1/p' "$MFM_DIR/version.h")
 out=$("$MFM" -v) && [ "$out" = "$want" ] || fail "-v: status $?, '$out', not '$want'"
 echo "ok: -v prints $want"
+# A write error on stdout, a full disk or a closed stdout, is status 1 with a
+# message, not 0 with nothing written.
+for opt in -v -h; do
+	"$MFM" $opt >/dev/full 2>"$SMOKE_DIR/err"
+	status=$?
+	[ "$status" = 1 ] && grep -q '^mfm: stdout: ' "$SMOKE_DIR/err" ||
+		fail "$opt >/dev/full: status $status, stderr '$(cat "$SMOKE_DIR/err")'"
+	"$MFM" $opt >&- 2>"$SMOKE_DIR/err"
+	status=$?
+	[ "$status" = 1 ] && grep -q '^mfm: stdout: ' "$SMOKE_DIR/err" ||
+		fail "$opt >&-: status $status, stderr '$(cat "$SMOKE_DIR/err")'"
+done
+echo "ok: -v and -h report a stdout that cannot be written"
 
 # ---- rendering and frame ---------------------------------------------------
 
