@@ -7,6 +7,18 @@ LOG=$(cd "$(dirname "$0")/.." && pwd)/build/ui.log
 MFM_LOG=${LOG%.log}-mfm.log
 . "$(dirname "$0")/common.sh"
 
+# The cursor runs need the Adwaita cursors: without them wayland-cursor falls back
+# to its built-in one and those checks fail with no word why. The places are
+# wayland-cursor's own, or XCURSOR_PATH.
+have_cursor_theme() {
+	local d IFS=:
+	for d in ${XCURSOR_PATH:-$HOME/.local/share/icons:$HOME/.icons:/usr/share/icons:/usr/share/pixmaps}; do
+		[ -d "$d/$1/cursors" ] && return 0
+	done
+	return 1
+}
+have_cursor_theme Adwaita || fail "no Adwaita cursor theme (adwaita-icon-theme)"
+
 # The socket comes before the test hooks, the startup command after them.
 start_mwc 'touch "$SMOKE_DIR/up"; exec sleep 600'
 wait_for "mwc is up" test -e "$SMOKE_DIR/up"
