@@ -28,7 +28,7 @@ B=$(global theme border)
 T=$(global theme title)
 echo "theme: border=$B title=$T"
 
-LIST=c6c9d5
+LIST=c4c4c4
 
 # ---- command line ----------------------------------------------------------
 
@@ -1129,16 +1129,24 @@ MFM_FONT=Monospace mfm_start "$D"
 mfm_quit
 echo "ok: a font without a size"
 
-# The selected row has mwc's activeBackground, a mid-tone: white, as Motif picks it
+# The selected row has mwc's activeBackground, a light stone: black, as Motif picks it
 # and mwc's titles have it. A big bold font has strokes wider than the edge smoothing.
 fresh_dir ink
 MFM_FONT="Sans Bold 24" mfm_start "$D"
 shoot
 ink=$(build/pngtool count "$SHOT" $((CX + 20)) $((ROW0 + 1)) 400 $((ROWH - 2)) 000000)
 white=$(build/pngtool count "$SHOT" $((CX + 20)) $((ROW0 + 1)) 400 $((ROWH - 2)) ffffff)
-[ "$white" -gt 0 ] && [ "$ink" = 0 ] ||
-	fail "the selected row has $ink black and $white white pixels, not white text"
-echo "ok: white text on the selected row"
+[ "$ink" -gt 0 ] && [ "$white" = 0 ] ||
+	fail "the selected row has $ink black and $white white pixels, not black text"
+echo "ok: black text on the selected row"
+# On the built-in grey the text is black, as in mwc, where Motif would give white.
+H=$(get mfm h)
+# Exact: the bevel's light side is within count's tolerance of white.
+ink=$(build/pngtool count "$SHOT" "$CX" $((CY + H - 60)) 400 60 000000 0)
+white=$(build/pngtool count "$SHOT" "$CX" $((CY + H - 60)) 400 60 ffffff 0)
+[ "$ink" -gt 0 ] && [ "$white" = 0 ] ||
+	fail "the status line has $ink black and $white white pixels, not black text"
+echo "ok: black text on the built-in grey"
 mfm_quit
 
 # As mwc reads it: a line however long counts, and the last line wins, so a value
@@ -1148,7 +1156,7 @@ mkdir -p "$XDG_CONFIG_HOME/mfm"
 printf 'Mfm*background:%1100s#336699\n' '' >"$XDG_CONFIG_HOME/mfm/mfmrc"
 BG=336699
 mfm_start "$D"
-BG=aeb2c3
+BG=aaaaaa
 echo "ok: a line of 1100 blanks and a colour counts"
 mfm_quit
 {
@@ -1205,24 +1213,24 @@ dim_px() {
 MFM_FONT="DejaVu Sans Bold 24" mfm_start "$D"
 name=$(build/pngtool count "$SHOT" $((CX + 20)) $((ROW0 + ROWH + 1)) 200 $((ROWH - 2)) 000000)
 [ "$name" -gt 0 ] || fail "no name in the row the date is looked for in"
-[ "$(dim_px 4f5055)" = 0 ] || fail "a big font in a small window shows the date"
+[ "$(dim_px 4e4e4e)" = 0 ] || fail "a big font in a small window shows the date"
 echo "ok: a big font in a small window leaves the date out"
 # Dimmed text, the date here, as far as 4.5:1 allows on the list it is drawn on:
-# 4f5055 on c6c9d5. 3d3e44, dimmed for the window's background, is darker than
-# the smoothing of 4f5055 ever gets.
+# 4e4e4e on c4c4c4. 3c3c3c, dimmed for the window's background, is darker than
+# the smoothing of 4e4e4e ever gets.
 do_input key super+Up
 check "maximized" '[ "$(get mfm max)" = 1 ]'
 content_origin
 find_rows
-check "maximized it shows the date, and dimmed text has 4.5:1" 'shoot; [ "$(dim_px 4f5055)" -gt 0 ]'
-[ "$(dim_px 3d3e44)" = 0 ] || fail "the date is dimmed for the background, not the list"
+check "maximized it shows the date, and dimmed text has 4.5:1" 'shoot; [ "$(dim_px 4e4e4e)" -gt 0 ]'
+[ "$(dim_px 3c3c3c)" = 0 ] || fail "the date is dimmed for the background, not the list"
 mfm_quit
 
 # The error colour follows the background: light on a dark one. F2 on ".." is one.
 fresh_dir err
 BG=202020
 MWC_INACTIVE=#202020 MFM_FONT="Sans Bold 24" mfm_start "$D"
-BG=aeb2c3
+BG=aaaaaa
 H=$(get mfm h)
 do_input key F2
 check "an error on a dark background is light" \
@@ -1236,7 +1244,7 @@ fresh_dir faces
 touch "$D/a" "$D/b"
 BG=008080
 MWC_INACTIVE=#008080 MFM_FONT="Sans Bold 24" mfm_start "$D"
-BG=aeb2c3
+BG=aaaaaa
 shoot
 black=$(build/pngtool count "$SHOT" $((CX + 20)) $((ROW0 + ROWH + 1)) 200 $((ROWH - 2)) 000000 6)
 [ "$black" -gt 0 ] || fail "#008080: no black text on the list"
@@ -1244,7 +1252,7 @@ echo "ok: text on the list goes by the list, not the background"
 mfm_quit
 BG=202020
 MWC_INACTIVE=#202020 MFM_FONT="Sans Bold 24" mfm_start "$D"
-BG=aeb2c3
+BG=aaaaaa
 H=$(get mfm h)
 # The label's white text smooths through 666666 too: only the field right of it
 # counts, filled with w's.
@@ -1261,7 +1269,7 @@ mkdir -p "$XDG_CONFIG_HOME/mwc"
 printf 'mwm.Background : #336699\n' >"$XDG_CONFIG_HOME/mwc/mwmrc"
 BG=336699
 mfm_start "$D"
-BG=aeb2c3
+BG=aaaaaa
 rm "$XDG_CONFIG_HOME/mwc/mwmrc"
 echo "ok: mwmrc in another spelling"
 mfm_quit

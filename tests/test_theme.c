@@ -56,13 +56,18 @@ static void readable_all(uint32_t bg, uint32_t act, const uint32_t *fg,
 
 int main(void)
 {
-	/* The default look: Motif's shadows, white on the active colour as mwc. */
+	/* mwc's default look, IRIX Base: Motif's shadows, black on the light stone,
+	 * and on the built-in grey black, which theme_init() passes as the text. */
 	struct theme t;
+	uint32_t black = 0;
+	theme_make(&t, 0xaaaaaa, 0xc6c1aa, &black, NULL);
+	CHECK(t.fg == 0 && t.list_fg == 0 && t.mark_fg == 0 && t.sel_fg == 0);
+	CHECK(t.top == 0xdadada && t.bot == 0x5a5a5a);
+	CHECK(t.paper_fg == 0 && t.err == 0x830303);
+	CHECK(t.list == 0xc4c4c4 && t.dim == 0x3c3c3c);
+	/* Motif's old look: white on its focused blue. */
 	theme_make(&t, 0xaeb2c3, 0x7387ad, NULL, NULL);
-	CHECK(t.fg == 0 && t.list_fg == 0 && t.mark_fg == 0 && t.sel_fg == 0xffffff);
-	CHECK(t.top == 0xdddee6 && t.bot == 0x5e6069);
-	CHECK(t.paper_fg == 0 && t.err == 0x8a0303);
-	CHECK(t.list == 0xc6c9d5 && t.dim == 0x3d3e44);
+	CHECK(t.fg == 0 && t.sel_fg == 0xffffff && t.err == 0x8a0303);
 	/* Dark: light text, the light error red. */
 	theme_make(&t, 0x202020, 0x7387ad, NULL, NULL);
 	CHECK(t.fg == 0xffffff && t.err == 0xffa0a0 && t.paper_fg != 0xffffff);

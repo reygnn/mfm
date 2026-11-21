@@ -26,10 +26,10 @@ SHOT=$SMOKE_DIR/ui.png
 MFM_PID=
 : >"$MFM_LOG"
 
-BG=aeb2c3
-SEL=7387ad
-TROUGH=999dac
-ERR=8a0303      # status line text for errors, on BG
+BG=aaaaaa      # mwc's defaults, IRIX Base
+SEL=c6c1aa
+TROUGH=969696
+ERR=830303      # status line text for errors, on BG: #8a0303 moved to 4.5:1
 
 # A type-ahead ends after TYPEAHEAD_MS without a key.
 TYPEAHEAD_MS=$(sed -n 's/^#define TYPEAHEAD_MS \([0-9]*\).*/\1/p' "$MFM_DIR/mfm.c")

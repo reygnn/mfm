@@ -87,7 +87,7 @@ One beyond that is taken only if it is announced again after the others went.
 
 Text has at least 4.5:1 on what it is drawn on, except on the window and on the
 selection. There, as on mwc's titles, a foreground or activeForeground that is set
-stays as it is, and without one the text is black or white by Motif's rule, which
-on a mid-tone can fall short: on mwc's activeBackground `#7387ad` the selected
-row's text is white at about 3.8:1. Dimmed text there never reads worse than the
-text.
+stays as it is, and without one the text is black or white by Motif's rule, black
+on mwc's default colours. A mid-tone set as a colour can fall short: on Motif's old
+focused blue `#7387ad` the selected row's text is white at about 3.6:1. Dimmed text
+there never reads worse than the text.

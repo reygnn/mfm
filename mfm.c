@@ -571,11 +571,14 @@ static int rc_color(const char *res, uint32_t *out)
 		color_of("Mwm*", res, mwmrc_get(res, v, sizeof v), out);
 }
 
-static uint32_t setting(const char *env, const char *res, uint32_t def)
+/* *builtin says the default it was. */
+static uint32_t setting(const char *env, const char *res, uint32_t def, int *builtin)
 {
 	uint32_t rgb;
+	*builtin = 0;
 	if (color_of(env, "", getenv(env), &rgb) || rc_color(res, &rgb))
 		return rgb;
+	*builtin = 1;
 	return def;
 }
 
@@ -583,11 +586,18 @@ static int shape(const char *s, int n);
 
 static void theme_init(void)
 {
-	uint32_t bg = setting("MWC_INACTIVE", "background", 0xaeb2c3);
-	uint32_t act = setting("MWC_ACTIVE", "activeBackground", 0x7387ad);
+	/* mwc's defaults, IRIX 6.5's Base scheme. */
+	int builtin, unused;
+	uint32_t bg = setting("MWC_INACTIVE", "background", 0xaaaaaa, &builtin);
+	uint32_t act = setting("MWC_ACTIVE", "activeBackground", 0xc6c1aa, &unused);
 	uint32_t fg, sel_fg;
-	/* Text as mwc's titles: the resource if set, else as Motif picks it. */
+	/* Text as mwc's titles: the resource if set, else as Motif picks it; on the
+	 * built-in grey black, as mwc has it, where Motif gives white at 67 %. */
 	int has_fg = rc_color("foreground", &fg);
+	if (!has_fg && builtin) {
+		fg = 0x000000;
+		has_fg = 1;
+	}
 	int has_sel = rc_color("activeForeground", &sel_fg);
 	struct theme t;
 	theme_make(&t, bg, act, has_fg ? &fg : NULL, has_sel ? &sel_fg : NULL);
