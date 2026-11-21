@@ -45,6 +45,11 @@ TEST(shade)
 	CHECK(mtk_shade(0x333333, 0).bot >> 16 < 0x33);
 	CHECK(mtk_shade(0xededed, 0).top >> 16 > 0xed);
 	CHECK(mtk_shade(0xeeeeee, 0).top >> 16 < 0xee);
+	/* Exactly at 20 % and 93 %: still medium, as in mwc's tests. */
+	s = mtk_shade(0x002287, 0);
+	CHECK(s.top == 0x8293c4 && s.bot == 0x000e3a);
+	s = mtk_shade(0xcbfdfe, 0);
+	CHECK(s.top == 0xeaffff && s.bot == 0x769393);
 }
 
 TEST(text_color)
@@ -58,6 +63,7 @@ TEST(text_color)
 	CHECK_INT(mtk_text_color(0xffd700), 0xffffff);  /* gold: mwm's is white too */
 	CHECK_INT(mtk_text_color(0x0000ff), 0xffffff);
 	CHECK_INT(mtk_text_color(0x5f9ea0), 0xffffff);  /* CadetBlue */
+	CHECK_INT(mtk_text_color(0x17fcff), 0xffffff);  /* exactly 70 %: not above */
 	CHECK_INT(mtk_text_color(0xb2b2b2), 0xffffff);
 	CHECK_INT(mtk_text_color(0xb3b3b3), 0x000000);
 }

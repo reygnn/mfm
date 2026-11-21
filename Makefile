@@ -25,6 +25,8 @@ UNIT_FLAGS = -std=c11 -Wall -Wextra -Wno-unused-parameter -Werror -O1 -g \
 	-fno-sanitize-recover=undefined,float-cast-overflow
 UNIT_CFLAGS = $(shell $(PKG_CONFIG) --cflags $(MTK_HEADLESS_PKGS))
 UNIT_LIBS = $(shell $(PKG_CONFIG) --libs $(MTK_HEADLESS_PKGS)) -lm
+# mwc's colour rules, in color.c.
+MWC_COLOR = mwc_color.h mwc/color.c mwc/color.h
 # What a module needs of another: also linked, real, and rebuilt with it.
 UNIT_WITH_rc = color.c
 UNIT_WITH_draw = color.c
@@ -36,7 +38,8 @@ build/unit: | build
 	mkdir -p $@
 
 .SECONDEXPANSION:
-build/unit/%: tests/unit/%_test.c %.c $$(UNIT_WITH_$$*) mtk.h tests/unit/unit.h | build/unit
+build/unit/%: tests/unit/%_test.c %.c $$(UNIT_WITH_$$*) mtk.h $(MWC_COLOR) \
+		tests/unit/unit.h | build/unit
 	$(CC) $(UNIT_FLAGS) $(UNIT_CFLAGS) -o $@ $< $*.c $(UNIT_WITH_$*) $(UNIT_LD_$*) \
 		$(UNIT_LIBS)
 
@@ -51,7 +54,15 @@ unit: $(UNIT:%=build/unit/%)
 build/mtkdemo-asan: demo/mtkdemo.c $(MTK_DEPS) | build
 	$(CC) $(MTK_CFLAGS) $(UNIT_FLAGS) -o $@ demo/mtkdemo.c $(MTK_SRC) $(MTK_LIBS)
 
-check: unit build/mtkdemo-asan mk
+check: unit build/mtkdemo-asan mk mwc-color
+
+# mwc-color: mwc/color.[ch] are MWC_DIR's src/color.[ch], unchanged, when it is there.
+MWC_DIR ?= ../mwc
+mwc-color:
+	@if [ -f $(MWC_DIR)/src/color.c ]; then \
+		cmp mwc/color.c $(MWC_DIR)/src/color.c && cmp mwc/color.h $(MWC_DIR)/src/color.h && \
+		echo "mwc/color.[ch] are $(MWC_DIR)'s"; \
+	else echo "mwc/color.[ch]: no $(MWC_DIR) to compare with"; fi
 
 # mk: tests/mk.sh, a client built as README.md shows, and the units' rebuilds.
 mk: build/unit/rc build/unit/input
@@ -76,7 +87,7 @@ analyze: $(MTK_PROTO_H)
 
 # make lint: C lines longer than LINT_MAX columns, tabs to every eighth column.
 LINT_MAX = 100
-LINT_FILES = *.c *.h tests/*.c tests/unit/*.c tests/unit/*.h demo/*.c
+LINT_FILES = *.c *.h mwc/*.c mwc/*.h tests/*.c tests/unit/*.c tests/unit/*.h demo/*.c
 lint:
 	@awk -v max=$(LINT_MAX) '{ \
 		n = 0; \
@@ -88,4 +99,4 @@ lint:
 clean:
 	rm -rf build
 
-.PHONY: all unit check mk test analyze lint clean
+.PHONY: all unit check mk mwc-color test analyze lint clean

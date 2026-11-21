@@ -8,6 +8,7 @@
 #include <strings.h>
 
 #include "mtk.h"
+#include "mwc_color.h"
 
 static char *trim(char *s)
 {
@@ -112,16 +113,15 @@ void mtk_theme_load(struct mtk_theme *t)
 	/* IRIX 6.5's Base scheme, as mwc's defaults: a grey, and a light stone for
 	 * the window that has the focus. */
 	int builtin, unused;
-	uint32_t bg = setting("MWC_INACTIVE", "background", 0xaaaaaa, &builtin);
-	uint32_t act = setting("MWC_ACTIVE", "activeBackground", 0xc6c1aa, &unused);
+	uint32_t bg = setting("MWC_INACTIVE", "background", COLOR_INACTIVE, &builtin);
+	uint32_t act = setting("MWC_ACTIVE", "activeBackground", COLOR_ACTIVE, &unused);
 	uint32_t fg, afg;
 	t->has_fg = rc_color("foreground", &fg);
 	t->has_active_fg = rc_color("activeForeground", &afg);
 	/* The built-in grey takes the Base palette's black text, as in mwc; Motif
 	 * would pick white, at 67 %. A grey that is set, #aaaaaa too, gets Motif's
 	 * choice. */
-	t->inactive = mtk_shade(bg, t->has_fg ? fg : builtin ? 0x000000 :
-		mtk_text_color(bg));
+	t->inactive = mtk_shade(bg, t->has_fg ? fg : color_inactive_text(bg, builtin));
 	t->active = mtk_shade(act, t->has_active_fg ? afg : mtk_text_color(act));
 	t->dim = mtk_dimmed(bg, t->inactive.fg);
 }
