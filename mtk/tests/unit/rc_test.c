@@ -218,6 +218,69 @@ TEST(theme)
 	CHECK_INT(t.inactive.fg, 0x000000);
 }
 
+/* IRIX's client palette: basicBackground and textForeground for the tools, the frame
+ * colours for mwc; the text has 4.5:1 where the palette or Motif's rule has less. */
+TEST(palette)
+{
+	struct mtk_theme t;
+	unsetenv("MWC_INACTIVE");
+	unsetenv("MWC_ACTIVE");
+	setenv("XDG_CONFIG_HOME", dir, 1);
+	rc(dir, "Mwm*background: #8c8c8c\n");
+	mtk_theme_load(&t);
+	CHECK(!t.palette);
+
+	/* Buckingham: Motif's white on the frames' greys has 3.4:1 and 3.0:1. */
+	rc(dir, "Mwm*activeBackground: #9991a6\nMwm*background: #8c8c8c\n"
+	   "Mwm*basicBackground: #795f78\nMwm*textForeground: #fffffe\n");
+	mtk_theme_load(&t);
+	CHECK(t.palette && !t.has_fg && !t.has_active_fg);
+	CHECK_INT(t.inactive.bg, 0x795f78);
+	CHECK_INT(t.inactive.fg, 0xfffffe);             /* 5.6:1, as the palette has it */
+	CHECK_INT(t.inactive.top, mtk_shade(0x795f78, 0).top);
+	CHECK_INT(t.inactive.bot, mtk_shade(0x795f78, 0).bot);
+	CHECK_INT(t.active.bg, 0x9991a6);
+	CHECK_INT(t.active.fg, 0x000000);               /* 7.0:1, Motif's white 3.0:1 */
+	CHECK(mtk_contrast_ratio(t.inactive.bg, t.dim) >= 4.5f);
+	CHECK_INT(t.dim, mtk_dimmed(0x795f78, 0xfffffe));       /* on the palette's face */
+
+	/* Without textForeground black or white; foreground is the frames' alone. */
+	rc(dir, "Mwm*basicBackground: #d9d9d9\nMwm*foreground: #ffffff\n");
+	mtk_theme_load(&t);
+	CHECK(t.palette && !t.has_fg);
+	CHECK_INT(t.inactive.fg, 0x000000);
+	/* ... the better of them, where Motif's rule would take white at 3.4:1. */
+	rc(dir, "Mwm*basicBackground: #8c8c8c\n");
+	mtk_theme_load(&t);
+	CHECK_INT(t.inactive.fg, 0x000000);
+
+	/* Arizona's palette text has 3.8:1: moved as far as 4.5:1 needs. */
+	rc(dir, "Mwm*basicBackground: #868373\nMwm*textForeground: #ffffff\n");
+	mtk_theme_load(&t);
+	CHECK(t.inactive.fg != 0xffffff);
+	CHECK(mtk_contrast_ratio(0x868373, t.inactive.fg) >= 4.5f);
+
+	/* activeForeground is kept if it reads, else moved: Monet's white on #aaa5d5. */
+	rc(dir, "Mwm*basicBackground: #b688a5\nMwm*activeBackground: #aaa5d5\n"
+	   "Mwm*activeForeground: #ffffff\n");
+	mtk_theme_load(&t);
+	CHECK(t.has_active_fg);
+	CHECK(mtk_contrast_ratio(0xaaa5d5, t.active.fg) >= 4.5f);
+	rc(dir, "Mwm*basicBackground: #b688a5\nMwm*activeBackground: #aaa5d5\n"
+	   "Mwm*activeForeground: #000033\n");
+	mtk_theme_load(&t);
+	CHECK_INT(t.active.fg, 0x000033);
+
+	/* One that is no colour counts as not set, as everywhere. */
+	rc(dir, "Mwm*basicBackground: nonsense\nMwm*background: #102030\n");
+	mtk_theme_load(&t);
+	CHECK(!t.palette);
+	CHECK_INT(t.inactive.bg, 0x102030);
+	rc(dir, "Mwm*basicBackground: #21628c\nMwm*textForeground: nonsense\n");
+	mtk_theme_load(&t);
+	CHECK_INT(t.inactive.fg, 0xffffff);
+}
+
 int main(void)
 {
 	if (!mkdtemp(dir)) {
@@ -229,6 +292,7 @@ int main(void)
 	RUN(long_line);
 	RUN(where);
 	RUN(theme);
+	RUN(palette);
 	char cmd[64];
 	snprintf(cmd, sizeof cmd, "rm -rf %s", dir);
 	if (system(cmd) != 0)

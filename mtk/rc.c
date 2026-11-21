@@ -118,6 +118,22 @@ void mtk_theme_load(struct mtk_theme *t)
 	uint32_t fg, afg;
 	t->has_fg = rc_color("foreground", &fg);
 	t->has_active_fg = rc_color("activeForeground", &afg);
+	uint32_t basic;
+	t->palette = rc_color("basicBackground", &basic);
+	if (t->palette) {
+		/* IRIX's client palette: the tools draw as IRIX's programs did, on
+		 * BasicBackground with TextForeground, not on the frame colours. Their
+		 * text is small, so it gets WCAG's 4.5:1 where the palette or Motif's
+		 * rule falls short. foreground is the frames' title text then. */
+		uint32_t text, best = mtk_best_contrast(basic), abest = mtk_best_contrast(act);
+		t->inactive = mtk_shade(basic, rc_color("textForeground", &text) ?
+			mtk_readable(basic, text, best) : best);
+		t->active = mtk_shade(act, mtk_readable(act, t->has_active_fg ? afg : abest,
+			abest));
+		t->has_fg = 0;
+		t->dim = mtk_dimmed(basic, t->inactive.fg);
+		return;
+	}
 	/* The built-in grey takes the Base palette's black text, as in mwc; Motif
 	 * would pick white, at 67 %. A grey that is set, #aaaaaa too, gets Motif's
 	 * choice. */
