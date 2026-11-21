@@ -413,6 +413,19 @@ grep -q 'ERROR: AddressSanitizer\|runtime error' "$SMOKE_DIR/wide.log" &&
 sed -i '/outputScale/d' "$XDG_CONFIG_HOME/mwc/mwmrc"
 reload_mwc
 
+# ---- IRIX's client palette -------------------------------------------------------
+# With Mwm*basicBackground the client's face is that colour; its border keeps the
+# frame colours, as mwc's frames do.
+MTKDEMO_FIXED=1 start_demo
+pixel_at "without it the face is mwc's grey" 200 12 $BG
+quit_demo Escape
+echo 'Mwm*basicBackground: #795f78' >>"$XDG_CONFIG_HOME/mwc/mwmrc"
+MTKDEMO_FIXED=1 start_demo
+pixel_at "with it the face is basicBackground" 200 12 795f78
+pixel_at "the border keeps the active frame colour" 0 60 $ACT_TOP
+quit_demo Escape
+sed -i '/basicBackground/d' "$XDG_CONFIG_HOME/mwc/mwmrc"
+
 # ---- a poll that fails ----------------------------------------------------------
 # Told as itself, with its cause, not as a lost connection. Without ASan, whose
 # runtime must be loaded first.

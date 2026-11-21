@@ -23,6 +23,14 @@ under names that start with `mtk_`. `make check` compares them with `MWC_DIR`'s.
 `mtk_best_contrast()`, `mtk_dimmed()` and `mtk_readable()` are there for text that
 must reach WCAG's 4.5:1.
 
+With `Mwm*basicBackground` in the mwmrc, IRIX's client palette, a client draws as
+IRIX's programs did: `inactive` is that colour with `Mwm*textForeground`, else black or
+white, while the frame colours stay mwc's. `active` keeps `Mwm*activeBackground`. The
+text on both then has at least 4.5:1: a palette or `activeForeground` colour with less
+is moved towards black or white as far as that needs, and `Mwm*foreground` is left to
+mwc's titles (`has_fg` is 0). `theme.palette` says that it is on. mwc's
+`docs/mwmrc.irix-schemes` has both for each of IRIX 6.5's schemes.
+
 
 ## Use
 
