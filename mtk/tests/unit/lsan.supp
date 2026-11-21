@@ -1,0 +1,2 @@
+# fontconfig keeps its caches until exit; mwc never calls it itself, only through Pango.
+leak:libfontconfig.so
