@@ -125,15 +125,37 @@ TEST(theme)
 	setenv("XDG_CONFIG_HOME", dir, 1);
 	rc(dir, "");
 	mtk_theme_load(&t);
-	/* Motif's defaults, as mwc's */
-	CHECK_INT(t.inactive.bg, 0xaeb2c3);
-	CHECK_INT(t.inactive.top, 0xdddee6);
-	CHECK_INT(t.inactive.bot, 0x5e6069);
-	CHECK_INT(t.inactive.fg, 0x000000);
-	CHECK_INT(t.active.bg, 0x7387ad);
-	CHECK_INT(t.active.fg, 0xffffff);
+	/* mwc's defaults, IRIX's Base scheme, with Motif's shadows */
+	CHECK_INT(t.inactive.bg, 0xaaaaaa);
+	CHECK_INT(t.inactive.top, 0xdadada);
+	CHECK_INT(t.inactive.bot, 0x5a5a5a);
+	CHECK_INT(t.active.bg, 0xc6c1aa);
+	CHECK_INT(t.active.top, 0xe7e5db);
+	CHECK_INT(t.active.bot, 0x6b685c);
+	CHECK_INT(t.active.fg, 0x000000);       /* at 74 %, Motif's black */
 	CHECK(!t.has_fg && !t.has_active_fg);
-	CHECK_INT(t.dim, 0x3d3e44);
+	/* The built-in grey takes black, where Motif gives white at 67 %. */
+	CHECK_INT(t.inactive.fg, 0x000000);
+	CHECK_INT(t.dim, 0x3c3c3c);
+	/* A grey that is set, the same one too, gets Motif's white; so does one from
+	 * the environment. One that is no colour counts as not set. */
+	rc(dir, "Mwm*background: #aaaaaa\n");
+	mtk_theme_load(&t);
+	CHECK_INT(t.inactive.fg, 0xffffff);
+	rc(dir, "");
+	setenv("MWC_INACTIVE", "#aaaaaa", 1);
+	mtk_theme_load(&t);
+	CHECK_INT(t.inactive.fg, 0xffffff);
+	unsetenv("MWC_INACTIVE");
+	rc(dir, "Mwm*background: nonsense\n");
+	mtk_theme_load(&t);
+	CHECK(t.inactive.bg == 0xaaaaaa && t.inactive.fg == 0x000000);
+	rc(dir, "Mwm*foreground: #ffffff\n");
+	mtk_theme_load(&t);
+	CHECK_INT(t.inactive.fg, 0xffffff);
+	rc(dir, "Mwm*activeBackground: #8c8c8c\n");
+	mtk_theme_load(&t);
+	CHECK_INT(t.inactive.fg, 0x000000);
 
 	rc(dir, "Mwm*background: #102030\nMwm*activeBackground: gold\n"
 	   "Mwm*foreground: white\nMwm*activeForeground: rgb:1/2/3\n");

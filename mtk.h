@@ -17,7 +17,7 @@
 #include <xkbcommon/xkbcommon.h>
 #include <xkbcommon/xkbcommon-compose.h>
 
-#define MTK_VERSION "0.7.0"
+#define MTK_VERSION "0.8.0"
 
 /* ---- colours (color.c) ---------------------------------------------------- */
 
@@ -67,9 +67,10 @@ char *mtk_mwmrc_get(const char *key, char *val, size_t n);
 /* The value of the last "Mwm*app*key: value" line, for one client. */
 char *mtk_mwmrc_client_get(const char *app, const char *key, char *val, size_t n);
 
-/* The colours mwc draws with: MWC_INACTIVE, else Mwm*background, else #aeb2c3;
- * MWC_ACTIVE, else Mwm*activeBackground, else #7387ad. The text is
- * Mwm*foreground and Mwm*activeForeground, else mtk_text_color(). */
+/* The colours mwc draws with: MWC_INACTIVE, else Mwm*background, else #aaaaaa;
+ * MWC_ACTIVE, else Mwm*activeBackground, else #c6c1aa, IRIX's Base scheme. The
+ * text is Mwm*foreground and Mwm*activeForeground, else mtk_text_color(); on the
+ * built-in grey black, as mwc has it. */
 struct mtk_theme {
 	struct mtk_shade inactive, active;
 	int has_fg, has_active_fg;      /* the user set the text colour */

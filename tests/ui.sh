@@ -34,11 +34,11 @@ SHOT=$SMOKE_DIR/ui.png
 ERR_SHOT=$MTK_DIR/build/ui-last.png
 DS=$SMOKE_DIR/demo.state
 # Motif 2.3.8's shades of mwc's default colours, as mwc draws its own frames.
-TOP=dddee6      # the light shadow of #aeb2c3
-ACT_TOP=c0c9da  # ... of #7387ad, the border with the keyboard
-BOT=5e6069
-BG=aeb2c3
-SEL=7387ad      # activeBackground: a lit menu item
+TOP=dadada      # the light shadow of #aaaaaa, mwc's default
+ACT_TOP=e7e5db  # ... of #c6c1aa, the border with the keyboard
+BOT=5a5a5a
+BG=aaaaaa
+SEL=c6c1aa      # activeBackground: a lit menu item
 
 mkdir -p "$XDG_CONFIG_HOME/mwc"
 : >"$XDG_CONFIG_HOME/mwc/mwmrc"
@@ -95,7 +95,7 @@ echo "ok: no server-side decoration unless asked"
 check "it has the keyboard" "[ \"\$(get mtkdemo kbfocus)\" = 1 ]"
 check "it knows" "[ \"\$(ds focus)\" = 1 ]"
 pixel_at "its border is the active one, in Motif's light shadow" 0 60 $ACT_TOP
-pixel_at "the face beside the bevel" 2 60 7387ad
+pixel_at "the face beside the bevel" 2 60 c6c1aa
 
 # Another window takes the keyboard: the border goes inactive.
 WAYLAND_DISPLAY=wayland-0 build/xdgc app=thief size=200x100 >"$SMOKE_DIR/thief.log" 2>&1 &
@@ -260,7 +260,7 @@ where
 check "the same size in the layout" "[ \"\$(get mtkdemo w)x\$(get mtkdemo h)\" = 300x120 ]"
 SC=2
 pixel_at "the bevel in buffer pixels" $((2 * 1 + 1)) 120 $ACT_TOP
-pixel_at "the face right beside it" 4 120 7387ad
+pixel_at "the face right beside it" 4 120 c6c1aa
 SC=1
 sed -i '/outputScale/d' "$XDG_CONFIG_HOME/mwc/mwmrc"
 reload_mwc
