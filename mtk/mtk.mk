@@ -29,7 +29,8 @@ MTK_PROTO_C = $(MTK_PROTO_NAMES:%=$(MTK_BUILD)/%-protocol.c)
 MTK_HEADLESS = $(MTK_DIR)/color.c $(MTK_DIR)/rc.c $(MTK_DIR)/draw.c \
 	$(MTK_DIR)/input.c $(MTK_DIR)/field.c
 MTK_SRC = $(MTK_HEADLESS) $(MTK_DIR)/wl.c $(MTK_PROTO_C)
-MTK_DEPS = $(MTK_SRC) $(MTK_DIR)/mtk.h $(MTK_PROTO_H)
+MTK_DEPS = $(MTK_SRC) $(MTK_DIR)/mtk.h $(MTK_DIR)/mwc_color.h $(MTK_DIR)/mwc/color.c \
+	$(MTK_DIR)/mwc/color.h $(MTK_PROTO_H)
 MTK_CFLAGS = -std=c11 -Wall -Wextra -Wno-unused-parameter -I$(MTK_DIR) -I$(MTK_BUILD) \
 	$(shell $(PKG_CONFIG) --cflags $(MTK_PKGS))
 MTK_LIBS = $(shell $(PKG_CONFIG) --libs $(MTK_PKGS)) -lm

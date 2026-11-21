@@ -20,9 +20,10 @@ asks them and talks Wayland; what it does is tested through `demo/mtkdemo.c` and
 
 ## Rules
 
-- Colours, shadows and text colour follow mwc's `src/draw.c`; its
-  `tests/unit/draw_test.c` values are in `tests/unit/color_test.c`. A change there is
-  made here too.
+- Colours, shadows and text colour are mwc's: `mwc/color.c` and `mwc/color.h` are
+  its `src/color.c` and `color.h`, unchanged, copied anew when mwc changes them.
+  `mwc_color.h` gives them `mtk_` names, `make check` compares them with mwc's. The
+  cases of mwc's `tests/unit/color_test.c` are in `tests/unit/color_test.c`.
 - Every public name starts with `mtk_` or `MTK_`: the clients have their own `mix`,
   `fill` and `bevel` until they are moved over.
 - mtk is vendored in the clients with git subtree (README.md). A change to `mtk.h`
