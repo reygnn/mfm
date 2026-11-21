@@ -23,7 +23,6 @@ exec "$engine" run --rm --network=none --security-opt seccomp=unconfined \
 		rm -rf build mwc .git
 		make -s -j"$(nproc)" mwc build/vinput build/pngtool >/dev/null
 		cd ~/w/mfm
-		rm -rf .git
 		make -s clean
 		make -s
 		make -s check

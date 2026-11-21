@@ -18,12 +18,23 @@ PROTO_C = build/ext-data-control-v1-protocol.c
 CFLAGS ?= -O2 -g
 MFM_CFLAGS = $(MTK_CFLAGS) -Ibuild
 
-mfm: mfm.c theme.c theme.h version.h $(PROTO_H) $(PROTO_C) $(MTK_DEPS)
+mfm: mfm.c theme.c theme.h version.h build/gitversion.h $(PROTO_H) $(PROTO_C) $(MTK_DEPS)
 	$(CC) $(MFM_CFLAGS) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ mfm.c theme.c \
 		$(PROTO_C) $(MTK_SRC) $(MTK_LIBS) $(LDLIBS)
 
 build:
 	mkdir -p build
+
+# The commit a build is from, after the version: +DATE.TIME.HASH, its commit time in
+# UTC, and .dirty for changes not committed. Rewritten only when it changes, so
+# mfm is linked again only then; empty without git.
+build/gitversion.h: FORCE | build
+	@v=$$(TZ=UTC0 git log -1 --format=%cd.%h --date=format-local:%Y%m%d.%H%M 2>/dev/null); \
+	if [ -n "$$v" ] && ! git diff --quiet HEAD 2>/dev/null; then v=$$v.dirty; fi; \
+	line="#define MFM_GIT \"$${v:++$$v}\""; \
+	[ "$$(cat $@ 2>/dev/null)" = "$$line" ] || echo "$$line" >$@
+
+FORCE:
 
 build/ext-data-control-v1-client-protocol.h: $(DATA_CONTROL) | build
 	$(MTK_SCANNER) client-header $(DATA_CONTROL) $@
@@ -76,4 +87,4 @@ test-docker:
 clean:
 	rm -rf mfm build
 
-.PHONY: all install uninstall check test test-docker clean
+.PHONY: all install uninstall check test test-docker clean FORCE

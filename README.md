@@ -27,7 +27,8 @@ another program.
 
 Without an argument mfm starts in the current directory; given a file, it opens its
 folder and selects it. `-h` prints the usage, `-v` the version, which is set in
-`version.h`. To start it with mwc, in `~/.config/mwc/autostart`:
+`version.h`, and the commit built, as `VERSION+DATE.TIME.HASH` with its commit time in UTC
+and `.dirty` for changes not committed. To start it with mwc, in `~/.config/mwc/autostart`:
 
     mfm "$HOME" &
 

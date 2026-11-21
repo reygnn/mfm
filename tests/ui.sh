@@ -44,7 +44,13 @@ for args in --help -x "a b"; do
 		fail "$args: status $status, stdout '$out'"
 done
 echo "ok: -h on stdout, --help and the rest refused on stderr"
-want=$(sed -n 's/^#define MFM_VERSION "\(.*\)"$/mfm \1/p' "$MFM_DIR/version.h")
+# The version from version.h, then the commit the build is from where git knows it.
+want=$(sed -n 's/^#define MFM_VERSION "\([^"]*\)".*/mfm \1/p' "$MFM_DIR/version.h")
+if commit=$(TZ=UTC0 git -C "$MFM_DIR" log -1 --format=%cd.%h \
+		--date=format-local:%Y%m%d.%H%M 2>/dev/null); then
+	git -C "$MFM_DIR" diff --quiet HEAD || commit=$commit.dirty
+	want=$want+$commit
+fi
 out=$("$MFM" -v) && [ "$out" = "$want" ] || fail "-v: status $?, '$out', not '$want'"
 echo "ok: -v prints $want"
 # A write error on stdout, a full disk or a closed stdout, is status 1 with a
