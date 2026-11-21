@@ -1,4 +1,5 @@
 /* input.c - keys, key repeat, seats and cursor sizes, without Wayland. */
+#include <ctype.h>
 #include <limits.h>
 #include <math.h>
 #include <stdlib.h>
@@ -188,13 +189,23 @@ int mtk_key_translate(struct xkb_state *st, struct xkb_compose_state *compose,
 
 xkb_keysym_t mtk_latin_sym(struct xkb_keymap *map, uint32_t kc, xkb_keysym_t ks)
 {
-	if (ks <= 0xff || !map)
+	if ((ks < 0x80 && isalnum((int)ks)) || !map)
 		return ks;
 	xkb_layout_index_t n = xkb_keymap_num_layouts_for_key(map, kc);
-	for (xkb_layout_index_t g = 0; g < n; g++) {
+	for (xkb_layout_index_t l = 0; l < n; l++)
+		for (xkb_level_index_t lv = 0; lv < 2; lv++) {
+			const xkb_keysym_t *syms;
+			if (xkb_keymap_key_get_syms_by_level(map, kc, l, lv, &syms) == 1 &&
+			    syms[0] < 0x80 && (isdigit((int)syms[0]) ||
+			    (lv == 0 && isalpha((int)syms[0]))))
+				return syms[0];
+		}
+	if (ks < 0x100)
+		return ks;
+	for (xkb_layout_index_t l = 0; l < n; l++) {
 		const xkb_keysym_t *syms;
-		if (xkb_keymap_key_get_syms_by_level(map, kc, g, 0, &syms) > 0 &&
-		    syms[0] <= 0xff)
+		if (xkb_keymap_key_get_syms_by_level(map, kc, l, 0, &syms) == 1 &&
+		    syms[0] > 0x20 && syms[0] < 0x7f)
 			return syms[0];
 	}
 	return ks;

@@ -195,9 +195,11 @@ struct xkb_compose_state *mtk_compose_new(struct xkb_context *ctx);
 int mtk_key_translate(struct xkb_state *st, struct xkb_compose_state *compose,
 	uint32_t kc, xkb_keysym_t *sym, char utf8[64]);
 
-/* For a shortcut: in a layout without Latin letters, such as Russian, the key that
- * is ks in the first layout of map that has a Latin one there, as Qt reads it; ks
- * itself where it is Latin already or no layout has one. */
+/* For a shortcut, the key as it is in the first layout of map that gives a Latin
+ * letter or a digit there, as Qt and mfm read it: in Russian, Ctrl+U is the key that
+ * is U in a Latin layout. A digit counts on its level with Shift too: AZERTY has "&"
+ * there without it, and Ctrl+1 would never come. Else ks, or for a key past Latin-1
+ * the first printable ASCII any layout has on it. */
 xkb_keysym_t mtk_latin_sym(struct xkb_keymap *map, uint32_t kc, xkb_keysym_t ks);
 
 /* Key repeat, by the compositor's rate (keys a second, 0 for none) and delay

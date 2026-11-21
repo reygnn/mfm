@@ -134,6 +134,19 @@ TEST(latin)
 	CHECK_INT(mtk_latin_sym(ru, KC_LEFT, XKB_KEY_Left), XKB_KEY_Left);
 	xkb_state_unref(s);
 	xkb_keymap_unref(ru);
+	/* AZERTY: the "&" key is 1 for a shortcut, "é" is 2, "a" stays a. */
+	names.layout = "fr";
+	struct xkb_keymap *fr = xkb_keymap_new_from_names(ctx, &names,
+		XKB_KEYMAP_COMPILE_NO_FLAGS);
+	CHECK(fr != NULL);
+	if (fr) {
+		enum { KC_1 = 10, KC_2 = 11, KC_Q_POS = 24 };
+		CHECK_INT(mtk_latin_sym(fr, KC_1, XKB_KEY_ampersand), XKB_KEY_1);
+		CHECK_INT(mtk_latin_sym(fr, KC_2, XKB_KEY_eacute), XKB_KEY_2);
+		CHECK_INT(mtk_latin_sym(fr, KC_Q_POS, XKB_KEY_a), XKB_KEY_a);
+		CHECK_INT(mtk_latin_sym(fr, KC_SHIFT, XKB_KEY_Shift_L), XKB_KEY_Shift_L);
+		xkb_keymap_unref(fr);
+	}
 	/* Without a Latin layout at all: ks. */
 	names.layout = "ru";
 	ru = xkb_keymap_new_from_names(ctx, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
