@@ -9,7 +9,7 @@ CLAUDE.md.
 | Target | |
 |---|---|
 | `make` | mfm |
-| `make check` | the seat list (`seats.c`) and the colours (`theme.c`) under ASan and UBSan, no compositor |
+| `make check` | the colours (`theme.c`) with mtk's modules without Wayland, under ASan and UBSan, no compositor |
 | `make test` | `tests/ui.sh` and `tests/files.sh` under a headless mwc; logs in `build/` |
 | `make test-docker` | `make check` and `make test` in a Podman container, image `mfm-test` |
 
@@ -24,5 +24,7 @@ Polling helpers: `check`, `wait_for`, `pixel_is`, `reload_mwc` from mwc's
 
 ## Rules
 
+- `mtk/` is mtk, vendored with git subtree: changed in mtk's repository and taken
+  with `git subtree pull --prefix=mtk`, never edited here.
 - mfm-x11 is outdated and not maintained; nothing is carried over to it.
 - Keys and settings are documented in `mfm.1`; the README keeps one line each.

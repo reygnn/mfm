@@ -79,12 +79,15 @@ with only `WAYLAND_SOCKET` cannot hand anything to the clipboard.
 
 ## Seats
 
-mfm keeps the first eight seats the compositor announces and uses the oldest one left.
+mtk keeps the first eight seats the compositor announces and uses the oldest one left.
 One beyond that is taken only if it is announced again after the others went.
 
 
 ## Colours
 
-Text has at least 4.5:1 on what it is drawn on, with one exception: a foreground
-or activeForeground that is set stays as it is on the window and on the
-selection, as mwc takes it for its titles, and can read badly there.
+Text has at least 4.5:1 on what it is drawn on, except on the window and on the
+selection. There, as on mwc's titles, a foreground or activeForeground that is set
+stays as it is, and without one the text is black or white by Motif's rule, which
+on a mid-tone can fall short: on mwc's activeBackground `#7387ad` the selected
+row's text is white at about 3.8:1. Dimmed text there never reads worse than the
+text.

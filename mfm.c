@@ -2,10 +2,11 @@
  * mfm - a minimal file manager for Wayland, in the Motif look of mwc
  * (https://github.com/reygnn/mwc). The X11 version is mfm-x11.
  *
- * libwayland, Pango and Cairo, one file, no toolkit. It reads the same
- * colours as mwc: MWC_INACTIVE / MWC_ACTIVE from the environment, else
- * Mwm*background and Mwm*activeBackground from ~/.config/mwc/mwmrc, else the
- * Motif defaults.
+ * One file on mtk (mtk/), the toolkit of mwc's clients, which brings the window,
+ * the menu's popup, the seat, the keys, the cursor and the colours; the clipboard
+ * of the session is its own connection. It reads the same colours as mwc:
+ * MWC_INACTIVE / MWC_ACTIVE from the environment, else Mwm*background and
+ * Mwm*activeBackground from ~/.config/mwc/mwmrc, else the Motif defaults.
  *
  * Keys:   Up/Down/PgUp/PgDn/Home/End  move      Return / Right  open
  *         Backspace / Left / Alt+Up   parent    Alt+Home        home dir
@@ -41,7 +42,6 @@
  * $PATH, never in the directory being browsed.
  */
 #define _GNU_SOURCE
-#include <cairo.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -49,8 +49,6 @@
 #include <limits.h>
 #include <linux/input-event-codes.h>
 #include <locale.h>
-#include <math.h>
-#include <pango/pangocairo.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -59,7 +57,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -67,16 +64,11 @@
 #include <time.h>
 #include <unistd.h>
 #include <wayland-client.h>
-#include <wayland-cursor.h>
 #include <wctype.h>
-#include <xkbcommon/xkbcommon-compose.h>
-#include <xkbcommon/xkbcommon.h>
+#include <xkbcommon/xkbcommon-keysyms.h>
 
 #include "ext-data-control-v1-client-protocol.h"
-#include "viewporter-client-protocol.h"
-#include "xdg-decoration-unstable-v1-client-protocol.h"
-#include "xdg-shell-client-protocol.h"
-#include "seats.h"
+#include "mtk.h"
 #include "theme.h"
 #include "version.h"
 
@@ -86,7 +78,6 @@
 #define DCLICK_MS 400
 #define TYPEAHEAD_MS 1000
 #define POLL_MS 1000
-#define MAX_STEPS 20    /* wheel steps in one frame */
 #define MENU_CLICK_MS 300       /* a quicker click leaves the menu open */
 /* The widest that format_date() and human() give: the columns' widths. */
 #define DATE_WIDEST "0000-00-00 00:00"
@@ -146,7 +137,6 @@ static size_t pcur;
 static int up_pressed, dragging, drag_off;
 static uint32_t last_click;
 static int last_idx = -1;
-static int dirty = 1;
 
 /* Ctrl+C / Ctrl+X: names in clip_dir to copy or move on Ctrl+V */
 static char clip_dir[PATH_MAX];
@@ -181,27 +171,6 @@ static struct {
 
 /* ---- Wayland ------------------------------------------------------------ */
 
-/* One wl_shm buffer with a Cairo context on it. */
-struct shmbuf {
-	struct wl_buffer *wl;
-	cairo_surface_t *cs;
-	cairo_t *cr;
-	void *data;
-	size_t size;
-	int w, h;
-	int busy;       /* the compositor still reads it */
-	int stale;      /* wrong size: free it as soon as it is released */
-};
-
-struct wsurf {
-	struct wl_surface *wl;
-	struct wl_callback *frame;      /* a frame is on its way */
-	struct shmbuf *b[2];
-	struct shmbuf *shown;           /* the last one committed, if kept */
-	int scale;                      /* of the buffer last drawn */
-	int shown_scale;
-};
-
 /* Modifiers and held buttons, in the state of a pointer event. */
 enum { MOD_SHIFT = 1, MOD_CTRL = 2, MOD_ALT = 4, BTN1_HELD = 8, BTN2_HELD = 16 };
 enum { B_LEFT = 1, B_MIDDLE = 2, B_RIGHT = 3, B_WHEEL_UP = 4, B_WHEEL_DOWN = 5,
@@ -213,51 +182,10 @@ struct pev {
 	unsigned state;
 };
 
-static struct wl_display *dpy;
-static struct wl_compositor *compositor;
-static struct wl_shm *shm;
-static struct wl_seat *seat;
-static uint32_t seat_global;    /* its name in the registry */
-static struct wl_registry *registry;
-/* Every seat announced, the bound one too: the next is taken when it goes. */
-static struct seats seats;
-static struct wp_viewporter *viewporter;
-static struct xdg_wm_base *wm_base;
-static struct zxdg_decoration_manager_v1 *deco_mgr;
-static struct wsurf main_s;
-static struct xdg_surface *main_xdg;
-static struct xdg_toplevel *toplevel;
-static int configured;          /* the first configure has arrived */
-static int scale = 1;           /* buffer pixels per surface pixel */
-static int need_commit;         /* a configure waits for its commit */
-static int pend_w, pend_h;      /* size of the configure in progress */
-static int pend_bound;          /* ... which is maximized, tiled or the like */
-static int float_w = 680, float_h = 480; /* the size of its own to go back to */
-
-static struct wl_pointer *pointer;
-static struct wl_surface *ptr_surface;
+static struct mtk *m;
+static struct mtk_window *win;
+static struct mtk_window *ptr_on;       /* the window or the menu the pointer is on */
 static int ptr_x, ptr_y;
-static unsigned btn_mask;
-static double axis_acc;
-static int axis_steps;
-static struct wl_surface *cursor_surf;
-static struct wl_cursor_theme *cursor_theme;
-static struct wl_cursor_image *cursor_img;
-static int cursor_scale;        /* the scale it was loaded at, 0 for none yet */
-static int cursor_buf_scale;    /* its buffer's scale: one that divides its size */
-static struct wp_viewport *cursor_vp;
-static int cursor_vw, cursor_vh; /* its size on the window, if the viewport sets it */
-static uint32_t ptr_serial;     /* of the last enter, for set_cursor */
-static void cursor_update(void);
-
-static struct wl_keyboard *keyboard;
-static struct xkb_context *xkb;
-static struct xkb_keymap *kb_map;
-static struct xkb_state *kb_state;
-static struct xkb_compose_state *compose;
-static uint32_t repeat_kc;      /* xkb keycode of the repeating key, or 0 */
-static uint64_t repeat_next;
-static int repeat_rate = 25, repeat_delay = 600;
 
 static int W = 680, H = 480;
 static uint32_t px_bg, px_top, px_bot, px_list, px_sel, px_trough,
@@ -274,9 +202,7 @@ static struct rect r_up, r_path, r_list, r_sb, r_status;
 
 static uint64_t now_ms(void)
 {
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+	return mtk_now();
 }
 
 /* A type-ahead is going on: keys still add to the name. */
@@ -285,177 +211,13 @@ static int searching(void)
 	return search[0] && now_ms() - search_ms < TYPEAHEAD_MS;
 }
 
-/* ---- buffers ------------------------------------------------------------ */
-
-static void buf_free(struct shmbuf *b)
+static void redraw(void)
 {
-	cairo_destroy(b->cr);
-	cairo_surface_destroy(b->cs);
-	wl_buffer_destroy(b->wl);
-	munmap(b->data, b->size);
-	free(b);
+	if (win)
+		mtk_window_redraw(win);
 }
 
-static void buf_release(void *data, struct wl_buffer *wl)
-{
-	struct shmbuf *b = data;
-	b->busy = 0;
-	if (b->stale)
-		buf_free(b);
-}
-
-static const struct wl_buffer_listener buf_listener = { buf_release };
-
-static struct shmbuf *buf_new(int w, int h)
-{
-	int stride = cairo_format_stride_for_width(CAIRO_FORMAT_RGB24, w);
-	size_t size = (size_t)stride * h;
-	struct shmbuf *b = calloc(1, sizeof *b);
-	int fd = memfd_create("mfm", MFD_CLOEXEC);
-	void *data = MAP_FAILED;
-	if (b && fd >= 0 && ftruncate(fd, size) == 0)
-		data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-	if (data == MAP_FAILED) {
-		fprintf(stderr, "mfm: no memory for a %dx%d buffer: %s\n", w, h,
-			strerror(errno));
-		exit(1);
-	}
-	struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, size);
-	b->wl = wl_shm_pool_create_buffer(pool, 0, w, h, stride,
-		WL_SHM_FORMAT_XRGB8888);
-	wl_shm_pool_destroy(pool);
-	close(fd);
-	wl_buffer_add_listener(b->wl, &buf_listener, b);
-	b->data = data;
-	b->size = size;
-	b->w = w;
-	b->h = h;
-	b->cs = cairo_image_surface_create_for_data(data, CAIRO_FORMAT_RGB24, w, h,
-		stride);
-	b->cr = cairo_create(b->cs);
-	cairo_set_antialias(b->cr, CAIRO_ANTIALIAS_NONE);       /* not the text */
-	return b;
-}
-
-/* A buffer of this size in surface pixels to draw on, with its Cairo context
- * scaled to match, or NULL while the compositor holds both; its release wakes
- * the main loop. The scale is s->scale: the output's, unless the buffer would
- * be too large. */
-static struct shmbuf *wsurf_buffer(struct wsurf *s, int w, int h)
-{
-	/* Cairo draws at most 32767 pixels a side, and a wl_shm pool holds
-	 * less than 2 GiB: a scale that goes past either is lowered, and past
-	 * that the buffer is cut, smaller than a maximized window should be.
-	 * No output is that large. */
-	enum { SIDE = 32767 };
-	int sc = scale;
-	while (sc > 1 && ((int64_t)w * sc > SIDE || (int64_t)h * sc > SIDE ||
-	    (int64_t)w * sc * 4 * h * sc > INT32_MAX))
-		sc--;
-	w = MIN(w * sc, SIDE);
-	h = MIN(MIN(h * sc, SIDE), INT32_MAX / 4 / MAX(w, 1));
-	s->scale = sc;
-	for (int i = 0; i < 2; i++) {
-		struct shmbuf *b = s->b[i];
-		if (!b || (b->w == w && b->h == h))
-			continue;
-		if (s->shown == b)
-			s->shown = NULL;
-		if (b->busy)
-			b->stale = 1;
-		else
-			buf_free(b);
-		s->b[i] = NULL;
-	}
-	/* Not the one shown, if the other is free: that keeps what the
-	 * compositor has, to compare the next frame with. */
-	struct shmbuf *b = NULL;
-	for (int i = 0; i < 2 && !b; i++)
-		if (s->b[i] && !s->b[i]->busy && s->b[i] != s->shown)
-			b = s->b[i];
-	for (int i = 0; i < 2 && !b; i++)
-		if (!s->b[i])
-			b = s->b[i] = buf_new(w, h);
-	for (int i = 0; i < 2 && !b; i++)
-		if (s->b[i] && !s->b[i]->busy)
-			b = s->b[i];
-	if (b) {
-		cairo_identity_matrix(b->cr);
-		cairo_scale(b->cr, s->scale, s->scale);
-	}
-	return b;
-}
-
-static void frame_done(void *data, struct wl_callback *cb, uint32_t time)
-{
-	struct wsurf *s = data;
-	wl_callback_destroy(cb);
-	s->frame = NULL;
-}
-
-static const struct wl_callback_listener frame_listener = { frame_done };
-
-/* Commit b, with damage for the rows that differ from what was shown: the
- * compositor copies and composites only those. */
-static void wsurf_present(struct wsurf *s, struct shmbuf *b)
-{
-	cairo_surface_flush(b->cs);
-	if (s->frame)
-		wl_callback_destroy(s->frame);
-	s->frame = wl_surface_frame(s->wl);
-	wl_callback_add_listener(s->frame, &frame_listener, s);
-	wl_surface_set_buffer_scale(s->wl, s->scale);
-	wl_surface_attach(s->wl, b->wl, 0, 0);
-	const struct shmbuf *o = s->shown;
-	if (o && o != b && o->w == b->w && o->h == b->h &&
-	    s->shown_scale == s->scale) {
-		/* Runs of changed rows, a few at most: the last one takes in
-		 * the rest. A gap of a few rows is not worth a rectangle. The
-		 * ends are trimmed first, so only what lies between the first
-		 * and the last change is read for gaps. */
-		enum { RECTS = 4, GAP = 8 };
-		size_t row = b->size / b->h;
-		const char *p = b->data, *q = o->data;
-		int y0 = 0, y1 = b->h;
-		while (y0 < y1 && !memcmp(p + y0 * row, q + y0 * row, row))
-			y0++;
-		while (y1 > y0 && !memcmp(p + (y1 - 1) * row,
-		    q + (y1 - 1) * row, row))
-			y1--;
-		int n = 0, start = y0, last = y0;
-		for (int y = y0 + 1; y < y1 && n < RECTS - 1; y++) {
-			if (!memcmp(p + y * row, q + y * row, row))
-				continue;
-			if (y - last > GAP * s->scale) {
-				wl_surface_damage_buffer(s->wl, 0, start, b->w,
-					last + 1 - start);
-				n++;
-				start = y;
-			}
-			last = y;
-		}
-		if (y1 > y0)
-			wl_surface_damage_buffer(s->wl, 0, start, b->w,
-				y1 - start);
-	} else {
-		wl_surface_damage_buffer(s->wl, 0, 0, b->w, b->h);
-	}
-	wl_surface_commit(s->wl);
-	b->busy = 1;
-	s->shown = b;
-	s->shown_scale = s->scale;
-}
-
-static void wsurf_destroy(struct wsurf *s)
-{
-	if (s->frame)
-		wl_callback_destroy(s->frame);
-	wl_surface_destroy(s->wl);
-	for (int i = 0; i < 2; i++)
-		if (s->b[i])
-			buf_free(s->b[i]);
-	memset(s, 0, sizeof *s);
-}
+static void menu_redraw(void);
 
 /* ---- UTF-8 -------------------------------------------------------------- */
 
@@ -691,31 +453,7 @@ static int prefix_ci(const char *name, const char *pre)
  * digits per channel. */
 static int parse_color(const char *s, uint32_t *out)
 {
-	PangoColor c;
-	if (!s || !*s)
-		return 0;
-	if (!strncasecmp(s, "rgb:", 4)) {
-		uint32_t rgb = 0;
-		s += 4;
-		for (int i = 0; i < 3; i++) {
-			/* Only hex digits: strtoul alone also takes blanks, signs
-			 * and 0x. */
-			int digits = strspn(s, "0123456789abcdefABCDEF");
-			if (digits < 1 || digits > 4 ||
-			    s[digits] != (i < 2 ? '/' : '\0'))
-				return 0;
-			unsigned long v = strtoul(s, NULL, 16);
-			unsigned long max = (1ul << (4 * digits)) - 1;
-			rgb = rgb << 8 | (v * 255 + max / 2) / max;
-			s += digits + 1;
-		}
-		*out = rgb;
-		return 1;
-	}
-	if (!pango_color_parse(&c, s))
-		return 0;
-	*out = (uint32_t)(c.red >> 8) << 16 | (c.green >> 8) << 8 | (c.blue >> 8);
-	return 1;
+	return mtk_parse_color(s, out);
 }
 
 /* `key` from $XDG_CONFIG_HOME/`file` (default ~/.config/`file`), resource
@@ -857,7 +595,7 @@ static void theme_init(void)
 	uint32_t bg = setting("MWC_INACTIVE", "background", 0xaeb2c3);
 	uint32_t act = setting("MWC_ACTIVE", "activeBackground", 0x7387ad);
 	uint32_t fg, sel_fg;
-	/* Text as mwc's titles: the resource if set, else black or white. */
+	/* Text as mwc's titles: the resource if set, else as Motif picks it. */
 	int has_fg = rc_color("foreground", &fg);
 	int has_sel = rc_color("activeForeground", &sel_fg);
 	struct theme t;
@@ -932,7 +670,7 @@ static void set_status(int err, const char *fmt, ...)
 		u8_cut(status_msg);
 	va_end(ap);
 	status_err = err;
-	dirty = 1;
+	redraw();
 	errno = saved;
 }
 
@@ -940,7 +678,7 @@ static void clear_status(void)
 {
 	if (status_msg[0]) {
 		status_msg[0] = 0;
-		dirty = 1;
+		redraw();
 	}
 }
 
@@ -1113,7 +851,7 @@ static void set_title(void)
 			d++;
 	}
 	snprintf(t, sizeof t, "mfm: %s", d);
-	xdg_toplevel_set_title(toplevel, t);
+	mtk_window_set_title(win, t);
 }
 
 static int rows_vis(void)
@@ -1138,7 +876,7 @@ static void scroll_to(int t)
 	top = t;
 	clamp_top();
 	if (top != old)
-		dirty = 1;
+		redraw();
 }
 
 static void show_sel(void)
@@ -1280,7 +1018,7 @@ static int load(const char *path, const char *select, int fallback)
 		}
 	top = 0;
 	show_sel();
-	if (toplevel)
+	if (win)
 		set_title();
 	if (rerr) {
 		set_status(1, "%s: listing incomplete: %s", path,
@@ -1291,7 +1029,7 @@ static int load(const char *path, const char *select, int fallback)
 			clear_status();         /* that error no longer holds */
 		load_err[0] = 0;
 	}
-	dirty = 1;
+	redraw();
 	return 0;
 oom:
 	closedir(d);
@@ -1573,7 +1311,7 @@ static void toggle_mark(int i)
 {
 	if (i >= 0 && i < nents && !ents[i].up) {
 		ents[i].mark = !ents[i].mark;
-		dirty = 1;
+		redraw();
 	}
 }
 
@@ -1586,14 +1324,14 @@ static void mark_all(void)
 			all = 0;
 	for (int i = 0; i < nents; i++)
 		ents[i].mark = !all && !ents[i].up;
-	dirty = 1;
+	redraw();
 }
 
 static void unmark_all(void)
 {
 	for (int i = 0; i < nents; i++)
 		ents[i].mark = 0;
-	dirty = 1;
+	redraw();
 }
 
 static void free_names(char **v, int n)
@@ -2560,7 +2298,7 @@ static void select_name(const char *name)
 		if (!strcmp(ents[i].name, name)) {
 			sel = i;
 			show_sel();
-			dirty = 1;
+			redraw();
 			return;
 		}
 }
@@ -2571,7 +2309,7 @@ static void clip_clear(void)
 	clip = NULL;
 	nclip = 0;
 	clip_gen++;
-	dirty = 1;
+	redraw();
 }
 
 /* After a move from the clipboard that failed on some items: only those
@@ -2591,7 +2329,7 @@ static void clip_keep(const char *keep)
 		clip = NULL;
 	}
 	clip_gen++;
-	dirty = 1;
+	redraw();
 }
 
 static void job_done(void)
@@ -3102,7 +2840,7 @@ static void ask_delete(void)
 	pend = v;
 	npend = n;
 	snprintf(pend_dir, sizeof pend_dir, "%s", cwd);
-	dirty = 1;
+	redraw();
 }
 
 static void answer_delete(int yes)
@@ -3114,7 +2852,7 @@ static void answer_delete(int yes)
 	free_names(pend, npend);
 	pend = NULL;
 	npend = 0;
-	dirty = 1;
+	redraw();
 }
 
 /* ---- navigation --------------------------------------------------------- */
@@ -3231,7 +2969,7 @@ static void move_sel(int d)
 	last_idx = -1;
 	sel += d;
 	show_sel();
-	dirty = 1;
+	redraw();
 }
 
 static char climb_failed[PATH_MAX];
@@ -3338,7 +3076,7 @@ static void typeahead(const char *txt, int n)
 		}
 	}
 	g_free(pre);
-	dirty = 1;
+	redraw();
 }
 
 /* ---- text input ------------------------------------------------------- */
@@ -3481,7 +3219,7 @@ static int line_key(char *b, size_t sz, size_t *cur, int *fresh, int selects,
 		u8_next(&p);
 	*fresh = 0;
 	*cur = p - b;
-	dirty = 1;
+	redraw();
 	return 0;
 }
 
@@ -3492,14 +3230,14 @@ static void edit_begin(void)
 	    strcmp(cwd, "/") ? "/" : "") >= sizeof edit)
 		snprintf(edit, sizeof edit, "%s", cwd);
 	edit_cur = strlen(edit);
-	dirty = 1;
+	redraw();
 }
 
 static void edit_commit(void)
 {
 	char t[PATH_MAX];
 	editing = 0;
-	dirty = 1;
+	redraw();
 	if (!edit[0])
 		return;
 	if (edit[0] == '~' && (edit[1] == 0 || edit[1] == '/')) {
@@ -3527,7 +3265,7 @@ static void edit_key(xkb_keysym_t ks, const char *txt, int n, int ctrl)
 		edit_commit();
 	} else if (r < 0) {
 		editing = 0;
-		dirty = 1;
+		redraw();
 	}
 }
 
@@ -3604,7 +3342,7 @@ static void prompt_begin(int kind)
 	snprintf(pdir, sizeof pdir, "%s", cwd);
 	search[0] = 0;
 	clear_status();
-	dirty = 1;
+	redraw();
 }
 
 #define HIDDEN_SHOWN ", hidden files shown (Ctrl+H hides them)"
@@ -3624,7 +3362,7 @@ static void prompt_commit(void)
 	char p[PATH_MAX], q[PATH_MAX];
 	int kind = prompt;
 	prompt = PR_NONE;
-	dirty = 1;
+	redraw();
 	if (!pbuf[0] || (kind == PR_RENAME && !strcmp(pbuf, pold)))
 		return;
 	if (strcmp(pdir, cwd)) {        /* the directory went away meanwhile */
@@ -3691,7 +3429,7 @@ static void prompt_key(xkb_keysym_t ks, const char *txt, int n, int ctrl)
 		prompt_commit();
 	} else if (r < 0) {
 		prompt = PR_NONE;
-		dirty = 1;
+		redraw();
 	}
 }
 
@@ -4134,16 +3872,11 @@ static void paint(void)
 	text_fit(sc, in_s.x, in_s.y, in_s.h, in_s.w - rw, s, 0);
 }
 
-/* 0 if the compositor holds both buffers: try again after a release. */
-static int draw(void)
+static void paint_main(struct mtk_window *w, cairo_t *c, int width, int height,
+	void *data)
 {
-	struct shmbuf *b = wsurf_buffer(&main_s, W, H);
-	if (!b)
-		return 0;
-	cr = b->cr;
+	cr = c;
 	paint();
-	wsurf_present(&main_s, b);
-	return 1;
 }
 
 static void on_resize(void)
@@ -4154,7 +3887,7 @@ static void on_resize(void)
 		show_sel();
 	else
 		clamp_top();
-	dirty = 1;
+	redraw();
 }
 
 /* ---- context menu ------------------------------------------------------- */
@@ -4193,12 +3926,8 @@ static const struct { int id; const char *label, *accel; } menu_items[] = {
 	{ M_RELOAD, "Reload", "F5" },
 };
 #define NMENU ((int)(sizeof menu_items / sizeof menu_items[0]))
-static struct wsurf menu_s;
-static struct xdg_surface *menu_xdg;
-static struct xdg_popup *menu_popup;
-static int menu_configured;
-static int menu_px, menu_py;    /* where the menu is, in the main window */
-static int menu_on, menu_dirty, menu_hot = -1, menu_w, menu_h;
+static struct mtk_window *menu_win;
+static int menu_on, menu_hot = -1, menu_w, menu_h;
 static int menu_presses, menu_entered;
 static int menu_ok[NMENU], menu_y[NMENU + 1];  /* item i: y[i]..y[i+1] */
 static uint32_t menu_time;
@@ -4246,13 +3975,16 @@ static int menu_at(int x, int y)
 	return -1;
 }
 
-/* 0 if the compositor holds both buffers: try again after a release. */
-static int menu_draw(void)
+static void menu_redraw(void)
 {
-	struct shmbuf *b = wsurf_buffer(&menu_s, menu_w, menu_h);
-	if (!b)
-		return 0;
-	cr = b->cr;
+	if (menu_win)
+		mtk_window_redraw(menu_win);
+}
+
+static void menu_paint(struct mtk_window *w, cairo_t *c, int width, int height,
+	void *data)
+{
+	cr = c;
 	fill(px_bg, 0, 0, menu_w, menu_h);
 	bevel((struct rect){ 0, 0, menu_w, menu_h }, 1);
 	for (int i = 0; i < NMENU; i++) {
@@ -4273,55 +4005,41 @@ static int menu_draw(void)
 		text(c, BEV + 12, y, h, l, strlen(l));
 		text_right(c, menu_w - BEV - 12, y, h, a);
 	}
-	wsurf_present(&menu_s, b);
-	return 1;
 }
 
 static void menu_close(void)
 {
 	if (!menu_on)
 		return;
-	if (ptr_surface == menu_s.wl)
-		ptr_surface = NULL;
-	xdg_popup_destroy(menu_popup);
-	xdg_surface_destroy(menu_xdg);
-	wsurf_destroy(&menu_s);
+	if (ptr_on == menu_win)
+		ptr_on = NULL;
+	mtk_window_destroy(menu_win);
+	menu_win = NULL;
 	/* The command that follows may block (a slow directory); the
 	 * desktop must not stay grabbed meanwhile. */
-	wl_display_flush(dpy);
+	wl_display_flush(mtk_display(m));
 	menu_on = 0;
 	menu_hot = -1;
-	dirty = 1;
-}
-
-static void popup_configure(void *data, struct xdg_popup *p, int32_t x,
-	int32_t y, int32_t w, int32_t h)
-{
-	menu_px = x;
-	menu_py = y;
+	redraw();
 }
 
 /* A click on another client, or the compositor refused the grab. */
-static void popup_done(void *data, struct xdg_popup *p)
+static void menu_done(struct mtk_window *w, void *data)
 {
 	menu_close();
 }
 
-static const struct xdg_popup_listener popup_listener = {
-	.configure = popup_configure,
-	.popup_done = popup_done,
-};
+static void menu_key_event(struct mtk_window *w, const struct mtk_key *k, void *data);
+static int key_repeats_event(struct mtk_window *w, const struct mtk_key *k, void *data);
+static void pointer_event_of(struct mtk_window *w, const struct mtk_pointer *p,
+	void *data);
 
-static void menu_xdg_configure(void *data, struct xdg_surface *s,
-	uint32_t serial)
-{
-	xdg_surface_ack_configure(s, serial);
-	menu_configured = 1;
-	menu_dirty = 1;
-}
-
-static const struct xdg_surface_listener menu_xdg_listener = {
-	menu_xdg_configure,
+static const struct mtk_window_listener menu_listener = {
+	.paint = menu_paint,
+	.close = menu_done,
+	.key = menu_key_event,
+	.key_repeats = key_repeats_event,
+	.pointer = pointer_event_of,
 };
 
 /* Which items work: `row` is the clicked entry, or -1 for the empty area
@@ -4377,28 +4095,9 @@ static void menu_open(int px, int py, uint32_t serial, uint32_t t, int row)
 	menu_h = h;
 	/* Below and right of the pointer, else above or left of it with the
 	 * pointer still on the corner, and always on the screen. */
-	struct xdg_positioner *pos = xdg_wm_base_create_positioner(wm_base);
-	xdg_positioner_set_size(pos, w, h);
-	xdg_positioner_set_anchor_rect(pos, MAX(0, MIN(px, W - 1)),
-		MAX(0, MIN(py, H - 1)), 1, 1);
-	xdg_positioner_set_anchor(pos, XDG_POSITIONER_ANCHOR_TOP_LEFT);
-	xdg_positioner_set_gravity(pos, XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
-	xdg_positioner_set_constraint_adjustment(pos,
-		XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X |
-		XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y |
-		XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X |
-		XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y);
-	menu_s.wl = wl_compositor_create_surface(compositor);
-	menu_xdg = xdg_wm_base_get_xdg_surface(wm_base, menu_s.wl);
-	xdg_surface_add_listener(menu_xdg, &menu_xdg_listener, NULL);
-	menu_popup = xdg_surface_get_popup(menu_xdg, main_xdg, pos);
-	xdg_popup_add_listener(menu_popup, &popup_listener, NULL);
-	xdg_positioner_destroy(pos);
-	xdg_popup_grab(menu_popup, seat, serial);
-	wl_surface_commit(menu_s.wl);
-	menu_configured = 0;
-	menu_px = px;
-	menu_py = py;
+	menu_win = mtk_popup_new(win, &(struct mtk_popup_config){
+		.x = px, .y = py, .width = w, .height = h, .grab = 1, .serial = serial,
+	}, &menu_listener, NULL);
 	snprintf(menu_dir, sizeof menu_dir, "%s", cwd);
 	snprintf(menu_name, sizeof menu_name, "%s",
 		row >= 0 ? ents[row].name : "");
@@ -4408,7 +4107,7 @@ static void menu_open(int px, int py, uint32_t serial, uint32_t t, int row)
 	menu_presses = 0;
 	menu_entered = 0;
 	menu_time = t;
-	menu_dirty = 1;
+	menu_redraw();
 }
 
 /* Is the listing still the one the menu was opened on? */
@@ -4447,7 +4146,7 @@ static void menu_run(int i)
 	case M_HIDDEN: toggle_hidden(); break;
 	case M_RELOAD: reload(); break;
 	}
-	dirty = 1;
+	redraw();
 }
 
 static void menu_key(xkb_keysym_t ks)
@@ -4470,7 +4169,7 @@ static void menu_key(xkb_keysym_t ks)
 		i = (i + d + NMENU) % NMENU;
 		if (menu_items[i].id != M_SEP && menu_ok[i]) {
 			menu_hot = i;
-			menu_dirty = 1;
+			menu_redraw();
 			return;
 		}
 	}
@@ -4489,7 +4188,7 @@ static void menu_motion(int x, int y)
 		return;
 	if (i != menu_hot) {
 		menu_hot = i;
-		menu_dirty = 1;
+		menu_redraw();
 	}
 }
 
@@ -4608,7 +4307,7 @@ static void key(xkb_keysym_t ks, const char *txt, int n, unsigned state)
 		if (search[0]) {
 			search[u8_prev(search, strlen(search))] = 0;
 			search_ms = now_ms();
-			dirty = 1;
+			redraw();
 		} else {
 			go_parent();
 		}
@@ -4618,7 +4317,7 @@ static void key(xkb_keysym_t ks, const char *txt, int n, unsigned state)
 			search[0] = 0;
 		else if (!had_msg)
 			unmark_all();
-		dirty = 1;
+		redraw();
 		return;
 	case XKB_KEY_F5: reload(); return;
 	case XKB_KEY_F2: prompt_begin(PR_RENAME); return;
@@ -4670,7 +4369,7 @@ static void list_menu(const struct pev *ev)
 			unmark_all();
 		sel = i;
 		last_idx = -1;
-		dirty = 1;
+		redraw();
 	}
 	menu_open(ev->x, ev->y, ev->serial, ev->time, i);
 }
@@ -4688,11 +4387,11 @@ static void on_button(const struct pev *ev)
 		answer_delete(0);
 	if (prompt) {
 		prompt = PR_NONE;
-		dirty = 1;
+		redraw();
 	}
 	if (editing && !in(r_path, x, y)) {
 		editing = 0;
-		dirty = 1;
+		redraw();
 	}
 	switch (ev->button) {
 	case B_BACK: go_parent(); return;
@@ -4702,7 +4401,7 @@ static void on_button(const struct pev *ev)
 	}
 	if (in(r_up, x, y)) {
 		up_pressed = 1;
-		dirty = 1;
+		redraw();
 	} else if (in(r_path, x, y)) {
 		if (!editing)
 			edit_begin();
@@ -4748,7 +4447,7 @@ static void on_button(const struct pev *ev)
 			last_idx = i;
 			last_click = ev->time;
 		}
-		dirty = 1;
+		redraw();
 	}
 }
 
@@ -4770,7 +4469,7 @@ static void on_release(const struct pev *ev)
 	dragging = 0;
 	if (up_pressed) {
 		up_pressed = 0;
-		dirty = 1;
+		redraw();
 		if (in(r_up, ev->x, ev->y))
 			go_parent();
 	}
@@ -4778,30 +4477,13 @@ static void on_release(const struct pev *ev)
 
 /* ---- Wayland input ------------------------------------------------------ */
 
-static unsigned current_state(void)
-{
-	unsigned s = btn_mask;
-	if (kb_state) {
-		if (xkb_state_mod_name_is_active(kb_state, XKB_MOD_NAME_SHIFT,
-		    XKB_STATE_MODS_EFFECTIVE) > 0)
-			s |= MOD_SHIFT;
-		if (xkb_state_mod_name_is_active(kb_state, XKB_MOD_NAME_CTRL,
-		    XKB_STATE_MODS_EFFECTIVE) > 0)
-			s |= MOD_CTRL;
-		if (xkb_state_mod_name_is_active(kb_state, XKB_MOD_NAME_ALT,
-		    XKB_STATE_MODS_EFFECTIVE) > 0)
-			s |= MOD_ALT;
-	}
-	return s;
-}
-
 /* A held key moves and types, but runs no command again: Delete would empty
  * the folder into the trash, Return would open a file 25 times a second,
  * Backspace would climb to /. */
-static int key_repeats(uint32_t kc)
+static int key_repeats_event(struct mtk_window *w, const struct mtk_key *k, void *data)
 {
-	xkb_keysym_t ks = xkb_state_key_get_one_sym(kb_state, kc);
-	unsigned state = current_state();
+	xkb_keysym_t ks = k->sym;
+	unsigned state = k->mods & (MOD_SHIFT | MOD_CTRL | MOD_ALT);
 	if (pend)
 		return 0;
 	switch (ks) {
@@ -4829,170 +4511,30 @@ static int key_repeats(uint32_t kc)
 	return c >= 0x20 && c != 0x7f;
 }
 
-/* With Ctrl or Alt, a key that gives no Latin letter on the active layout
- * (Cyrillic, Greek) acts as it does on the first layout where it gives one:
- * else Ctrl+C would only ever see a "с". A digit counts as on its level with
- * Shift too: AZERTY has "&" there without it, and Ctrl+1 would never sort. */
-static xkb_keysym_t shortcut_sym(uint32_t kc, xkb_keysym_t ks)
+/* With Ctrl or Alt a key that gives no Latin letter on the active layout acts
+ * as on the first layout where it gives one, as mtk_key.latin has it. */
+static void key_event(struct mtk_window *w, const struct mtk_key *k, void *data)
 {
-	if (ks < 0x80 && isalnum((int)ks))
-		return ks;
-	xkb_layout_index_t n = xkb_keymap_num_layouts_for_key(kb_map, kc);
-	for (xkb_layout_index_t l = 0; l < n; l++)
-		for (xkb_level_index_t lv = 0; lv < 2; lv++) {
-			const xkb_keysym_t *syms;
-			if (xkb_keymap_key_get_syms_by_level(kb_map, kc, l, lv,
-			    &syms) == 1 && syms[0] < 0x80 &&
-			    (isdigit((int)syms[0]) || (lv == 0 &&
-			    isalpha((int)syms[0]))))
-				return syms[0];
-		}
-	if (ks < 0x100)
-		return ks;
-	for (xkb_layout_index_t l = 0; l < n; l++) {
-		const xkb_keysym_t *syms;
-		if (xkb_keymap_key_get_syms_by_level(kb_map, kc, l, 0,
-		    &syms) == 1 && syms[0] > 0x20 && syms[0] < 0x7f)
-			return syms[0];
-	}
-	return ks;
+	unsigned state = k->mods & (MOD_SHIFT | MOD_CTRL | MOD_ALT);
+	xkb_keysym_t ks = state & (MOD_CTRL | MOD_ALT) ? k->latin : k->sym;
+	key(ks, k->utf8, (int)strlen(k->utf8), state);
 }
 
-/* One key press or repeat, with kc an xkb keycode. Compose and dead keys come
- * from xkbcommon; a key that is only part of a sequence does nothing else. */
-static void key_press(uint32_t kc)
+static void menu_key_event(struct mtk_window *w, const struct mtk_key *k, void *data)
 {
-	char txt[64];
-	int n = -1;
-	xkb_keysym_t ks = xkb_state_key_get_one_sym(kb_state, kc);
-	if (compose && xkb_compose_state_feed(compose, ks) ==
-	    XKB_COMPOSE_FEED_ACCEPTED) {
-		switch (xkb_compose_state_get_status(compose)) {
-		case XKB_COMPOSE_COMPOSING:
-			return;
-		case XKB_COMPOSE_CANCELLED:
-			xkb_compose_state_reset(compose);
-			return;
-		case XKB_COMPOSE_COMPOSED:
-			n = xkb_compose_state_get_utf8(compose, txt, sizeof txt);
-			ks = xkb_compose_state_get_one_sym(compose);
-			xkb_compose_state_reset(compose);
-			break;
-		case XKB_COMPOSE_NOTHING:
-			break;
-		}
-	}
-	if (n < 0)
-		n = xkb_state_key_get_utf8(kb_state, kc, txt, sizeof txt);
-	if (n >= (int)sizeof txt)
-		n = 0;
-	unsigned state = current_state();
-	if (state & (MOD_CTRL | MOD_ALT))
-		ks = shortcut_sym(kc, ks);
-	key(ks, txt, n, state);
+	key_event(w, k, data);
 }
-
-static void kb_keymap(void *data, struct wl_keyboard *k, uint32_t format,
-	int32_t fd, uint32_t size)
-{
-	if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
-		close(fd);
-		return;
-	}
-	char *s = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
-	close(fd);
-	if (s == MAP_FAILED)
-		return;
-	/* The protocol promises no NUL at the end: read size bytes at most. */
-	struct xkb_keymap *map = xkb_keymap_new_from_buffer(xkb, s,
-		strnlen(s, size), XKB_KEYMAP_FORMAT_TEXT_V1,
-		XKB_KEYMAP_COMPILE_NO_FLAGS);
-	munmap(s, size);
-	struct xkb_state *state = map ? xkb_state_new(map) : NULL;
-	if (!state) {
-		xkb_keymap_unref(map);
-		return;
-	}
-	xkb_state_unref(kb_state);
-	xkb_keymap_unref(kb_map);
-	kb_state = state;
-	kb_map = map;
-	repeat_kc = 0;
-}
-
-static void kb_enter(void *data, struct wl_keyboard *k, uint32_t serial,
-	struct wl_surface *surface, struct wl_array *keys)
-{
-}
-
-static void kb_leave(void *data, struct wl_keyboard *k, uint32_t serial,
-	struct wl_surface *surface)
-{
-	repeat_kc = 0;
-	if (compose)
-		xkb_compose_state_reset(compose);
-	/* What is held now is unknown, and a click can come before the next
-	 * enter, which brings the real state. */
-	if (kb_state)
-		xkb_state_update_mask(kb_state, 0, 0, 0, 0, 0,
-			xkb_state_serialize_layout(kb_state,
-				XKB_STATE_LAYOUT_EFFECTIVE));
-}
-
-static void kb_key(void *data, struct wl_keyboard *k, uint32_t serial,
-	uint32_t time, uint32_t code, uint32_t state)
-{
-	uint32_t kc = code + 8;
-	if (!kb_state)
-		return;
-	if (state != WL_KEYBOARD_KEY_STATE_PRESSED) {
-		if (kc == repeat_kc)
-			repeat_kc = 0;
-		return;
-	}
-	/* A modifier does not stop a key that is repeating. */
-	int repeats = xkb_keymap_key_repeats(kb_map, kc);
-	if (repeats)
-		repeat_kc = 0;
-	key_press(kc);
-	if (repeats && repeat_rate > 0 && key_repeats(kc)) {
-		repeat_kc = kc;
-		repeat_next = now_ms() + repeat_delay;
-	}
-}
-
-static void kb_modifiers(void *data, struct wl_keyboard *k, uint32_t serial,
-	uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group)
-{
-	if (kb_state)
-		xkb_state_update_mask(kb_state, depressed, latched, locked, 0, 0,
-			group);
-}
-
-static void kb_repeat_info(void *data, struct wl_keyboard *k, int32_t rate,
-	int32_t delay)
-{
-	repeat_rate = rate;
-	repeat_delay = delay;
-}
-
-static const struct wl_keyboard_listener keyboard_listener = {
-	.keymap = kb_keymap,
-	.enter = kb_enter,
-	.leave = kb_leave,
-	.key = kb_key,
-	.modifiers = kb_modifiers,
-	.repeat_info = kb_repeat_info,
-};
 
 /* The pointer position in menu coordinates, wherever it is. */
 static void menu_pos(int *x, int *y)
 {
 	*x = ptr_x;
 	*y = ptr_y;
-	if (ptr_surface != menu_s.wl) {
-		*x -= menu_px;
-		*y -= menu_py;
+	if (ptr_on != menu_win) {
+		int px, py;
+		mtk_popup_position(menu_win, &px, &py);
+		*x -= px;
+		*y -= py;
 	}
 }
 
@@ -5003,52 +4545,12 @@ static void menu_pointer_moved(void)
 	menu_motion(x, y);
 }
 
-static void ptr_enter(void *data, struct wl_pointer *p, uint32_t serial,
-	struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y)
-{
-	ptr_surface = surface;
-	ptr_serial = serial;
-	ptr_x = wl_fixed_to_int(x);
-	ptr_y = wl_fixed_to_int(y);
-	/* An unchanged position gets no motion event after this. */
-	if (menu_on)
-		menu_pointer_moved();
-	cursor_update();
-}
-
-/* Not every compositor keeps the pointer on a window while a button is held,
- * and then the release never reaches us: a drag ends at the window's edge. */
-static void ptr_leave(void *data, struct wl_pointer *p, uint32_t serial,
-	struct wl_surface *surface)
-{
-	ptr_surface = NULL;
-	btn_mask = 0;
-	dragging = 0;
-	if (menu_on)            /* or Return would run what it left */
-		menu_motion(-1, -1);
-	if (up_pressed) {
-		up_pressed = 0;
-		dirty = 1;
-	}
-}
-
-static void ptr_motion(void *data, struct wl_pointer *p, uint32_t time,
-	wl_fixed_t x, wl_fixed_t y)
-{
-	ptr_x = wl_fixed_to_int(x);
-	ptr_y = wl_fixed_to_int(y);
-	if (menu_on)
-		menu_pointer_moved();
-	else
-		on_motion(ptr_y);
-}
-
 static void pointer_event(int button, int pressed, uint32_t serial,
-	uint32_t time)
+	uint32_t time, unsigned state)
 {
-	if (!ptr_surface)
+	if (!ptr_on)
 		return;
-	struct pev e = { button, ptr_x, ptr_y, serial, time, current_state() };
+	struct pev e = { button, ptr_x, ptr_y, serial, time, state };
 	if (menu_on) {          /* the pointer belongs to the menu */
 		menu_pos(&e.x, &e.y);
 		if (pressed)
@@ -5062,411 +4564,144 @@ static void pointer_event(int button, int pressed, uint32_t serial,
 	}
 }
 
-static void ptr_button(void *data, struct wl_pointer *p, uint32_t serial,
-	uint32_t time, uint32_t code, uint32_t state)
+/* On the window or the menu: with the menu up the compositor still sends what
+ * happens over the window, and the handlers turn it into menu coordinates. */
+static void pointer_event_of(struct mtk_window *w, const struct mtk_pointer *p,
+	void *data)
 {
-	int pressed = state == WL_POINTER_BUTTON_STATE_PRESSED, b;
-	unsigned held = 0;
-	switch (code) {
-	case BTN_LEFT: b = B_LEFT; held = BTN1_HELD; break;
-	case BTN_MIDDLE: b = B_MIDDLE; held = BTN2_HELD; break;
-	case BTN_RIGHT: b = B_RIGHT; break;
-	case BTN_SIDE: case BTN_BACK: b = B_BACK; break;
-	default: return;
+	unsigned state = (p->mods & (MOD_SHIFT | MOD_CTRL | MOD_ALT)) |
+		(p->buttons & MTK_BUTTON_LEFT ? BTN1_HELD : 0) |
+		(p->buttons & MTK_BUTTON_MIDDLE ? BTN2_HELD : 0);
+	if (p->kind != MTK_LEAVE) {
+		ptr_on = w;
+		ptr_x = (int)p->x;
+		ptr_y = (int)p->y;
 	}
-	pointer_event(b, pressed, serial, time);
-	/* A press sees the buttons held before it, as with any toolkit. */
-	if (pressed)
-		btn_mask |= held;
-	else
-		btn_mask &= ~held;
-}
-
-static void ptr_frame(void *data, struct wl_pointer *p);
-
-static void ptr_axis(void *data, struct wl_pointer *p, uint32_t time,
-	uint32_t axis, wl_fixed_t value)
-{
-	if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
-		return;
-	axis_acc += wl_fixed_to_double(value);
-	/* Before wl_seat 5 no frame ends the event: each one counts by itself. */
-	if (wl_pointer_get_version(p) < WL_POINTER_FRAME_SINCE_VERSION)
-		ptr_frame(data, p);
-}
-
-static void ptr_axis_source(void *data, struct wl_pointer *p, uint32_t source)
-{
-}
-
-static void ptr_axis_stop(void *data, struct wl_pointer *p, uint32_t time,
-	uint32_t axis)
-{
-	if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
-		axis_acc = 0;
-}
-
-static void ptr_axis_discrete(void *data, struct wl_pointer *p, uint32_t axis,
-	int32_t steps)
-{
-	if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
-		axis_steps = MAX(MIN(axis_steps + MAX(MIN(steps, MAX_STEPS),
-			-MAX_STEPS), MAX_STEPS), -MAX_STEPS);
-}
-
-/* Wheels report steps; touchpads only a distance, of which AXIS_STEP makes
- * one wheel step. */
-static void ptr_frame(void *data, struct wl_pointer *p)
-{
-	enum { AXIS_STEP = 15 };
-	int steps = axis_steps;
-	if (steps) {
-		axis_acc = 0;
-	} else {
-		double v = axis_acc / AXIS_STEP;
-		steps = (int)MAX(MIN(v, MAX_STEPS), -MAX_STEPS);
-		axis_acc = v > MAX_STEPS || v < -MAX_STEPS ? 0 :
-			axis_acc - steps * AXIS_STEP;
-	}
-	axis_steps = 0;
-	for (int i = 0; i < abs(steps); i++)
-		pointer_event(steps < 0 ? B_WHEEL_UP : B_WHEEL_DOWN, 1, 0, 0);
-}
-
-static const struct wl_pointer_listener pointer_listener = {
-	.enter = ptr_enter,
-	.leave = ptr_leave,
-	.motion = ptr_motion,
-	.button = ptr_button,
-	.axis = ptr_axis,
-	.frame = ptr_frame,
-	.axis_source = ptr_axis_source,
-	.axis_stop = ptr_axis_stop,
-	.axis_discrete = ptr_axis_discrete,
-};
-
-static void seat_capabilities(void *data, struct wl_seat *s, uint32_t caps)
-{
-	int want_ptr = caps & WL_SEAT_CAPABILITY_POINTER;
-	int want_kb = caps & WL_SEAT_CAPABILITY_KEYBOARD;
-	if (want_ptr && !pointer) {
-		pointer = wl_seat_get_pointer(s);
-		wl_pointer_add_listener(pointer, &pointer_listener, NULL);
-	} else if (!want_ptr && pointer) {
-		/* No leave comes: a drag or a held button would outlive it. */
-		ptr_leave(NULL, pointer, 0, NULL);
-		/* release is from wl_seat 3 on; an older seat only knows
-		 * destroy. */
-		if (wl_pointer_get_version(pointer) >=
-		    WL_POINTER_RELEASE_SINCE_VERSION)
-			wl_pointer_release(pointer);
+	switch (p->kind) {
+	case MTK_ENTER:
+		/* An unchanged position gets no motion event after this. */
+		if (menu_on)
+			menu_pointer_moved();
+		break;
+	case MTK_LEAVE:
+		/* Not every compositor keeps the pointer on a window while a button
+		 * is held, and then the release never reaches us: a drag ends at the
+		 * window's edge. */
+		if (ptr_on == w)
+			ptr_on = NULL;
+		dragging = 0;
+		if (menu_on)            /* or Return would run what it left */
+			menu_motion(-1, -1);
+		if (up_pressed) {
+			up_pressed = 0;
+			redraw();
+		}
+		break;
+	case MTK_MOTION:
+		if (menu_on)
+			menu_pointer_moved();
 		else
-			wl_pointer_destroy(pointer);
-		pointer = NULL;
+			on_motion(ptr_y);
+		break;
+	case MTK_PRESS:
+	case MTK_RELEASE: {
+		int b;
+		switch (p->button) {
+		case BTN_LEFT: b = B_LEFT; break;
+		case BTN_MIDDLE: b = B_MIDDLE; break;
+		case BTN_RIGHT: b = B_RIGHT; break;
+		case BTN_SIDE: case BTN_BACK: b = B_BACK; break;
+		default: return;
+		}
+		pointer_event(b, p->kind == MTK_PRESS, p->serial, p->time, state);
+		break;
 	}
-	if (want_kb && !keyboard) {
-		keyboard = wl_seat_get_keyboard(s);
-		wl_keyboard_add_listener(keyboard, &keyboard_listener, NULL);
-	} else if (!want_kb && keyboard) {
-		kb_leave(NULL, keyboard, 0, NULL);     /* held Ctrl included */
-		if (wl_keyboard_get_version(keyboard) >=
-		    WL_KEYBOARD_RELEASE_SINCE_VERSION)
-			wl_keyboard_release(keyboard);
-		else
-			wl_keyboard_destroy(keyboard);
-		keyboard = NULL;
-	}
-}
-
-static void seat_name(void *data, struct wl_seat *s, const char *name)
-{
-}
-
-static const struct wl_seat_listener seat_listener = {
-	.capabilities = seat_capabilities,
-	.name = seat_name,
-};
-
-/* ---- window setup ------------------------------------------------------- */
-
-static void wm_ping(void *data, struct xdg_wm_base *b, uint32_t serial)
-{
-	xdg_wm_base_pong(b, serial);
-}
-
-static const struct xdg_wm_base_listener wm_base_listener = { wm_ping };
-
-static void bind_seat(uint32_t name, uint32_t ver)
-{
-	seat = wl_registry_bind(registry, name, &wl_seat_interface, MIN(ver, 7));
-	seat_global = name;
-	wl_seat_add_listener(seat, &seat_listener, NULL);
-}
-
-static void registry_global(void *data, struct wl_registry *r, uint32_t name,
-	const char *iface, uint32_t ver)
-{
-	/* wl_surface.damage_buffer is from version 4: an older one is not
-	 * taken. */
-	if (!strcmp(iface, wl_compositor_interface.name) && ver >= 4) {
-		compositor = wl_registry_bind(r, name, &wl_compositor_interface,
-			MIN(ver, 6));
-	} else if (!strcmp(iface, wl_shm_interface.name)) {
-		shm = wl_registry_bind(r, name, &wl_shm_interface, 1);
-	} else if (!strcmp(iface, wl_seat_interface.name)) {
-		if (seats_add(&seats, name, ver) && !seat)
-			bind_seat(name, ver);
-	} else if (!strcmp(iface, wp_viewporter_interface.name) && !viewporter) {
-		viewporter = wl_registry_bind(r, name, &wp_viewporter_interface, 1);
-	} else if (!strcmp(iface, xdg_wm_base_interface.name)) {
-		wm_base = wl_registry_bind(r, name, &xdg_wm_base_interface,
-			MIN(ver, 2));
-		xdg_wm_base_add_listener(wm_base, &wm_base_listener, NULL);
-	} else if (!strcmp(iface, zxdg_decoration_manager_v1_interface.name)) {
-		deco_mgr = wl_registry_bind(r, name,
-			&zxdg_decoration_manager_v1_interface, 1);
+	case MTK_SCROLL:
+		for (int i = 0; i < abs(p->steps_y); i++)
+			pointer_event(p->steps_y < 0 ? B_WHEEL_UP : B_WHEEL_DOWN, 1, 0, 0,
+				state);
+		break;
 	}
 }
 
-/* A seat that goes is let go of, and the oldest one left is taken instead. */
-static void registry_remove(void *data, struct wl_registry *r, uint32_t name)
+/* 0 leaves the size to us, which after maximizing is the size from before:
+ * mtk keeps that. */
+static void configure_event(struct mtk_window *w, int cw, int ch, unsigned states,
+	void *data)
 {
-	seats_remove(&seats, name);
-	if (!seat || name != seat_global)
-		return;
-	seat_capabilities(NULL, seat, 0);
-	if (wl_seat_get_version(seat) >= WL_SEAT_RELEASE_SINCE_VERSION)
-		wl_seat_release(seat);
-	else
-		wl_seat_destroy(seat);
-	seat = NULL;
-	unsigned next, ver;
-	if (seats_next(&seats, &next, &ver))
-		bind_seat(next, ver);
-}
-
-static const struct wl_registry_listener registry_listener = {
-	.global = registry_global,
-	.global_remove = registry_remove,
-};
-
-static void main_xdg_configure(void *data, struct xdg_surface *s,
-	uint32_t serial)
-{
-	xdg_surface_ack_configure(s, serial);
-	int w = pend_w > 0 ? pend_w : float_w, h = pend_h > 0 ? pend_h : float_h;
-	if (w != W || h != H) {
-		W = w;
-		H = h;
+	int nw, nh;
+	mtk_window_size(w, &nw, &nh);
+	if (nw != W || nh != H) {
+		W = nw;
+		H = nh;
 		on_resize();
 	}
-	if (!pend_bound) {
-		float_w = W;
-		float_h = H;
-	}
-	configured = 1;
-	need_commit = 1;
-	dirty = 1;
 }
 
-static const struct xdg_surface_listener main_xdg_listener = {
-	main_xdg_configure,
-};
-
-/* 0 leaves the size to us, which after maximizing is the size from before. */
-static void top_configure(void *data, struct xdg_toplevel *t, int32_t w,
-	int32_t h, struct wl_array *states)
-{
-	uint32_t *st;
-	pend_w = w;
-	pend_h = h;
-	pend_bound = 0;
-	wl_array_for_each(st, states)
-		if (*st != XDG_TOPLEVEL_STATE_ACTIVATED &&
-		    *st != XDG_TOPLEVEL_STATE_RESIZING)
-			pend_bound = 1;
-}
-
-static void top_close(void *data, struct xdg_toplevel *t)
+static void close_event(struct mtk_window *w, void *data)
 {
 	exit(0);
 }
 
-static const struct xdg_toplevel_listener toplevel_listener = {
-	.configure = top_configure,
-	.close = top_close,
+static const struct mtk_window_listener main_listener = {
+	.paint = paint_main,
+	.configure = configure_event,
+	.close = close_event,
+	.key = key_event,
+	.key_repeats = key_repeats_event,
+	.pointer = pointer_event_of,
 };
 
-/* The buffer scale and viewport for the loaded image. A theme has only some
- * sizes: Adwaita gives 30 for 32. A buffer scale that doesn't divide the image
- * is a protocol error. With a viewport the buffer is shown at its size over
- * the scale, as mwc shows its own cursor; without, at the largest scale up to
- * the window's that divides it, and that much larger. */
-static void cursor_fit(void)
+/* ---- the loop ------------------------------------------------------------- */
+
+static void job_ready(struct mtk *mm, int fd, short revents, void *data)
 {
-	int w = cursor_img->width, h = cursor_img->height, sc = scale;
-	cursor_buf_scale = 1;
-	cursor_vw = cursor_vh = -1;
-	if (w % sc == 0 && h % sc == 0) {
-		cursor_buf_scale = sc;
-	} else if (cursor_vp) {
-		cursor_vw = MAX((w + sc / 2) / sc, 1);
-		cursor_vh = MAX((h + sc / 2) / sc, 1);
-	} else {
-		for (int d = sc - 1; d > 1; d--)
-			if (w % d == 0 && h % d == 0) {
-				cursor_buf_scale = d;
-				break;
-			}
+	job_poll();
+}
+
+/* A folder that keeps changing is read again each time: one that takes long to
+ * read is not polled more often than leaves the window three quarters of the
+ * time. */
+static void dir_tick(struct mtk *mm, void *data)
+{
+	uint64_t now = now_ms();
+	poll_dir();
+	uint64_t took = now_ms() - now;
+	mtk_timer(mm, (int)MAX(POLL_MS, 4 * took), dir_tick, NULL);
+}
+
+static unsigned search_timer;
+
+/* The type-ahead ends a while after its last key. */
+static void search_tick(struct mtk *mm, void *data)
+{
+	search_timer = 0;
+	if (search[0] && now_ms() - search_ms >= TYPEAHEAD_MS) {
+		search[0] = 0;
+		redraw();
 	}
 }
 
-/* The cursor on the window or the menu, while the pointer is over one; 0 if
- * not shown. */
-static int cursor_show(void)
+/* Before the loop waits: the job's fd watched while there is one, a timer for
+ * the end of the type-ahead while there is one. */
+static void idle(struct mtk *mm, void *data)
 {
-	if (!cursor_img || !pointer || !ptr_surface)
-		return 0;
-	int hx = cursor_img->hotspot_x / cursor_buf_scale;
-	int hy = cursor_img->hotspot_y / cursor_buf_scale;
-	if (cursor_vw > 0) {
-		/* Rounded as the viewport's size is. */
-		hx = (cursor_img->hotspot_x * cursor_vw + cursor_img->width / 2) /
-			cursor_img->width;
-		hy = (cursor_img->hotspot_y * cursor_vh + cursor_img->height / 2) /
-			cursor_img->height;
+	static int watched = -1;
+	if (job.fd != watched) {
+		if (watched >= 0)
+			mtk_unwatch_fd(mm, watched);
+		if (job.fd >= 0)
+			mtk_watch_fd(mm, job.fd, POLLIN, job_ready, NULL);
+		watched = job.fd;
 	}
-	wl_pointer_set_cursor(pointer, ptr_serial, cursor_surf, hx, hy);
-	if (cursor_vp)
-		wp_viewport_set_destination(cursor_vp, cursor_vw, cursor_vh);
-	wl_surface_set_buffer_scale(cursor_surf, cursor_buf_scale);
-	wl_surface_attach(cursor_surf, wl_cursor_image_get_buffer(cursor_img), 0,
-		0);
-	wl_surface_damage_buffer(cursor_surf, 0, 0, cursor_img->width,
-		cursor_img->height);
-	wl_surface_commit(cursor_surf);
-	return 1;
-}
-
-/* The theme's cursor at the window's scale, loaded again when that changes,
- * and shown if the pointer is on the window. The new theme first: a failed
- * load keeps the old cursor and is tried again on the next enter. The old
- * theme's buffers go with it, so the surface shows the new cursor or none
- * before it goes. */
-static void cursor_update(void)
-{
-	if (cursor_scale != scale) {
-		/* A whole number only: "32x" is none. */
-		const char *s = getenv("XCURSOR_SIZE");
-		char *end = NULL;
-		long size = s ? strtol(s, &end, 10) : 0;
-		if (!s || end == s || *end || size <= 0)
-			size = 24;
-		/* No theme has more; and times the scale it must stay an int. */
-		size = MIN(size, 256);
-		struct wl_cursor_theme *t = wl_cursor_theme_load(
-			getenv("XCURSOR_THEME"), (int)size * scale, shm);
-		struct wl_cursor *c = t ?
-			wl_cursor_theme_get_cursor(t, "default") : NULL;
-		if (t && !c)
-			c = wl_cursor_theme_get_cursor(t, "left_ptr");
-		if (c) {
-			struct wl_cursor_theme *old = cursor_theme;
-			cursor_theme = t;
-			cursor_img = c->images[0];
-			cursor_scale = scale;
-			if (!cursor_surf)
-				cursor_surf = wl_compositor_create_surface(compositor);
-			if (viewporter && !cursor_vp)
-				cursor_vp = wp_viewporter_get_viewport(viewporter,
-					cursor_surf);
-			cursor_fit();
-			if (!cursor_show() && old) {
-				wl_surface_attach(cursor_surf, NULL, 0, 0);
-				wl_surface_commit(cursor_surf);
-			}
-			if (old)
-				wl_cursor_theme_destroy(old);
-			return;
-		}
-		if (t)
-			wl_cursor_theme_destroy(t);
+	if (search[0] && !search_timer) {
+		uint64_t now = now_ms(), end = search_ms + TYPEAHEAD_MS;
+		search_timer = mtk_timer(mm, end > now ? (int)MIN(end - now, INT_MAX) : 0,
+			search_tick, NULL);
 	}
-	cursor_show();
 }
 
-/* Sharp on a scaled output: wl_compositor 6 says which scale the output it is on
- * has. An older compositor never does, and it stays at 1. The menu takes the
- * main window's scale. */
-static void surf_enter(void *data, struct wl_surface *s, struct wl_output *o)
-{
-}
-
-static void surf_leave(void *data, struct wl_surface *s, struct wl_output *o)
-{
-}
-
-static void surf_preferred_scale(void *data, struct wl_surface *s, int32_t factor)
-{
-	factor = MIN(factor, 16);       /* no output is denser */
-	if (factor < 1 || factor == scale)
-		return;
-	scale = factor;
-	dirty = 1;
-	menu_dirty = 1;
-	/* Not only at the next enter: the pointer may stay where it is. */
-	cursor_update();
-}
-
-static void surf_preferred_transform(void *data, struct wl_surface *s,
-	uint32_t transform)
-{
-}
-
-static const struct wl_surface_listener surf_listener = {
-	.enter = surf_enter,
-	.leave = surf_leave,
-	.preferred_buffer_scale = surf_preferred_scale,
-	.preferred_buffer_transform = surf_preferred_transform,
-};
-
-/* The locale compose sequences follow, in the order of xkbcommon's docs. */
-static void compose_init(void)
-{
-	const char *loc = getenv("LC_ALL");
-	if (!loc || !*loc)
-		loc = getenv("LC_CTYPE");
-	if (!loc || !*loc)
-		loc = getenv("LANG");
-	if (!loc || !*loc)
-		loc = "C";
-	struct xkb_compose_table *table = xkb_compose_table_new_from_locale(xkb,
-		loc, XKB_COMPOSE_COMPILE_NO_FLAGS);
-	if (!table)
-		return;
-	compose = xkb_compose_state_new(table, XKB_COMPOSE_STATE_NO_FLAGS);
-	xkb_compose_table_unref(table);
-}
-
-static void setup_window(void)
-{
-	main_s.wl = wl_compositor_create_surface(compositor);
-	wl_surface_add_listener(main_s.wl, &surf_listener, NULL);
-	main_xdg = xdg_wm_base_get_xdg_surface(wm_base, main_s.wl);
-	xdg_surface_add_listener(main_xdg, &main_xdg_listener, NULL);
-	toplevel = xdg_surface_get_toplevel(main_xdg);
-	xdg_toplevel_add_listener(toplevel, &toplevel_listener, NULL);
-	xdg_toplevel_set_app_id(toplevel, "mfm");
-	xdg_toplevel_set_min_size(toplevel, 300, 200);
-	if (deco_mgr) {
-		struct zxdg_toplevel_decoration_v1 *d =
-			zxdg_decoration_manager_v1_get_toplevel_decoration(deco_mgr,
-				toplevel);
-		zxdg_toplevel_decoration_v1_set_mode(d,
-			ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
-	}
-	layout();
-}
+/* ---- window setup ------------------------------------------------------- */
 
 /* Where to start: the argument (a file is shown selected in its
  * directory), else the current directory. $PWD is used for that when it
@@ -5534,13 +4769,6 @@ static void start(const char *arg)
 		set_status(1, "%s", err);
 }
 
-static void lost_connection(void)
-{
-	fprintf(stderr, "mfm: lost the connection to the compositor: %s\n",
-		strerror(wl_display_get_error(dpy)));
-	exit(1);
-}
-
 /* stdout to a file is fully buffered: without the flush a full disk or a
  * closed stdout would go unnoticed and -v or -h would still exit 0. */
 static int
@@ -5583,96 +4811,16 @@ int main(int argc, char **argv)
 	setlocale(LC_ALL, "");
 	signal(SIGCHLD, SIG_IGN);
 
-	if (!(dpy = wl_display_connect(NULL))) {
-		fprintf(stderr, "mfm: cannot connect to a Wayland compositor\n");
+	if (!(m = mtk_open(&(struct mtk_config){ .name = "mfm", .idle = idle })))
 		return 1;
-	}
-	if (!(xkb = xkb_context_new(XKB_CONTEXT_NO_FLAGS))) {
-		fprintf(stderr, "mfm: cannot set up xkbcommon\n");
-		return 1;
-	}
-	compose_init();
-	registry = wl_display_get_registry(dpy);
-	wl_registry_add_listener(registry, &registry_listener, NULL);
-	if (wl_display_roundtrip(dpy) < 0)
-		lost_connection();
-	if (!compositor || !shm || !wm_base) {
-		fprintf(stderr, "mfm: the compositor lacks wl_compositor 4, wl_shm "
-			"or xdg_wm_base\n");
-		return 1;
-	}
-	cursor_update();
 	theme_init();
-	setup_window();
+	win = mtk_window_new(m, &(struct mtk_window_config){
+		.width = W, .height = H, .min_width = 300, .min_height = 200,
+		.server_decoration = 1,
+	}, &main_listener, NULL);
+	layout();
 	start(argc == 2 ? argv[1] : NULL);
 	set_title();
-	wl_surface_commit(main_s.wl);
-
-	int dfd = wl_display_get_fd(dpy);
-	uint64_t next_poll = now_ms() + POLL_MS;
-	for (;;) {
-		if (wl_display_dispatch_pending(dpy) < 0)
-			lost_connection();
-		/* Timers run on every pass, so a steady stream of events
-		 * (held keys, scrolling) cannot starve them. */
-		uint64_t now = now_ms();
-		job_poll();
-		/* A folder that keeps changing is read again each time: one that
-		 * takes long to read is not polled more often than leaves the
-		 * window three quarters of the time. */
-		if (now >= next_poll) {
-			poll_dir();
-			uint64_t took = now_ms() - now;
-			next_poll = now + MAX(POLL_MS, 4 * took);
-		}
-		if (search[0] && now - search_ms >= TYPEAHEAD_MS) {
-			search[0] = 0;
-			dirty = 1;
-		}
-		if (repeat_kc && now >= repeat_next) {
-			/* The key may mean something else by now. */
-			if (key_repeats(repeat_kc))
-				key_press(repeat_kc);
-			else
-				repeat_kc = 0;
-			repeat_next = now_ms() + MAX(1000 / MAX(repeat_rate, 1), 1);
-		}
-		/* A frame at a time, except that a configure wants its commit
-		 * even if the window is hidden and gets no frames. */
-		if (dirty && configured && (!main_s.frame || need_commit) && draw()) {
-			dirty = 0;
-			need_commit = 0;
-		}
-		if (menu_on && menu_dirty && menu_configured && !menu_s.frame &&
-		    menu_draw())
-			menu_dirty = 0;
-
-		if (wl_display_prepare_read(dpy) != 0)
-			continue;       /* events arrived in the meantime */
-		short dev = POLLIN;
-		if (wl_display_flush(dpy) < 0) {
-			if (errno != EAGAIN) {
-				wl_display_cancel_read(dpy);
-				lost_connection();
-			}
-			dev |= POLLOUT;
-		}
-		uint64_t wake = next_poll;
-		if (search[0])
-			wake = MIN(wake, search_ms + TYPEAHEAD_MS);
-		if (repeat_kc)
-			wake = MIN(wake, repeat_next);
-		now = now_ms();
-		struct pollfd fds[2] = {
-			{ .fd = dfd, .events = dev },
-			{ .fd = job.fd, .events = POLLIN },     /* -1: ignored */
-		};
-		poll(fds, 2, wake > now ? (int)MIN(wake - now, INT_MAX) : 0);
-		if (fds[0].revents & (POLLIN | POLLERR | POLLHUP)) {
-			if (wl_display_read_events(dpy) < 0)
-				lost_connection();
-		} else {
-			wl_display_cancel_read(dpy);
-		}
-	}
+	mtk_timer(m, POLL_MS, dir_tick, NULL);
+	return mtk_run(m);
 }

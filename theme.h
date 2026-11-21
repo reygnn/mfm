@@ -4,6 +4,8 @@
 
 #include <stdint.h>
 
+#include "mtk.h"
+
 struct theme {
 	/* faces */
 	uint32_t bg, top, bot, list, trough, sel, mark, folder, paper;
@@ -18,10 +20,5 @@ struct theme {
 /* fg and sel_fg are the user's colours, or NULL for black or white. */
 void theme_make(struct theme *t, uint32_t bg, uint32_t act, const uint32_t *fg,
 	const uint32_t *sel_fg);
-
-uint32_t mix(uint32_t rgb, uint32_t to, float f);
-float contrast_ratio(uint32_t a, uint32_t b);
-/* Black or white, whichever reads better on bg. */
-uint32_t contrast(uint32_t bg);
 
 #endif

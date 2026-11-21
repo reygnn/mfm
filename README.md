@@ -1,8 +1,9 @@
 # mfm
 
 mfm is a minimal file manager for Wayland in the look of the Motif window manager,
-made to go with [mwc](https://github.com/reygnn/mwc). One C file on libwayland,
-xkbcommon, Cairo and Pango, no toolkit. It takes mwc's colours, browses, copies, moves,
+made to go with [mwc](https://github.com/reygnn/mwc). One C file on
+[mtk](https://github.com/reygnn/mtk), the toolkit of mwc's clients, vendored in `mtk/`:
+libwayland, xkbcommon, Cairo and Pango. It takes mwc's colours, browses, copies, moves,
 renames, trashes and deletes, and leaves the rest to a terminal.
 
 
@@ -91,7 +92,7 @@ over its entry.
 | `terminal` | `MFM_TERMINAL` | `MWC_TERMINAL`, else the first found | Ctrl+T |
 | `font` | `MFM_FONT` | `Sans 10` | a Pango font name |
 | `background`, `activeBackground` | `MWC_INACTIVE`, `MWC_ACTIVE` | mwc's, from its mwmrc | window and selection |
-| `foreground`, `activeForeground` | | mwc's, else black or white | their text |
+| `foreground`, `activeForeground` | | mwc's, else black or white as Motif picks it | their text |
 | `sort`, `sortReverse` | | `name`, `false` | the order at start: `name`, `size` or `date` |
 | `showHidden` | | `false` | hidden files at start |
 

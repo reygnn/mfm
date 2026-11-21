@@ -1129,16 +1129,16 @@ MFM_FONT=Monospace mfm_start "$D"
 mfm_quit
 echo "ok: a font without a size"
 
-# The selected row has mwc's activeBackground, a mid-tone: black reads better on it
-# than white. A big bold font has strokes wider than the edge smoothing.
+# The selected row has mwc's activeBackground, a mid-tone: white, as Motif picks it
+# and mwc's titles have it. A big bold font has strokes wider than the edge smoothing.
 fresh_dir ink
 MFM_FONT="Sans Bold 24" mfm_start "$D"
 shoot
 ink=$(build/pngtool count "$SHOT" $((CX + 20)) $((ROW0 + 1)) 400 $((ROWH - 2)) 000000)
 white=$(build/pngtool count "$SHOT" $((CX + 20)) $((ROW0 + 1)) 400 $((ROWH - 2)) ffffff)
-[ "$ink" -gt 0 ] && [ "$white" = 0 ] ||
-	fail "the selected row has $ink black and $white white pixels, not black text"
-echo "ok: black text on the selected row"
+[ "$white" -gt 0 ] && [ "$ink" = 0 ] ||
+	fail "the selected row has $ink black and $white white pixels, not white text"
+echo "ok: white text on the selected row"
 mfm_quit
 
 # As mwc reads it: a line however long counts, and the last line wins, so a value
