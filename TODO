@@ -1,5 +1,3 @@
 TODO
 
-* mfm auf mtk umstellen.
-* Ein Eingabefeld (Cursor, Auswahl, Kürzel) aus mrun und mfm, wenn beide
-  umgestellt sind und dasselbe brauchen.
+* mfm, mrun und pulseControl auf mtk_field umstellen.

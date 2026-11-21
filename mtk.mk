@@ -24,7 +24,7 @@ MTK_PROTO_C = $(MTK_PROTO_NAMES:%=$(MTK_BUILD)/%-protocol.c)
 
 # The modules without Wayland, which a client's tests may link alone.
 MTK_HEADLESS = $(MTK_DIR)/color.c $(MTK_DIR)/rc.c $(MTK_DIR)/draw.c \
-	$(MTK_DIR)/input.c
+	$(MTK_DIR)/input.c $(MTK_DIR)/field.c
 MTK_SRC = $(MTK_HEADLESS) $(MTK_DIR)/wl.c $(MTK_PROTO_C)
 MTK_DEPS = $(MTK_SRC) $(MTK_DIR)/mtk.h $(MTK_PROTO_H)
 MTK_CFLAGS = -std=c11 -Wall -Wextra -Wno-unused-parameter -I$(MTK_DIR) -I$(MTK_BUILD) \
