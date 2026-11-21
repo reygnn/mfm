@@ -56,7 +56,7 @@ int mtk_damage_rows(const void *now, const void *was, size_t stride, int h, int 
 	for (int y = y0 + 1; y < y1 && n < max - 1; y++) {
 		if (!memcmp(p + y * stride, q + y * stride, stride))
 			continue;
-		if (y - last > gap) {
+		if (y - last - 1 > gap) {       /* the rows unchanged between */
 			rows[n][0] = start;
 			rows[n][1] = last + 1 - start;
 			n++;
@@ -129,16 +129,31 @@ PangoFontDescription *mtk_dock_font(const char *name)
 	return d;
 }
 
+/* fontconfig's generic names (45-generic.conf, 60-latin.conf): aliases, never the
+ * family they give. */
+static int generic(const char *fam)
+{
+	static const char *const names[] = {
+		"sans", "sans serif", "sans-serif", "serif", "mono", "monospace",
+		"cursive", "fantasy", "emoji", "math", "system-ui",
+	};
+	for (size_t i = 0; i < sizeof names / sizeof names[0]; i++)
+		if (!g_ascii_strcasecmp(fam, names[i]))
+			return 1;
+	return 0;
+}
+
 PangoFontDescription *mtk_font(const char *name, const char *pango_name)
 {
 	PangoFontDescription *d = pango_font_description_from_string(pango_name);
+	/* "Monospace" has no size, and metrics without one are all zero: 10 points,
+	 * as mfm and mrun take it. */
+	if (pango_font_description_get_size(d) <= 0)
+		pango_font_description_set_size(d, 10 * PANGO_SCALE);
 	const char *fam = pango_font_description_get_family(d);
 	char got[128];
 	/* A family list ("Sans, Noto") is left to fontconfig. */
-	if (!fam || strchr(fam, ',') || font_is(d, fam, got, sizeof got) ||
-	    /* The generic names are aliases, never the family itself. */
-	    !g_ascii_strcasecmp(fam, "sans") || !g_ascii_strcasecmp(fam, "serif") ||
-	    !g_ascii_strcasecmp(fam, "monospace") || !g_ascii_strcasecmp(fam, "sans-serif"))
+	if (!fam || strchr(fam, ',') || generic(fam) || font_is(d, fam, got, sizeof got))
 		return d;
 	fprintf(stderr, "%s: font \"%s\" not found, Pango would take %s\n", name,
 		pango_name, got);
@@ -269,6 +284,15 @@ void mtk_field_draw(cairo_t *cr, PangoLayout *l, const char *d, size_t cur,
 	int asc = PANGO_PIXELS_CEIL(pango_font_metrics_get_ascent(fm));
 	int desc = PANGO_PIXELS_CEIL(pango_font_metrics_get_descent(fm));
 	pango_font_metrics_unref(fm);
+	if (asc + desc <= 0) {
+		/* A font without a size has no metrics, though Pango draws it at its
+		 * default size: the layout's own line, then. */
+		int lh;
+		pango_layout_set_text(l, "Hg", 2);
+		pango_layout_get_pixel_size(l, NULL, &lh);
+		asc = pango_layout_get_baseline(l) / PANGO_SCALE;
+		desc = lh - asc;
+	}
 	int ew = fit_shape(&f, "...", 3), maxw = w - 2, start = 0, end = n, x0 = x;
 	if (maxw <= 2 * ew) {
 		free(f.stop);

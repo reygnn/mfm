@@ -178,6 +178,22 @@ TEST(text)
 	CHECK(dv != NULL);
 	if (dv)
 		pango_font_description_free(dv);
+	/* fontconfig's other generic names, which no family is called either. */
+	static const char *const generic[] = {
+		"Mono 10", "system-ui 10", "Sans Serif 10", "cursive 10", "fantasy 10",
+		"emoji 10", "math 10",
+	};
+	for (size_t i = 0; i < sizeof generic / sizeof generic[0]; i++) {
+		PangoFontDescription *g = mtk_font("draw_test", generic[i]);
+		CHECK(g != NULL);
+		if (g)
+			pango_font_description_free(g);
+	}
+	/* Without a size it is 10 points, with metrics to draw a field by. */
+	PangoFontDescription *mono = mtk_font("draw_test", "Monospace");
+	CHECK(mono && pango_font_description_get_size(mono) == 10 * PANGO_SCALE);
+	if (mono)
+		pango_font_description_free(mono);
 }
 
 /* Rows of 4 bytes, the ones in ch[] changed. */
@@ -196,11 +212,14 @@ TEST(damage)
 	CHECK_INT(damage("", 8, 4, r), 0);              /* nothing changed */
 	CHECK_INT(damage("5", 8, 4, r), 1);
 	CHECK(r[0][0] == 5 && r[0][1] == 1);
-	/* A gap of 8 is no gap, one of 9 is. */
-	CHECK_INT(damage("5=", 8, 4, r), 1);            /* '=' is row 13 */
-	CHECK(r[0][0] == 5 && r[0][1] == 9);
-	CHECK_INT(damage("5>", 8, 4, r), 2);            /* '>' is row 14 */
-	CHECK(r[0][0] == 5 && r[0][1] == 1 && r[1][0] == 14 && r[1][1] == 1);
+	/* 8 unchanged rows between are no gap, 9 are. */
+	CHECK_INT(damage("5>", 8, 4, r), 1);            /* '>' is row 14 */
+	CHECK(r[0][0] == 5 && r[0][1] == 10);
+	CHECK_INT(damage("5?", 8, 4, r), 2);            /* '?' is row 15 */
+	CHECK(r[0][0] == 5 && r[0][1] == 1 && r[1][0] == 15 && r[1][1] == 1);
+	CHECK_INT(damage("56", 0, 4, r), 1);            /* no gap at all */
+	CHECK(r[0][0] == 5 && r[0][1] == 2);
+	CHECK_INT(damage("57", 0, 4, r), 2);
 	/* At most max: the last takes in the rest. */
 	CHECK_INT(damage("0;FQ", 3, 2, r), 2);          /* rows 0, 11, 22, 33 */
 	CHECK(r[0][0] == 0 && r[0][1] == 1 && r[1][0] == 11 && r[1][1] == 23);
@@ -224,13 +243,16 @@ static int ink_in(cairo_surface_t *f, int x0, int x1, uint32_t c)
 	return n;
 }
 
-static int field(const char *text, size_t cur, int selected, int *first, int *last)
+/* The field in font, or the dock's; *rows how many rows have ink. */
+static int field_in(const char *font, const char *text, size_t cur, int selected,
+	int *first, int *last, int *rows)
 {
 	enum { FW = 300, FH = 24, BX = 50, BW = 120 };
 	cairo_surface_t *f = cairo_image_surface_create(CAIRO_FORMAT_RGB24, FW, FH);
 	cairo_t *c = cairo_create(f);
 	cairo_set_antialias(c, CAIRO_ANTIALIAS_NONE);
-	PangoFontDescription *fd = mtk_dock_font("draw_test");
+	PangoFontDescription *fd = font ? pango_font_description_from_string(font) :
+		mtk_dock_font("draw_test");
 	PangoLayout *l = mtk_layout_new(fd);
 	mtk_fill(c, 0xffffff, 0, 0, FW, FH);
 	mtk_field_draw(c, l, text, cur, selected, BX, 0, BW, FH, 0x000000, 0x7387ad,
@@ -243,11 +265,28 @@ static int field(const char *text, size_t cur, int selected, int *first, int *la
 			*last = x;
 		}
 	int sel = ink_in(f, 0, FW - 1, 0x7387ad);
+	cairo_surface_flush(f);
+	const unsigned char *d = cairo_image_surface_get_data(f);
+	int stride = cairo_image_surface_get_stride(f);
+	*rows = 0;
+	for (int y = 0; y < FH; y++) {
+		int any = 0;
+		for (int x = 0; x < FW && !any; x++)
+			any = (*(const uint32_t *)(d + y * stride + 4 * x) & 0xffffff) !=
+				0xffffff;
+		*rows += any;
+	}
 	g_object_unref(l);
 	pango_font_description_free(fd);
 	cairo_destroy(c);
 	cairo_surface_destroy(f);
 	return sel;
+}
+
+static int field(const char *text, size_t cur, int selected, int *first, int *last)
+{
+	int rows;
+	return field_in(NULL, text, cur, selected, first, last, &rows);
 }
 
 TEST(field_draw)
@@ -270,6 +309,16 @@ TEST(field_draw)
 	/* A cursor inside a grapheme goes to its start; nothing past the box. */
 	field("xe\xcc\x81y", 2, 0, &first, &last);
 	CHECK(first >= BX && last < BX + BW);
+	/* ... and so does the selection before it. */
+	CHECK_INT(field("xe\xcc\x81y", 2, 1, &first, &last),
+		field("xe\xcc\x81y", 1, 1, &first, &last));
+	/* A font without a size, which Pango gives no metrics: the text and the
+	 * cursor as high as in the dock's. */
+	int rows, rows10;
+	field_in("DejaVu Sans 10", "Hg", 2, 1, &first, &last, &rows10);
+	CHECK(field_in("DejaVu Sans", "Hg", 2, 1, &first, &last, &rows) > 20);
+	CHECK(first >= BX && last < BX + BW);
+	CHECK(rows >= rows10 - 2 && rows10 > 8);
 	/* Too narrow for anything: nothing. */
 	cairo_surface_t *f = cairo_image_surface_create(CAIRO_FORMAT_RGB24, 40, 24);
 	cairo_t *c = cairo_create(f);

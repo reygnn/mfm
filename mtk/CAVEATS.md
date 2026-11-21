@@ -16,7 +16,9 @@ wl_compositor 6. A fractional scale is drawn at the next integer and scaled down
 the compositor; a compositor with wl_compositor 4 or 5 never asks, and there the
 window stays at scale 1. A scale above 16 is drawn at 16. A window too large for
 Cairo's 32767 pixels at its scale is drawn at a lower one and enlarged by the
-compositor; one past 32767 surface pixels stays black.
+compositor. One past 32767 pixels, or past 2 GiB of buffer, at scale 1 gets a
+buffer cut to that size: the window is shown that much smaller, without its right
+and bottom.
 
 A lost connection, a failed buffer allocation and a failed poll print why and exit
 with 1: the clients have nothing to save.
@@ -42,9 +44,9 @@ frame; a flood beyond that is dropped, not carried over.
 
 ## Colours
 
-Colours are 8 bits a channel. A colour given in 16 bits (`rgb:ffff/8000/0`) is
-rounded to 8 before its shadows are made; mwc keeps all 16, so such a colour's shadow
-can differ by one from mwc's frame.
+Colours are 8 bits a channel. One given with more (`rgb:ffff/8000/0`) is rounded to
+16 and cut to the high byte, as mwc does before Motif's rules: the shadows and text
+are those of the colour as it is shown.
 
 
 ## The loop

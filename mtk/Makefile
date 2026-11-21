@@ -25,15 +25,20 @@ UNIT_FLAGS = -std=c11 -Wall -Wextra -Wno-unused-parameter -Werror -O1 -g \
 	-fno-sanitize-recover=undefined,float-cast-overflow
 UNIT_CFLAGS = $(shell $(PKG_CONFIG) --cflags $(MTK_HEADLESS_PKGS))
 UNIT_LIBS = $(shell $(PKG_CONFIG) --libs $(MTK_HEADLESS_PKGS)) -lm
-# What a module needs of another: also linked, real.
+# What a module needs of another: also linked, real, and rebuilt with it.
 UNIT_WITH_rc = color.c
 UNIT_WITH_draw = color.c
+# What cannot be made real is wrapped: fopen's path, a malloc that fails.
+UNIT_LD_rc = -Wl,--wrap=fopen
+UNIT_LD_field = -Wl,--wrap=malloc
 
 build/unit: | build
 	mkdir -p $@
 
-build/unit/%: tests/unit/%_test.c %.c mtk.h tests/unit/unit.h | build/unit
-	$(CC) $(UNIT_FLAGS) $(UNIT_CFLAGS) -o $@ $< $*.c $(UNIT_WITH_$*) $(UNIT_LIBS)
+.SECONDEXPANSION:
+build/unit/%: tests/unit/%_test.c %.c $$(UNIT_WITH_$$*) mtk.h tests/unit/unit.h | build/unit
+	$(CC) $(UNIT_FLAGS) $(UNIT_CFLAGS) -o $@ $< $*.c $(UNIT_WITH_$*) $(UNIT_LD_$*) \
+		$(UNIT_LIBS)
 
 unit: $(UNIT:%=build/unit/%)
 	@fail=0; for t in $^; do \
@@ -46,7 +51,11 @@ unit: $(UNIT:%=build/unit/%)
 build/mtkdemo-asan: demo/mtkdemo.c $(MTK_DEPS) | build
 	$(CC) $(MTK_CFLAGS) $(UNIT_FLAGS) -o $@ demo/mtkdemo.c $(MTK_SRC) $(MTK_LIBS)
 
-check: unit build/mtkdemo-asan
+check: unit build/mtkdemo-asan mk
+
+# mk: tests/mk.sh, a client built as README.md shows, and the units' rebuilds.
+mk: build/unit/rc build/unit/input
+	tests/mk.sh
 
 # make test: the demo in a headless mwc from MWC_DIR (default ../mwc), checked in
 # screenshots, under ASan and UBSan.
@@ -79,4 +88,4 @@ lint:
 clean:
 	rm -rf build
 
-.PHONY: all unit check test analyze lint clean
+.PHONY: all unit check mk test analyze lint clean

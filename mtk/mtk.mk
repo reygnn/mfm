@@ -1,13 +1,16 @@
 # mtk.mk - mtk for a client's Makefile, where mtk is vendored in MTK_DIR:
 #
+#   all: app
 #   MTK_DIR = mtk
 #   include $(MTK_DIR)/mtk.mk
 #   app: app.c $(MTK_DEPS)
 #   	$(CC) $(MTK_CFLAGS) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ app.c \
 #   		$(MTK_SRC) $(MTK_LIBS) $(LDLIBS)
 #
-# The protocol code goes to MTK_BUILD. PKG_CONFIG and CC are the client's.
+# The protocol code goes to MTK_BUILD. PKG_CONFIG and CC are the client's. The
+# client's default goal stays its own, wherever it includes this.
 
+MTK_GOAL := $(.DEFAULT_GOAL)
 MTK_DIR ?= mtk
 MTK_BUILD ?= build/mtk
 PKG_CONFIG ?= pkg-config
@@ -45,3 +48,5 @@ $(MTK_BUILD)/xdg-decoration-unstable-v1-%: \
 		$(MTK_PROTOCOLS)/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml \
 		| $(MTK_BUILD)
 	$(MTK_SCANNER) $(if $(filter %.h,$@),client-header,private-code) $< $@
+
+.DEFAULT_GOAL := $(MTK_GOAL)

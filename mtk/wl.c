@@ -109,6 +109,7 @@ struct mtk {
 	struct xkb_state *kb_state;
 	struct xkb_compose_state *compose;
 	struct mtk_repeat repeat;
+	struct mtk_window *repeat_win;  /* the window the repeating key went to */
 	struct mtk_window *kb_win;
 
 	struct wl_pointer *pointer;
@@ -421,7 +422,8 @@ static int key_make(struct mtk *m, uint32_t kc, int repeat, struct mtk_key *k,
 	if (!mtk_key_translate(m->kb_state, m->compose, kc, &k->sym, utf8))
 		return 0;
 	k->kc = kc;
-	k->latin = mtk_latin_sym(m->kb_map, kc, k->sym);
+	k->latin = mtk_latin_sym(m->kb_map, xkb_state_key_get_layout(m->kb_state, kc), kc,
+		k->sym);
 	k->utf8 = utf8;
 	k->mods = mtk_mods(m->kb_state);
 	k->repeat = repeat;
@@ -528,6 +530,8 @@ static void kb_key(void *data, struct wl_keyboard *kb, uint32_t serial,
 	 * sequence does. */
 	mtk_repeat_press(&m->repeat, kc, repeats, made && win && key_may_repeat(win, &k),
 		mtk_now());
+	if (m->repeat.kc == kc)
+		m->repeat_win = win;
 	if (made && win && win->l->key)
 		win->l->key(win, &k, win->data);
 }
@@ -564,6 +568,11 @@ static void key_repeat(struct mtk *m)
 	struct mtk_window *win = key_target(m);
 	if (!kc || !win || !m->kb_state)
 		return;
+	/* Not into another window than the press went to: a menu closed by it. */
+	if (win != m->repeat_win) {
+		mtk_repeat_stop(&m->repeat);
+		return;
+	}
 	struct mtk_key k;
 	char utf8[64];
 	if (!key_make(m, kc, 1, &k, utf8) || !key_may_repeat(win, &k)) {
@@ -920,11 +929,12 @@ static void xdg_configure(void *data, struct xdg_surface *s, uint32_t serial)
 	if (!win->fixed && win->toplevel)
 		mtk_configure_size(win->cfg_w, win->cfg_h, win->states, win->min_w,
 			win->min_h, &win->free_w, &win->free_h, &win->w, &win->h);
-	if (win->l->configure)
-		win->l->configure(win, win->cfg_w, win->cfg_h, win->cfg_states, win->data);
 	win->configured = 1;
 	win->need_commit = 1;
 	win->dirty = 1;
+	/* Last: the client may destroy the window there. */
+	if (win->l->configure)
+		win->l->configure(win, win->cfg_w, win->cfg_h, win->cfg_states, win->data);
 }
 
 static const struct xdg_surface_listener xdg_listener = { xdg_configure };
@@ -983,11 +993,12 @@ static void surf_preferred_scale(void *data, struct wl_surface *s, int32_t facto
 		return;
 	win->scale = factor;
 	win->dirty = 1;
-	if (win->l->scale)
-		win->l->scale(win, factor, win->data);
 	/* Now, not at the next enter: the pointer may be resting on the window. */
 	if (win->m->ptr_win == win || !win->m->ptr_win)
 		cursor_update(win->m);
+	/* Last: the client may destroy the window there. */
+	if (win->l->scale)
+		win->l->scale(win, factor, win->data);
 }
 
 static void surf_preferred_transform(void *data, struct wl_surface *s,
@@ -1082,6 +1093,10 @@ void mtk_window_destroy(struct mtk_window *win)
 		m->kb_win = NULL;
 	if (m->ptr_win == win)
 		m->ptr_win = NULL;
+	if (m->repeat_win == win) {
+		mtk_repeat_stop(&m->repeat);
+		m->repeat_win = NULL;
+	}
 	if (win->frame)
 		wl_callback_destroy(win->frame);
 	for (int i = 0; i < 2; i++)
@@ -1314,15 +1329,22 @@ void mtk_timer_cancel(struct mtk *m, unsigned id)
 static void run_timers(struct mtk *m)
 {
 	uint64_t now = mtk_now();
-	struct timer due[MAX_TIMERS];
+	struct due { int slot; unsigned id; } due[MAX_TIMERS];
 	int n = 0;
 	for (int i = 0; i < MAX_TIMERS; i++)
-		if (m->timers[i].id && m->timers[i].at <= now) {
-			due[n++] = m->timers[i];
-			m->timers[i].id = 0;
-		}
-	for (int i = 0; i < n; i++)
-		due[i].fn(m, due[i].data);
+		if (m->timers[i].id && m->timers[i].at <= now)
+			due[n++] = (struct due){ i, m->timers[i].id };
+	/* Each still there when its turn comes: an earlier callback may have
+	 * cancelled it, and freed its data. */
+	for (int i = 0; i < n; i++) {
+		struct timer *t = &m->timers[due[i].slot];
+		if (t->id != due[i].id)
+			continue;
+		mtk_timer_fn fn = t->fn;
+		void *data = t->data;
+		t->id = 0;
+		fn(m, data);
+	}
 }
 
 static int next_timeout(struct mtk *m)
@@ -1407,12 +1429,14 @@ int mtk_run(struct mtk *m)
 	while (!m->quit) {
 		struct pollfd pfd[1 + MAX_WATCH];
 		struct watch w[MAX_WATCH];
-		int timeout = -1, n = m->nwatch;
+		int timeout = -1;
 		mtk_before_poll(m, &pfd[0], &timeout);
 		if (m->quit) {
 			mtk_after_poll(m, 0);
 			break;
 		}
+		/* After the idle hook, which may watch or unwatch. */
+		int n = m->nwatch;
 		memcpy(w, m->watch, n * sizeof *w);
 		for (int i = 0; i < n; i++)
 			pfd[1 + i] = (struct pollfd){ .fd = w[i].fd, .events = w[i].events };

@@ -1,2 +1,6 @@
 TODO
 
+Low priority:
+
+- Colours per program, `Mwm*app*background` and the others, as mwc takes them for
+  the frame: a client would be drawn as its frame, not with the global colours.

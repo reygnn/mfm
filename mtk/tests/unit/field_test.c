@@ -7,6 +7,15 @@
 #include "../../mtk.h"
 #include "unit.h"
 
+/* malloc for field.c, wrapped: it fails while fail_malloc is set. */
+static int fail_malloc;
+void *__real_malloc(size_t n);
+void *__wrap_malloc(size_t n);
+void *__wrap_malloc(size_t n)
+{
+	return fail_malloc ? NULL : __real_malloc(n);
+}
+
 static char buf[16];
 static struct mtk_field f;
 
@@ -89,6 +98,23 @@ TEST(moving)
 	CHECK_INT(f.cur, 4);
 	key(XKB_KEY_Left);
 	CHECK_INT(f.cur, 1);
+	/* ... and back over it as Right went: the byte with the marks after it. */
+	set("\xe9\xcc\x81", 0, 0, 0);
+	key(XKB_KEY_Right);
+	CHECK_INT(f.cur, 3);
+	key(XKB_KEY_Left);
+	CHECK_INT(f.cur, 0);
+	set("X\xe9\xcc\x81Y", 5, 0, 0);
+	key(XKB_KEY_Left);
+	CHECK_INT(f.cur, 4);
+	key(XKB_KEY_Left);
+	CHECK_INT(f.cur, 1);
+	key(XKB_KEY_Left);
+	CHECK_INT(f.cur, 0);
+	set("X\xe9\xcc\x81Y", 5, 0, 0);
+	CHECK_INT(key(XKB_KEY_BackSpace), MTK_FIELD_CHANGED);
+	CHECK_INT(key(XKB_KEY_BackSpace), MTK_FIELD_CHANGED);   /* byte and mark */
+	CHECK(!strcmp(buf, "X") && f.cur == 1);
 }
 
 TEST(deleting)
@@ -184,6 +210,23 @@ TEST(accept)
 	CHECK(!strcmp(buf, "50") && f.cur == 2);
 }
 
+/* Without memory Return, Esc and the cursor keys still work; an edit does nothing. */
+TEST(no_memory)
+{
+	set("abc", 3, 1, 1);
+	fail_malloc = 1;
+	CHECK_INT(key(XKB_KEY_Return), MTK_FIELD_ENTER);
+	CHECK_INT(key(XKB_KEY_Escape), MTK_FIELD_CANCEL);
+	CHECK_INT(key(XKB_KEY_Left), MTK_FIELD_MOVED);
+	CHECK_INT(key(XKB_KEY_Home), MTK_FIELD_MOVED);
+	CHECK_INT(key(XKB_KEY_End), MTK_FIELD_MOVED);
+	CHECK_INT(type("x"), MTK_FIELD_NONE);
+	CHECK_INT(key(XKB_KEY_BackSpace), MTK_FIELD_NONE);
+	fail_malloc = 0;
+	CHECK(!strcmp(buf, "abc"));
+	CHECK_INT(key(XKB_KEY_BackSpace), MTK_FIELD_CHANGED);
+}
+
 int main(void)
 {
 	RUN(set);
@@ -193,5 +236,6 @@ int main(void)
 	RUN(fresh);
 	RUN(enter_cancel);
 	RUN(accept);
+	RUN(no_memory);
 	return unit_done();
 }

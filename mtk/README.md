@@ -32,6 +32,7 @@ builds it in.
 
 In the client's Makefile:
 
+    all: app
     MTK_DIR = mtk
     include $(MTK_DIR)/mtk.mk
 
@@ -40,7 +41,8 @@ In the client's Makefile:
     		$(MTK_SRC) $(MTK_LIBS) $(LDLIBS)
 
 `MTK_HEADLESS` are the modules without Wayland, for a client's own unit tests. The
-API is in `mtk.h`; `demo/mtkdemo.c` uses all of it.
+API is in `mtk.h`; `demo/mtkdemo.c` uses all of its Wayland side, `tests/unit` the
+rest.
 
 A client needs:
 
@@ -54,7 +56,7 @@ A client needs:
 |---|---|
 | `make` | `build/mtkdemo` |
 | `make unit` | `tests/unit`: a program per module without Wayland, under ASan and UBSan |
-| `make check` | the units, and the demo built under ASan and UBSan with `-Werror` |
+| `make check` | the units, `tests/mk.sh` (a client built with `mtk.mk`), and the demo built under ASan and UBSan with `-Werror` |
 | `make test` | `tests/ui.sh`: the demo in a headless mwc, under ASan, checked in screenshots |
 | `make analyze` | `gcc -fanalyzer`, findings as errors |
 | `make lint` | C lines over 100 columns |
