@@ -19,7 +19,7 @@ build/mtkdemo: demo/mtkdemo.c $(MTK_DEPS) | build
 
 # make unit: tests/unit, a program per module (NAME_test.c with NAME.c), always
 # under ASan and UBSan.
-UNIT = color rc draw input
+UNIT = color rc draw input field
 UNIT_FLAGS = -std=c11 -Wall -Wextra -Wno-unused-parameter -Werror -O1 -g \
 	-fno-omit-frame-pointer -fsanitize=address,undefined,float-cast-overflow \
 	-fno-sanitize-recover=undefined,float-cast-overflow
@@ -60,7 +60,7 @@ build/failpoll.so: tests/failpoll.c | build
 
 # make analyze: GCC's static analyzer over every source file, findings as errors.
 analyze: $(MTK_PROTO_H)
-	@for f in color.c rc.c draw.c input.c wl.c demo/mtkdemo.c tests/failpoll.c; do \
+	@for f in color.c rc.c draw.c input.c field.c wl.c demo/mtkdemo.c tests/failpoll.c; do \
 		echo "analyze $$f"; \
 		$(CC) $(MTK_CFLAGS) -O0 -fanalyzer -Werror -c $$f -o /dev/null || exit 1; \
 	done

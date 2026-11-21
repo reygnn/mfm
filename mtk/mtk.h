@@ -2,9 +2,9 @@
  * mtk.h - the Motif toolkit of mwc's clients: a Wayland window in the look of mwm,
  * drawn with Cairo and Pango.
  *
- * Colours, the mwmrc, drawing and key handling need no compositor (color.c, rc.c,
- * draw.c, input.c); the Wayland side is wl.c. Every name starts with mtk_ or MTK_.
- * Colours are 0xrrggbb.
+ * Colours, the mwmrc, drawing, key handling and a line to edit need no compositor
+ * (color.c, rc.c, draw.c, input.c, field.c); the Wayland side is wl.c. Every name
+ * starts with mtk_ or MTK_. Colours are 0xrrggbb.
  */
 #ifndef MTK_H
 #define MTK_H
@@ -17,7 +17,7 @@
 #include <xkbcommon/xkbcommon.h>
 #include <xkbcommon/xkbcommon-compose.h>
 
-#define MTK_VERSION "0.6.0"
+#define MTK_VERSION "0.7.0"
 
 /* ---- colours (color.c) ---------------------------------------------------- */
 
@@ -239,6 +239,52 @@ void mtk_scroll_stop(struct mtk_scroll *s);
 /* The frame is over: its steps. A wheel's count and drop the distance; else whole
  * steps of the distance are taken from it. */
 int mtk_scroll_frame(struct mtk_scroll *s);
+
+/* ---- a line to edit (field.c) --------------------------------------------- */
+
+/* The cursor position before (dir < 0) or after at in s: a whole grapheme, a flag
+ * or a letter with its marks, as Pango tells them apart. Next to a byte that is not
+ * UTF-8 it goes by a letter and the combining marks after it. */
+size_t mtk_grapheme_step(const char *s, size_t at, int dir);
+
+/* A line of text in the client's buffer text[size]. Fresh: nothing done since
+ * mtk_field_set(); with selects the text before the cursor is then selected, and
+ * typing or deleting replaces it. accept, if set, sees what an edit would make of
+ * the text, in a buffer of size bytes: it may change it, or refuse it with 0. */
+struct mtk_field {
+	char *text;
+	size_t size;
+	size_t cur;                     /* in bytes, on a character boundary */
+	int fresh, selects;
+	int (*accept)(char *text, size_t size, void *data);
+	void *data;
+};
+
+enum {
+	MTK_FIELD_NONE,                 /* nothing to show */
+	MTK_FIELD_MOVED,                /* the cursor, or the selection gone */
+	MTK_FIELD_CHANGED,              /* the text */
+	MTK_FIELD_ENTER,                /* Return */
+	MTK_FIELD_CANCEL,               /* Esc */
+};
+
+/* s in the field, cut before a character if it is too long, the cursor at its end,
+ * fresh. */
+void mtk_field_set(struct mtk_field *f, const char *s);
+
+/* A key: ks as for a shortcut (mtk_key.latin) when Ctrl is held, its text and
+ * the modifiers. Left, Right, Home, End, BackSpace, Delete, Ctrl+U and typing;
+ * Return and Esc only say so. */
+int mtk_field_key(struct mtk_field *f, xkb_keysym_t ks, const char *utf8,
+	unsigned mods);
+
+/* text, valid UTF-8, in l on one line in x, y, w, h: scrolled so the cursor at
+ * byte cur shows, shortened with "..." where it doesn't fit, as mfm draws its
+ * fields. With selected the text before the cursor is drawn selected, sel_fg on
+ * sel_bg. */
+void mtk_field_draw(cairo_t *cr, PangoLayout *l, const char *text, size_t cur,
+	int selected, int x, int y, int w, int h, uint32_t fg, uint32_t sel_bg,
+	uint32_t sel_fg);
 
 /* ---- Wayland (wl.c) -------------------------------------------------------- */
 

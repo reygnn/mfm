@@ -4,8 +4,8 @@ mtk is the Motif toolkit of the clients made for [mwc](https://github.com/reygnn
 mfm, mrun, deskControl, digitalClock, pulseControl and osDisplay. It holds what each of
 them had in a copy of its own: the Wayland window on wl_shm buffers, the seat with
 keyboard, compose, key repeat, pointer and cursor, an event loop, mwc's colours from
-the environment and the mwmrc, and mwm's bevels and borders on Cairo. C on libwayland,
-xkbcommon, Cairo and Pango.
+the environment and the mwmrc, mwm's bevels and borders on Cairo, popups for menus,
+and a line of text to edit. C on libwayland, xkbcommon, Cairo and Pango.
 
 It is no widget set. A client draws its window itself and handles its own events;
 mtk tells it when, at which scale and with which colours.

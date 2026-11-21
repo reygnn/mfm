@@ -212,6 +212,76 @@ TEST(damage)
 	CHECK_INT(damage("5", 8, 0, r), 0);
 }
 
+/* Pixels of colour c in columns x0..x1 of a field drawn on white. */
+static int ink_in(cairo_surface_t *f, int x0, int x1, uint32_t c)
+{
+	cairo_surface_flush(f);
+	const unsigned char *d = cairo_image_surface_get_data(f);
+	int stride = cairo_image_surface_get_stride(f), n = 0;
+	for (int y = 0; y < cairo_image_surface_get_height(f); y++)
+		for (int x = x0; x <= x1; x++)
+			n += (*(const uint32_t *)(d + y * stride + 4 * x) & 0xffffff) == c;
+	return n;
+}
+
+static int field(const char *text, size_t cur, int selected, int *first, int *last)
+{
+	enum { FW = 300, FH = 24, BX = 50, BW = 120 };
+	cairo_surface_t *f = cairo_image_surface_create(CAIRO_FORMAT_RGB24, FW, FH);
+	cairo_t *c = cairo_create(f);
+	cairo_set_antialias(c, CAIRO_ANTIALIAS_NONE);
+	PangoFontDescription *fd = mtk_dock_font("draw_test");
+	PangoLayout *l = mtk_layout_new(fd);
+	mtk_fill(c, 0xffffff, 0, 0, FW, FH);
+	mtk_field_draw(c, l, text, cur, selected, BX, 0, BW, FH, 0x000000, 0x7387ad,
+		0xffffff);
+	*first = *last = -1;
+	for (int x = 0; x < FW; x++)
+		if (ink_in(f, x, x, 0x000000) || ink_in(f, x, x, 0x7387ad)) {
+			if (*first < 0)
+				*first = x;
+			*last = x;
+		}
+	int sel = ink_in(f, 0, FW - 1, 0x7387ad);
+	g_object_unref(l);
+	pango_font_description_free(fd);
+	cairo_destroy(c);
+	cairo_surface_destroy(f);
+	return sel;
+}
+
+TEST(field_draw)
+{
+	enum { BX = 50, BW = 120 };
+	int first, last;
+	const char *lng = "a long line that has no room in the field at all, none";
+	CHECK_INT(field("abc", 3, 0, &first, &last), 0);
+	CHECK(first >= BX && last < BX + BW);
+	CHECK(field("abc", 3, 1, &first, &last) > 20);  /* the selection */
+	CHECK_INT(field("abc", 0, 1, &first, &last), 0);        /* nothing before it */
+	/* Too long: in the box wherever the cursor is, the cursor shown. */
+	for (size_t cur = 0; cur <= strlen(lng); cur += 11) {
+		field(lng, cur, 0, &first, &last);
+		CHECK(first >= BX && last < BX + BW - 1);
+		CHECK(last > BX + BW / 2);      /* cut at the box's end, not short of it */
+	}
+	field(lng, strlen(lng), 1, &first, &last);
+	CHECK(first >= BX && last < BX + BW - 1);
+	/* A cursor inside a grapheme goes to its start; nothing past the box. */
+	field("xe\xcc\x81y", 2, 0, &first, &last);
+	CHECK(first >= BX && last < BX + BW);
+	/* Too narrow for anything: nothing. */
+	cairo_surface_t *f = cairo_image_surface_create(CAIRO_FORMAT_RGB24, 40, 24);
+	cairo_t *c = cairo_create(f);
+	PangoLayout *l = mtk_layout_new(NULL);
+	mtk_fill(c, 0xffffff, 0, 0, 40, 24);
+	mtk_field_draw(c, l, "abc", 3, 0, 0, 0, 8, 24, 0, 0x7387ad, 0xffffff);
+	CHECK_INT(ink_in(f, 0, 39, 0x000000), 0);
+	g_object_unref(l);
+	cairo_destroy(c);
+	cairo_surface_destroy(f);
+}
+
 int main(void)
 {
 	cs = cairo_image_surface_create(CAIRO_FORMAT_RGB24, W, H);
@@ -224,6 +294,7 @@ int main(void)
 	RUN(rgb);
 	RUN(text);
 	RUN(damage);
+	RUN(field_draw);
 	cairo_destroy(cr);
 	cairo_surface_destroy(cs);
 	return unit_done();
