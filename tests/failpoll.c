@@ -1,6 +1,6 @@
 /* failpoll.c - LD_PRELOAD for black-box tests: the poll of an mtk loop with one fd
- * watched beside Wayland's, as mtkdemo's or osDisplay's, fails as under memory
- * pressure. libwayland's own polls have one fd and go through. */
+ * or more watched beside Wayland's, as mtkdemo's or osDisplay's, fails as under
+ * memory pressure. libwayland's own polls have one fd and go through. */
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
@@ -9,7 +9,7 @@
 int poll(struct pollfd *fds, nfds_t n, int timeout)
 {
 	static int (*real)(struct pollfd *, nfds_t, int);
-	if (n == 2) {
+	if (n >= 2) {
 		errno = ENOMEM;
 		return -1;
 	}

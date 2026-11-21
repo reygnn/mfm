@@ -109,7 +109,11 @@ TEST(compose)
 	/* A locale without a table: none, and keys still work without one. */
 	setenv("LC_ALL", "xx_NOWHERE.nothing", 1);
 	cs = mtk_compose_new(ctx);
+	CHECK(cs == NULL);
 	xkb_compose_state_unref(cs);
+	CHECK(mtk_key_translate(st, NULL, KC_A, &ks, t) && !strcmp(t, "a"));
+	mtk_key_translate(st, NULL, KC_APOS, &ks, t);    /* no sequence without it */
+	CHECK_INT(ks, XKB_KEY_dead_acute);
 	unsetenv("LC_ALL");
 }
 
@@ -127,11 +131,11 @@ TEST(latin)
 	struct xkb_state *s = xkb_state_new(ru);
 	xkb_keysym_t ks = xkb_state_key_get_one_sym(s, KC_U);
 	CHECK(ks == XKB_KEY_Cyrillic_ghe);
-	CHECK_INT(mtk_latin_sym(ru, KC_U, ks), XKB_KEY_u);
-	CHECK_INT(mtk_latin_sym(ru, KC_U, XKB_KEY_U), XKB_KEY_U);       /* Latin as is */
-	CHECK_INT(mtk_latin_sym(NULL, KC_U, ks), ks);
+	CHECK_INT(mtk_latin_sym(ru, 0, KC_U, ks), XKB_KEY_u);
+	CHECK_INT(mtk_latin_sym(ru, 0, KC_U, XKB_KEY_U), XKB_KEY_U);       /* Latin as is */
+	CHECK_INT(mtk_latin_sym(NULL, 0, KC_U, ks), ks);
 	/* A key no layout has a Latin one for keeps its own. */
-	CHECK_INT(mtk_latin_sym(ru, KC_LEFT, XKB_KEY_Left), XKB_KEY_Left);
+	CHECK_INT(mtk_latin_sym(ru, 0, KC_LEFT, XKB_KEY_Left), XKB_KEY_Left);
 	xkb_state_unref(s);
 	xkb_keymap_unref(ru);
 	/* AZERTY: the "&" key is 1 for a shortcut, "é" is 2, "a" stays a. */
@@ -141,18 +145,38 @@ TEST(latin)
 	CHECK(fr != NULL);
 	if (fr) {
 		enum { KC_1 = 10, KC_2 = 11, KC_Q_POS = 24 };
-		CHECK_INT(mtk_latin_sym(fr, KC_1, XKB_KEY_ampersand), XKB_KEY_1);
-		CHECK_INT(mtk_latin_sym(fr, KC_2, XKB_KEY_eacute), XKB_KEY_2);
-		CHECK_INT(mtk_latin_sym(fr, KC_Q_POS, XKB_KEY_a), XKB_KEY_a);
-		CHECK_INT(mtk_latin_sym(fr, KC_SHIFT, XKB_KEY_Shift_L), XKB_KEY_Shift_L);
+		CHECK_INT(mtk_latin_sym(fr, 0, KC_1, XKB_KEY_ampersand), XKB_KEY_1);
+		CHECK_INT(mtk_latin_sym(fr, 0, KC_2, XKB_KEY_eacute), XKB_KEY_2);
+		CHECK_INT(mtk_latin_sym(fr, 0, KC_Q_POS, XKB_KEY_a), XKB_KEY_a);
+		CHECK_INT(mtk_latin_sym(fr, 0, KC_SHIFT, XKB_KEY_Shift_L), XKB_KEY_Shift_L);
 		xkb_keymap_unref(fr);
+	}
+	/* Latin-1 stays as it is with a second layout: a comma, a semicolon, an o
+	 * umlaut are no letter of the other one. */
+	static const struct { const char *layouts; xkb_layout_index_t at; uint32_t kc;
+		xkb_keysym_t ks, want; } two[] = {
+		{ "fr,us", 0, 58, XKB_KEY_comma, XKB_KEY_comma },
+		{ "us,fr", 0, 47, XKB_KEY_semicolon, XKB_KEY_semicolon },
+		{ "de,fr", 0, 47, XKB_KEY_odiaeresis, XKB_KEY_odiaeresis },
+		{ "us,fr", 1, 10, XKB_KEY_ampersand, XKB_KEY_1 },  /* AZERTY active */
+		{ "fr,us", 1, 10, XKB_KEY_1, XKB_KEY_1 },
+	};
+	for (size_t i = 0; i < sizeof two / sizeof two[0]; i++) {
+		names.layout = two[i].layouts;
+		struct xkb_keymap *km = xkb_keymap_new_from_names(ctx, &names,
+			XKB_KEYMAP_COMPILE_NO_FLAGS);
+		CHECK(km != NULL);
+		if (km) {
+			CHECK_INT(mtk_latin_sym(km, two[i].at, two[i].kc, two[i].ks), two[i].want);
+			xkb_keymap_unref(km);
+		}
 	}
 	/* Without a Latin layout at all: ks. */
 	names.layout = "ru";
 	ru = xkb_keymap_new_from_names(ctx, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
 	CHECK(ru != NULL);
 	if (ru) {
-		CHECK_INT(mtk_latin_sym(ru, KC_U, XKB_KEY_Cyrillic_ghe), XKB_KEY_Cyrillic_ghe);
+		CHECK_INT(mtk_latin_sym(ru, 0, KC_U, XKB_KEY_Cyrillic_ghe), XKB_KEY_Cyrillic_ghe);
 		xkb_keymap_unref(ru);
 	}
 }

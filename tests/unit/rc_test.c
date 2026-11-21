@@ -11,6 +11,16 @@
 
 static char dir[] = "/tmp/mtk_rc_test.XXXXXX";
 
+/* fopen for rc.c, wrapped: the path it was asked for last. */
+static char opened[256];
+FILE *__real_fopen(const char *path, const char *mode);
+FILE *__wrap_fopen(const char *path, const char *mode);
+FILE *__wrap_fopen(const char *path, const char *mode)
+{
+	snprintf(opened, sizeof opened, "%s", path);
+	return __real_fopen(path, mode);
+}
+
 /* text as base/mwc/mwmrc */
 static void rc(const char *base, const char *text)
 {
@@ -98,7 +108,8 @@ TEST(long_line)
 
 TEST(where)
 {
-	/* Without XDG_CONFIG_HOME it is ~/.config; without HOME there is none. */
+	/* Without XDG_CONFIG_HOME it is ~/.config; without HOME there is none, an
+	 * empty one is /.config as in mwc. */
 	unsetenv("XDG_CONFIG_HOME");
 	setenv("HOME", "/nonexistent", 1);
 	CHECK(got(NULL, "background", NULL));
@@ -112,9 +123,15 @@ TEST(where)
 	CHECK(got(NULL, "background", "#888888"));
 	setenv("XDG_CONFIG_HOME", "", 1);       /* empty is unset */
 	CHECK(got(NULL, "background", "#888888"));
+	setenv("HOME", "", 1);
+	opened[0] = 0;
+	got(NULL, "background", NULL);
+	CHECK(!strcmp(opened, "/.config/mwc/mwmrc"));
 	unsetenv("HOME");
 	unsetenv("XDG_CONFIG_HOME");
+	opened[0] = 0;
 	CHECK(got(NULL, "background", NULL));
+	CHECK(!opened[0]);
 }
 
 TEST(theme)
@@ -183,6 +200,22 @@ TEST(theme)
 	CHECK_INT(t.inactive.fg, 0xffffff);
 	unsetenv("MWC_ACTIVE");
 	unsetenv("MWC_INACTIVE");
+
+	/* As mwc hands a colour to Motif's rules: the 8 bits shown, each channel's
+	 * 16 cut to the high byte. Rounded, or kept at 16, these would land on the
+	 * other side of a threshold. */
+	rc(dir, "Mwm*background: rgb:3380/3380/3380\n");     /* 33, dark below 20 % */
+	mtk_theme_load(&t);
+	CHECK_INT(t.inactive.bg, 0x333333);
+	CHECK(t.inactive.bot >> 16 < 0x33);             /* medium: darker */
+	rc(dir, "Mwm*background: rgb:edf8/edf8/edf8\n");     /* ed, not above 93 % */
+	mtk_theme_load(&t);
+	CHECK_INT(t.inactive.bg, 0xededed);
+	CHECK(t.inactive.top >> 16 > 0xed);             /* medium: lighter */
+	rc(dir, "Mwm*background: #b310b310b310\n");          /* b3, above 70 % */
+	mtk_theme_load(&t);
+	CHECK_INT(t.inactive.bg, 0xb3b3b3);
+	CHECK_INT(t.inactive.fg, 0x000000);
 }
 
 int main(void)

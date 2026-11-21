@@ -107,7 +107,9 @@ TEST(parse_color)
 	CHECK(color("#ff8000", &c) && c == 0xff8000);
 	CHECK(color("gold", &c) && c == 0xffd700);
 	CHECK(color("CadetBlue", &c) && c == 0x5f9ea0);
-	CHECK(color("rgb:f/80/ff00", &c) && c == 0xff80fe);
+	/* As the screen shows mwc's: 16 bits, cut to their high byte. */
+	CHECK(color("rgb:f/80/ff00", &c) && c == 0xff80ff);
+	CHECK(color("#fe80fe80fe80", &c) && c == 0xfefefe);
 	CHECK(color("RGB:0/0/0", &c) && c == 0x000000);
 	CHECK(color("rgb:123/fff/0", &c) && c == 0x12ff00);
 	CHECK(color("rgb:aB/Cd/eF", &c) && c == 0xabcdef);
@@ -121,6 +123,9 @@ TEST(parse_color)
 		CHECK_INT(c, 0xdeadbe);
 	}
 	CHECK(!color(NULL, &c) && c == 0xdeadbe);
+	/* Each channel cut, not rounded: 0x80ff is 80, 0x7f80 is 7f. */
+	CHECK(color("rgb:80ff/7f80/00ff", &c) && c == 0x807f00);
+	CHECK(color("#123456789abc", &c) && c == 0x12569a);
 }
 
 int main(void)

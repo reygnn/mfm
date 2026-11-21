@@ -10,10 +10,14 @@
  *   MTKDEMO_MAXIMIZED=1  maximized from the start
  *   MTKDEMO_OWN_LOOP=1   its own poll around mtk_before_poll() and mtk_after_poll(),
  *                        as a client with another library's loop has it
+ *   MTKDEMO_DROP_MENU=1  the menu closes itself as soon as it is configured
  *
- * Keys: text into the field, BackSpace, Esc or Ctrl+Q quits. SIGUSR1 counts
- * through a pipe the loop watches. The right button opens a menu of two items:
- * click one, or Up / Down and Return; Esc or a click outside closes it.
+ * Keys: text into the field, BackSpace, Esc or Ctrl+Q quits, F2 makes it 360x140
+ * with a minimum of 250x110 and the title "mtkdemo 360". SIGUSR1 counts through a
+ * pipe the loop watches. SIGUSR2 starts two timers due at once that cancel each
+ * other, and stops watching a second pipe from the idle hook. The right button
+ * opens a menu of two items: click one, or Up / Down and Return; Esc or a click
+ * outside closes it.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -37,10 +41,14 @@ static struct mtk_theme theme;
 static PangoLayout *lo;
 static int barh;
 static char text[256];
-static unsigned keys, repeats, clicks, signals, ticks, scrolls;
+static unsigned keys, repeats, clicks, signals, ticks, scrolls, sigcalls, races;
 static int steps, pressed, press_x, press_y, focused, scale = 1;
 static const char *state_path;
 static int sig_pipe[2] = { -1, -1 };
+static int extra_pipe[2] = { -1, -1 };  /* watched until SIGUSR2 */
+static int unwatch_extra, drop_menu;
+static unsigned race_a, race_b, menu_configs;
+static uint64_t started;         /* mtk_now() at the start */
 static int done;                /* asked to quit, for the own loop */
 static struct mtk_window *menu; /* the popup, while it is up */
 static int menu_hot = -1, choice, press_buttons, press_mods;
@@ -55,12 +63,24 @@ static void state_write(void)
 	if (!state_path)
 		return;
 	mtk_window_size(win, &w, &h);
+	int px = -1, py = -1;
+	if (menu)
+		mtk_popup_position(menu, &px, &py);
+	/* What mtk hands out of a window: its mtk, surface and toplevel, none for a
+	 * popup; and a clock that doesn't go back. */
+	int handles = mtk_window_mtk(win) == m && mtk_window_surface(win) &&
+		mtk_window_toplevel(win) && mtk_now() >= started &&
+		(!menu || (mtk_window_surface(menu) && !mtk_window_toplevel(menu)));
 	snprintf(now, sizeof now, "focus %d\nscale %d\nsize %dx%d\npaints %u\nkeys %u\n"
 		"repeats %u\nclicks %u\npress %d %d\nscrolls %u\nsteps %d\nsignals %u\n"
 		"ticks %u\ndirty %d\ncursors %u\npopup %d\nchoice %d\nbuttons %d\nmods %d\n"
-		"text %s\n", focused, scale, w, h, mtk_window_paints(win), keys, repeats,
-		clicks, press_x, press_y, scrolls, steps, signals, ticks, mtk_window_dirty(win),
-		mtk_cursor_loads(m), menu != NULL, choice, press_buttons, press_mods, text);
+		"popxy %d %d\nsigcalls %u\nraces %u\nwscale %d\nwfocus %d\nseat %d\n"
+		"display %d\nserial %d\nmenucfg %u\nhandles %d\ntext %s\n", focused, scale, w, h,
+		mtk_window_paints(win), keys, repeats, clicks, press_x, press_y, scrolls, steps,
+		signals, ticks, mtk_window_dirty(win), mtk_cursor_loads(m), menu != NULL,
+		choice, press_buttons, press_mods, px, py, sigcalls, races,
+		mtk_window_scale(win), mtk_window_focused(win), mtk_seat(m) != NULL,
+		mtk_display(m) != NULL, mtk_serial(m) != 0, menu_configs, handles, text);
 	if (!strcmp(now, last) ||
 	    (size_t)snprintf(tmp, sizeof tmp, "%s.tmp", state_path) >= sizeof tmp)
 		return;
@@ -188,11 +208,21 @@ static void menu_done(struct mtk_window *w, void *data)
 	menu_close();
 }
 
+/* MTKDEMO_DROP_MENU: gone before it is drawn, from inside mtk's configure. */
+static void menu_configure(struct mtk_window *w, int width, int height, unsigned states,
+	void *data)
+{
+	menu_configs++;
+	if (drop_menu)
+		menu_close();
+}
+
 static const struct mtk_window_listener menu_listener = {
 	.paint = menu_paint,
 	.pointer = menu_pointer,
 	.key = menu_key,
 	.close = menu_done,
+	.configure = menu_configure,
 };
 
 static void focus(struct mtk_window *w, int in, void *data)
@@ -214,6 +244,12 @@ static void key(struct mtk_window *w, const struct mtk_key *k, void *data)
 	    ((k->mods & MTK_MOD_CTRL) && (k->latin == XKB_KEY_q || k->latin == XKB_KEY_Q))) {
 		done = 1;
 		mtk_quit(m, 0);
+		return;
+	}
+	if (k->sym == XKB_KEY_F2) {
+		mtk_window_set_size(w, 360, 140);
+		mtk_window_set_min_size(w, 250, 110);
+		mtk_window_set_title(w, "mtkdemo 360");
 		return;
 	}
 	size_t n = strlen(text);
@@ -290,6 +326,13 @@ static void on_scale(struct mtk_window *w, int s, void *data)
 	scale = s;
 }
 
+/* The compositor's close: the own loop does not hear mtk_quit(). */
+static void on_close(struct mtk_window *w, void *data)
+{
+	done = 1;
+	mtk_quit(m, 0);
+}
+
 static const struct mtk_window_listener listener = {
 	.paint = paint,
 	.focus = focus,
@@ -297,23 +340,44 @@ static const struct mtk_window_listener listener = {
 	.key_repeats = key_repeats,
 	.pointer = pointer,
 	.scale = on_scale,
+	.close = on_close,
 };
 
 static void on_signal(int sig)
 {
 	int saved = errno;
-	if (write(sig_pipe[1], "x", 1) < 0) {
+	if (write(sig_pipe[1], sig == SIGUSR2 ? "r" : "x", 1) < 0) {
 		/* full: the count is a lower bound */
 	}
 	errno = saved;
+}
+
+/* Two timers due in the same round, each cancelling the other: one runs. */
+static void race(struct mtk *mm, void *data)
+{
+	races++;
+	mtk_timer_cancel(mm, data == &race_a ? race_b : race_a);
 }
 
 static void signal_read(struct mtk *mm, int fd, short revents, void *data)
 {
 	char buf[64];
 	ssize_t n;
+	sigcalls++;
 	while ((n = read(fd, buf, sizeof buf)) > 0)
-		signals += n;
+		for (ssize_t i = 0; i < n; i++) {
+			if (buf[i] == 'x') {
+				signals++;
+			} else if (buf[i] == 'r') {
+				race_a = mtk_timer(mm, 0, race, &race_a);
+				race_b = mtk_timer(mm, 0, race, &race_b);
+				unwatch_extra = 1;
+			}
+		}
+}
+
+static void extra_read(struct mtk *mm, int fd, short revents, void *data)
+{
 }
 
 static void tick(struct mtk *mm, void *data)
@@ -324,6 +388,15 @@ static void tick(struct mtk *mm, void *data)
 
 static void idle(struct mtk *mm, void *data)
 {
+	/* After SIGUSR2: the second pipe goes, and the first has something to read
+	 * in this round's poll, which must ask for it once. */
+	if (unwatch_extra) {
+		unwatch_extra = 0;
+		mtk_unwatch_fd(mm, extra_pipe[0]);
+		if (write(sig_pipe[1], "-", 1) < 0) {
+			/* full: it is readable anyway */
+		}
+	}
 	state_write();
 }
 
@@ -364,10 +437,13 @@ int main(int argc, char **argv)
 	int deco = e && *e == '1';
 	e = getenv("MTKDEMO_MAXIMIZED");
 	int maximized = e && *e == '1';
+	e = getenv("MTKDEMO_DROP_MENU");
+	drop_menu = e && *e == '1';
 
 	m = mtk_open(&(struct mtk_config){ .name = "mtkdemo", .idle = idle });
 	if (!m)
 		return 1;
+	started = mtk_now();
 	mtk_theme_load(&theme);
 	PangoFontDescription *font = mtk_dock_font("mtkdemo");
 	lo = mtk_layout_new(font);
@@ -384,11 +460,15 @@ int main(int argc, char **argv)
 		.maximized = maximized,
 	}, &listener, NULL);
 
-	if (pipe2(sig_pipe, O_NONBLOCK | O_CLOEXEC) < 0) {
+	if (pipe2(sig_pipe, O_NONBLOCK | O_CLOEXEC) < 0 ||
+	    pipe2(extra_pipe, O_NONBLOCK | O_CLOEXEC) < 0) {
 		perror("mtkdemo: pipe");
 		return 1;
 	}
 	signal(SIGUSR1, on_signal);
+	signal(SIGUSR2, on_signal);
+	/* The extra one first: unwatched, sig_pipe's watch moves into its place. */
+	mtk_watch_fd(m, extra_pipe[0], POLLIN, extra_read, NULL);
 	mtk_watch_fd(m, sig_pipe[0], POLLIN, signal_read, NULL);
 	mtk_timer(m, 100, tick, NULL);
 	e = getenv("MTKDEMO_OWN_LOOP");
@@ -399,5 +479,7 @@ int main(int argc, char **argv)
 	mtk_close(m);
 	close(sig_pipe[0]);
 	close(sig_pipe[1]);
+	close(extra_pipe[0]);
+	close(extra_pipe[1]);
 	return status;
 }

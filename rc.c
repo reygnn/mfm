@@ -46,10 +46,10 @@ static char *lookup(const char *app, const char *key, char *val, size_t n)
 	int len;
 	if (xdg && *xdg)
 		len = snprintf(path, sizeof path, "%s/mwc/mwmrc", xdg);
-	else if (home && *home)
+	else if (home)          /* as mwc: an empty HOME is /.config */
 		len = snprintf(path, sizeof path, "%s/.config/mwc/mwmrc", home);
 	else
-		return NULL;    /* as mwc: no HOME, no mwmrc, not /.config */
+		return NULL;    /* as mwc: no HOME, no mwmrc */
 	if (len < 0 || (size_t)len >= sizeof path)
 		return NULL;
 	FILE *f = fopen(path, "r");

@@ -17,7 +17,7 @@
 #include <xkbcommon/xkbcommon.h>
 #include <xkbcommon/xkbcommon-compose.h>
 
-#define MTK_VERSION "0.8.0"
+#define MTK_VERSION "0.9.0"
 
 /* ---- colours (color.c) ---------------------------------------------------- */
 
@@ -54,7 +54,9 @@ uint32_t mtk_dimmed(uint32_t bg, uint32_t fg);
 uint32_t mtk_readable(uint32_t bg, uint32_t c, uint32_t to);
 
 /* What mwc reads: "#rrggbb", names like "gold", and rgb:r/g/b with 1 to 4 hex
- * digits per channel. 0 for NULL, "" and anything else; *out is then untouched. */
+ * digits per channel. 0 for NULL, "" and anything else; *out is then untouched.
+ * The colour as the screen shows it and mwc hands it to Motif's rules: each
+ * channel rounded to 16 bits and cut to its high byte. */
 int mtk_parse_color(const char *s, uint32_t *out);
 
 /* ---- the mwmrc and the theme (rc.c) ---------------------------------------- */
@@ -100,8 +102,8 @@ void mtk_shadow(cairo_t *cr, int x, int y, int w, int h, int t,
 
 /* The rows of a buffer that differ from the one shown before it, both h rows of
  * stride bytes, as at most max runs in rows[i][0] (first row) and rows[i][1] (how
- * many): a gap of up to gap rows is not worth a run of its own, and the last run
- * takes in the rest. 0 if nothing changed. For wl_surface.damage_buffer, so the
+ * many): up to gap unchanged rows between two are not worth a run of their own,
+ * and the last run takes in the rest. 0 if nothing changed. For wl_surface.damage_buffer, so the
  * compositor copies and composites only those. */
 int mtk_damage_rows(const void *now, const void *was, size_t stride, int h, int gap,
 	int max, int rows[][2]);
@@ -178,8 +180,8 @@ void mtk_seats_remove(struct mtk_seats *s, unsigned name);
 /* The seat to take, the oldest left; 0 if there is none. */
 int mtk_seats_next(const struct mtk_seats *s, unsigned *name, unsigned *ver);
 
-/* Whether the key quits a small tool: Esc, q or Q, with Ctrl also w and W. With
- * Alt or Super held no key does. */
+/* Whether the key quits a small tool: Esc, q or Q; with Ctrl q, Q, w or W, but not
+ * Esc. With Alt or Super held no key does. */
 int mtk_key_quits(xkb_keysym_t ks, unsigned mods);
 
 /* The modifiers in effect, as MTK_MOD_*. */
@@ -196,12 +198,14 @@ struct xkb_compose_state *mtk_compose_new(struct xkb_context *ctx);
 int mtk_key_translate(struct xkb_state *st, struct xkb_compose_state *compose,
 	uint32_t kc, xkb_keysym_t *sym, char utf8[64]);
 
-/* For a shortcut, the key as it is in the first layout of map that gives a Latin
- * letter or a digit there, as Qt and mfm read it: in Russian, Ctrl+U is the key that
- * is U in a Latin layout. A digit counts on its level with Shift too: AZERTY has "&"
- * there without it, and Ctrl+1 would never come. Else ks, or for a key past Latin-1
- * the first printable ASCII any layout has on it. */
-xkb_keysym_t mtk_latin_sym(struct xkb_keymap *map, uint32_t kc, xkb_keysym_t ks);
+/* For a shortcut, key kc as it gave ks in the active layout: ks itself if it is in
+ * Latin-1, but a digit on the key's Shift level in that layout, as AZERTY has "&"
+ * without Shift and Ctrl+1 would never come. A key past Latin-1, as in Russian, is
+ * the letter or digit the first layout of map with one gives there, as Qt reads it:
+ * Ctrl+U is the key that is U in a Latin layout; else the first printable ASCII any
+ * layout has on it, else ks. Not for keys without Ctrl: "-" on AZERTY is 6. */
+xkb_keysym_t mtk_latin_sym(struct xkb_keymap *map, xkb_layout_index_t layout,
+	uint32_t kc, xkb_keysym_t ks);
 
 /* Key repeat, by the compositor's rate (keys a second, 0 for none) and delay
  * (ms). Times are in ms on any clock that does not go back. */
@@ -334,7 +338,8 @@ void mtk_unwatch_fd(struct mtk *m, int fd);
 unsigned mtk_timer(struct mtk *m, int ms, mtk_timer_fn fn, void *data);
 void mtk_timer_cancel(struct mtk *m, unsigned id);
 
-/* Runs until mtk_quit(); returns its status. */
+/* Runs until mtk_quit(); returns its status. mtk_quit() only ends mtk_run(): a
+ * client with a loop of its own (mtk_before_poll()) ends that itself. */
 int mtk_run(struct mtk *m);
 void mtk_quit(struct mtk *m, int status);
 
@@ -402,7 +407,8 @@ struct mtk_window_listener {
 	 * MTK_STATE_* flags. Called before the paint it causes. */
 	void (*configure)(struct mtk_window *w, int width, int height,
 		unsigned states, void *data);
-	/* The close button. NULL: mtk_quit(m, 0). */
+	/* The close button. NULL: mtk_quit(m, 0), which a loop of the client's own
+	 * does not hear. */
 	void (*close)(struct mtk_window *w, void *data);
 	void (*focus)(struct mtk_window *w, int in, void *data);
 	void (*key)(struct mtk_window *w, const struct mtk_key *k, void *data);

@@ -187,27 +187,29 @@ int mtk_key_translate(struct xkb_state *st, struct xkb_compose_state *compose,
 	return 1;
 }
 
-xkb_keysym_t mtk_latin_sym(struct xkb_keymap *map, uint32_t kc, xkb_keysym_t ks)
+xkb_keysym_t mtk_latin_sym(struct xkb_keymap *map, xkb_layout_index_t layout,
+	uint32_t kc, xkb_keysym_t ks)
 {
+	const xkb_keysym_t *syms;
 	if ((ks < 0x80 && isalnum((int)ks)) || !map)
 		return ks;
 	xkb_layout_index_t n = xkb_keymap_num_layouts_for_key(map, kc);
+	if (ks < 0x100) {
+		if (layout < n && xkb_keymap_key_get_syms_by_level(map, kc, layout, 1,
+		    &syms) == 1 && syms[0] < 0x80 && isdigit((int)syms[0]))
+			return syms[0];
+		return ks;
+	}
 	for (xkb_layout_index_t l = 0; l < n; l++)
-		for (xkb_level_index_t lv = 0; lv < 2; lv++) {
-			const xkb_keysym_t *syms;
+		for (xkb_level_index_t lv = 0; lv < 2; lv++)
 			if (xkb_keymap_key_get_syms_by_level(map, kc, l, lv, &syms) == 1 &&
 			    syms[0] < 0x80 && (isdigit((int)syms[0]) ||
 			    (lv == 0 && isalpha((int)syms[0]))))
 				return syms[0];
-		}
-	if (ks < 0x100)
-		return ks;
-	for (xkb_layout_index_t l = 0; l < n; l++) {
-		const xkb_keysym_t *syms;
+	for (xkb_layout_index_t l = 0; l < n; l++)
 		if (xkb_keymap_key_get_syms_by_level(map, kc, l, 0, &syms) == 1 &&
 		    syms[0] > 0x20 && syms[0] < 0x7f)
 			return syms[0];
-	}
 	return ks;
 }
 

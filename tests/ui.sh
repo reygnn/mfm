@@ -94,6 +94,8 @@ check "its own size" "[ \"\$(get mtkdemo w)x\$(get mtkdemo h)\" = 300x120 ]"
 echo "ok: no server-side decoration unless asked"
 check "it has the keyboard" "[ \"\$(get mtkdemo kbfocus)\" = 1 ]"
 check "it knows" "[ \"\$(ds focus)\" = 1 ]"
+check "mtk_window_focused() says so too" "[ \"\$(ds wfocus)\" = 1 ]"
+check "the seat and the display" "[ \"\$(ds seat)\" = 1 ] && [ \"\$(ds display)\" = 1 ]"
 pixel_at "its border is the active one, in Motif's light shadow" 0 60 $ACT_TOP
 pixel_at "the face beside the bevel" 2 60 c6c1aa
 
@@ -102,6 +104,7 @@ WAYLAND_DISPLAY=wayland-0 build/xdgc app=thief size=200x100 >"$SMOKE_DIR/thief.l
 PID_thief=$!
 check "another window takes the keyboard" "[ \"\$(get thief kbfocus)\" = 1 ]"
 check "it knows it lost it" "[ \"\$(ds focus)\" = 0 ]"
+check "mtk_window_focused() too" "[ \"\$(ds wfocus)\" = 0 ]"
 pixel_at "its border is the inactive one" 0 60 $TOP
 pixel_at "the dark shadow on the right" 299 60 $BOT
 kill "$PID_thief"
@@ -124,11 +127,13 @@ settle() {
 # ---- keys -----------------------------------------------------------------------
 for k in h i shift+1; do do_input key "$k"; done
 check "typed text arrives" "[ \"\$(ds text)\" = 'hi!' ]"
+check "with a serial for requests" "[ \"\$(ds serial)\" = 1 ]"
 do_input key BackSpace
 check "BackSpace" "[ \"\$(ds text)\" = 'hi' ]"
 do_input key ctrl+a
 check "Ctrl+A makes no text" "[ \"\$(ds text)\" = 'hi' ]"
-# A held key repeats at mwc's rate, after its delay; a held modifier doesn't.
+# A held key repeats at mwc's rate, after its delay; a modifier pressed while it
+# repeats doesn't stop it.
 r0=$(ds repeats)
 do_input press x
 check "a held key repeats" "[ \"\$(ds repeats)\" -ge $((r0 + 3)) ]"
@@ -139,11 +144,16 @@ sleep 0.5
 echo "ok: and stops at the release"
 case $(ds text) in hixxxx*) echo "ok: the repeats are typed" ;;
 	*) fail "the repeats made '$(ds text)'" ;; esac
-do_input hold ctrl
-sleep 1
-do_input release ctrl
-[ "$(ds repeats)" = "$r1" ] || fail "a modifier repeats"
-echo "ok: a modifier doesn't"
+do_input press x
+check "x repeats again" "[ \"\$(ds repeats)\" -ge $((r1 + 3)) ]"
+do_input hold shift
+r2=$(ds repeats)
+check "and on with Shift pressed" "[ \"\$(ds repeats)\" -ge $((r2 + 3)) ]"
+do_input lift x
+do_input release shift
+r1=$(settle repeats)
+case $(ds text) in hixxxx*xX*) echo "ok: as X then" ;;
+	*) fail "the repeats with Shift made '$(ds text)'" ;; esac
 # Ctrl+x may not repeat: the client says so.
 do_input hold ctrl
 do_input press x
@@ -191,6 +201,8 @@ menu_up() { pixel_at "$1" $((PX + 60)) $((PY + 14)) $BG; }
 do_input move $((X0 + PX)) $((Y0 + PY))
 do_input click right
 check "the menu is up" "[ \"\$(ds popup)\" = 1 ]"
+check "where mwc put it, at the pointer" "[ \"\$(ds popxy)\" = '$PX $PY' ]"
+check "a surface and no toplevel" "[ \"\$(ds handles)\" = 1 ]"
 menu_up "it is drawn below and right of the pointer"
 do_input key Down
 pixel_at "Down lights the first item" $((PX + 60)) $((PY + 14)) $SEL
@@ -209,6 +221,15 @@ menu_up "up again"
 do_input key Escape
 check "Esc closes it, nothing taken" "[ \"\$(ds popup)\" = 0 ] && [ \"\$(ds choice)\" = 2 ]"
 check "Esc went to the menu, not the window" "kill -0 $PID_demo"
+# Held past mwc's delay, its repeats don't go on to the window, which quits on Esc.
+do_input click right
+menu_up "up again"
+do_input press Escape
+check "the menu goes at the press" "[ \"\$(ds popup)\" = 0 ]"
+sleep 1.5
+do_input lift Escape
+sleep 0.3
+check "a held Esc doesn't repeat into the window" "kill -0 $PID_demo"
 do_input click right
 menu_up "up again"
 do_input move $((X0 + 20)) $((Y0 + 100))
@@ -239,6 +260,17 @@ kill -USR1 "$PID_demo"
 check "the watched fd" "[ \"\$(ds signals)\" = 1 ]"
 kill -USR1 "$PID_demo"
 check "again" "[ \"\$(ds signals)\" = 2 ]"
+# SIGUSR2: two timers due at once, each cancelling the other, and a watch dropped
+# in the idle hook while the one after it has something to read.
+c0=$(ds sigcalls)
+kill -USR2 "$PID_demo"
+check "of two timers that cancel each other one runs" "[ \"\$(ds races)\" = 1 ]"
+check "a watch dropped in the idle hook isn't polled" \
+	"[ \"\$(ds sigcalls)\" = $((c0 + 2)) ]"
+sleep 0.3
+[ "$(ds races)" = 1 ] && [ "$(ds sigcalls)" = $((c0 + 2)) ] ||
+	fail "later: races $(ds races), calls $(ds sigcalls) from $c0"
+echo "ok: and stay so"
 p0=$(ds paints)
 sleep 0.5
 [ "$(ds paints)" = "$p0" ] || fail "it paints without a change: $p0, then $(ds paints)"
@@ -254,6 +286,7 @@ echo 'Mwm*HEADLESS-1*outputScale: 2' >>"$XDG_CONFIG_HOME/mwc/mwmrc"
 reload_mwc
 check "the output is scaled" "[ \"\$(global output_HEADLESS-1 scale)\" = 200 ]"
 check "the demo at scale 2" "[ \"\$(ds scale)\" = 2 ]"
+check "mtk_window_scale() says so too" "[ \"\$(ds wscale)\" = 2 ]"
 check "the cursor theme loaded again, for it" "[ \"\$(ds cursors)\" = 2 ]"
 refresh
 where
@@ -270,20 +303,29 @@ where
 quit_demo Escape
 
 # ---- a resizable window, with mwc's frame ------------------------------------------
-MTKDEMO_DECO=1 start_demo
+DEMO_LOG_SAVED=$DEMO_LOG DEMO_LOG=$SMOKE_DIR/deco.log
+WAYLAND_DEBUG=client MTKDEMO_DECO=1 start_demo
+DEMO_LOG=$DEMO_LOG_SAVED
 check "mwc decorates it when asked" "[ \"\$(get mtkdemo th)\" -gt 0 ]"
-check "the compositor's size" "[ -n \"\$(ds size)\" ]"
-echo "ok: $(ds size)"
+check "the compositor's size" "[ \"\$(ds size)\" = \"\$(get mtkdemo w)x\$(get mtkdemo h)\" ]"
+# F2: a size, a minimum and a title of the client's.
+do_input key F2
+check "a size of its own" "[ \"\$(get mtkdemo w)x\$(get mtkdemo h)\" = 360x140 ]"
+check "it paints it" "[ \"\$(ds size)\" = 360x140 ]"
+check "a title of its own" "[ \"\$(get mtkdemo tlen)\" = 11 ]"
+check "a minimum size" "grep -q 'xdg_toplevel#[0-9]*\.set_min_size(250, 110)' $SMOKE_DIR/deco.log"
 # Maximized it takes the size it is given.
 do_input key alt+F10
 check "maximized, larger" "[ \"\$(get mtkdemo w)\" -gt 600 ]"
 check "it paints that size" "[ \"\$(ds size)\" = \"\$(get mtkdemo w)x\$(get mtkdemo h)\" ]"
 # Back from it mwc leaves the size to the client: its own from before, not the
-# maximized one.
+# maximized one nor the first.
 do_input key alt+F10
-check "unmaximized, its size from before" "[ \"\$(ds size)\" = 300x120 ]"
-check "and mwc's" "[ \"\$(get mtkdemo w)x\$(get mtkdemo h)\" = 300x120 ]"
+check "unmaximized, its size from before" "[ \"\$(ds size)\" = 360x140 ]"
+check "and mwc's" "[ \"\$(get mtkdemo w)x\$(get mtkdemo h)\" = 360x140 ]"
 quit_demo ctrl+q
+grep -q 'ERROR: AddressSanitizer\|runtime error' "$SMOKE_DIR/deco.log" &&
+	fail "the sanitizers report: $(grep -m1 'ERROR\|runtime error' "$SMOKE_DIR/deco.log")"
 
 # Maximized before its first commit, mwc has no size of its own for it: back from
 # that it leaves the size to the client, which takes its own from the start.
@@ -324,6 +366,19 @@ check "mtk's timers run" "[ \"\$(ds ticks)\" -gt $((t0 + 2)) ]"
 kill -USR1 "$PID_demo"
 check "its own fd" "[ \"\$(ds signals)\" = 1 ]"
 pixel_at "its border is the active one" 0 60 $ACT_TOP
+# mwc's close ends it too, though mtk_quit() doesn't end its loop.
+quit_demo alt+F4
+
+# ---- a popup gone in its configure ----------------------------------------------
+MTKDEMO_DROP_MENU=1 MTKDEMO_FIXED=1 start_demo
+do_input move $((X0 + 150)) $((Y0 + 50))
+do_input click right
+check "the menu closes itself as it is configured" \
+	"[ \"\$(ds menucfg)\" = 1 ] && [ \"\$(ds popup)\" = 0 ]"
+sleep 0.3
+check "and the demo lives on" "kill -0 $PID_demo"
+do_input key z
+check "with the keyboard" "[ \"\$(ds text)\" = z ]"
 quit_demo Escape
 
 # ---- shortcuts in a layout without Latin letters ---------------------------------

@@ -36,6 +36,12 @@ static void xm_channels(uint32_t rgb, int c[3])
 	c[2] = (rgb & 0xff) * 257;
 }
 
+/* The colour as the screen shows it: each 16-bit channel cut to its high byte. */
+static uint32_t rgb8(const uint16_t c[3])
+{
+	return (uint32_t)(c[0] >> 8) << 16 | (uint32_t)(c[1] >> 8) << 8 | (c[2] >> 8);
+}
+
 /* Brightness(): three quarters the mean of the channels, a quarter the luminosity. */
 static int xm_brightness(const int c[3])
 {
@@ -84,6 +90,7 @@ uint32_t mtk_text_color(uint32_t bg)
 	return xm_brightness(c) > XM_FOREGROUND ? 0x000000 : 0xffffff;
 }
 
+
 /* An sRGB channel as linear light. */
 static float linear(unsigned c)
 {
@@ -131,12 +138,19 @@ uint32_t mtk_readable(uint32_t bg, uint32_t c, uint32_t to)
 	return to;
 }
 
-int mtk_parse_color(const char *s, uint32_t *out)
+/* As mwc's config_color() and rgb_of(): a float of the channel, rounded to 16
+ * bits. */
+static uint16_t channel16(float v)
+{
+	return (uint16_t)lroundf(fminf(fmaxf(v, 0.0f), 1.0f) * 65535);
+}
+
+static int parse16(const char *s, uint16_t out[3])
 {
 	if (!s || !*s)
 		return 0;
 	if (!strncasecmp(s, "rgb:", 4)) {
-		uint32_t rgb = 0;
+		uint16_t c[3];
 		s += 4;
 		for (int i = 0; i < 3; i++) {
 			/* Only hex digits, as mwc: strtoul alone also takes spaces,
@@ -144,17 +158,27 @@ int mtk_parse_color(const char *s, uint32_t *out)
 			int digits = strspn(s, "0123456789abcdefABCDEF");
 			if (digits < 1 || digits > 4 || s[digits] != (i < 2 ? '/' : '\0'))
 				return 0;
-			unsigned long v = strtoul(s, NULL, 16);
-			unsigned long max = (1ul << (4 * digits)) - 1;
-			rgb = rgb << 8 | (v * 255 + max / 2) / max;
+			c[i] = channel16(strtoul(s, NULL, 16) /
+				(float)((1ul << (4 * digits)) - 1));
 			s += digits + 1;
 		}
-		*out = rgb;
+		memcpy(out, c, sizeof c);
 		return 1;
 	}
-	PangoColor c;
-	if (!pango_color_parse(&c, s))
+	PangoColor pc;
+	if (!pango_color_parse(&pc, s))
 		return 0;
-	*out = (uint32_t)(c.red >> 8) << 16 | (c.green >> 8) << 8 | (c.blue >> 8);
+	out[0] = channel16(pc.red / 65535.0f);
+	out[1] = channel16(pc.green / 65535.0f);
+	out[2] = channel16(pc.blue / 65535.0f);
+	return 1;
+}
+
+int mtk_parse_color(const char *s, uint32_t *out)
+{
+	uint16_t c[3];
+	if (!parse16(s, c))
+		return 0;
+	*out = rgb8(c);
 	return 1;
 }
