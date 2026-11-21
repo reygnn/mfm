@@ -14,8 +14,9 @@ mtk tells it when, at which scale and with which colours.
 ## Colours
 
 mtk takes mwc's colours as mwc does: `MWC_INACTIVE` and `MWC_ACTIVE`, else
-`Mwm*background` and `Mwm*activeBackground` from `~/.config/mwc/mwmrc`, else Motif's
-`#aeb2c3` and `#7387ad`. The shadows and the default text follow Motif 2.3.8's
+`Mwm*background` and `Mwm*activeBackground` from `~/.config/mwc/mwmrc`, else `#aaaaaa`
+and `#c6c1aa`, IRIX's Base scheme, as mwc's. On the built-in grey the text is black, as
+mwc has it. The shadows and the default text follow Motif 2.3.8's
 `CalculateColorsRGB()`, as mwc's own frames do, so a client and its frame match.
 `mtk_best_contrast()`, `mtk_dimmed()` and `mtk_readable()` are there for text that
 must reach WCAG's 4.5:1.

@@ -95,23 +95,33 @@ static int rc_color(const char *res, uint32_t *out)
 	return mtk_parse_color(mtk_mwmrc_get(res, v, sizeof v), out);
 }
 
-/* As mwc's setting_color(): the environment, the mwmrc, the default. */
-static uint32_t setting(const char *env, const char *res, uint32_t def)
+/* As mwc's setting_color(): the environment, the mwmrc, the default; *builtin says
+ * the default it was. One that is no colour counts as not set. */
+static uint32_t setting(const char *env, const char *res, uint32_t def, int *builtin)
 {
 	uint32_t rgb;
+	*builtin = 0;
 	if (mtk_parse_color(getenv(env), &rgb) || rc_color(res, &rgb))
 		return rgb;
+	*builtin = 1;
 	return def;
 }
 
 void mtk_theme_load(struct mtk_theme *t)
 {
-	uint32_t bg = setting("MWC_INACTIVE", "background", 0xaeb2c3);
-	uint32_t act = setting("MWC_ACTIVE", "activeBackground", 0x7387ad);
+	/* IRIX 6.5's Base scheme, as mwc's defaults: a grey, and a light stone for
+	 * the window that has the focus. */
+	int builtin, unused;
+	uint32_t bg = setting("MWC_INACTIVE", "background", 0xaaaaaa, &builtin);
+	uint32_t act = setting("MWC_ACTIVE", "activeBackground", 0xc6c1aa, &unused);
 	uint32_t fg, afg;
 	t->has_fg = rc_color("foreground", &fg);
 	t->has_active_fg = rc_color("activeForeground", &afg);
-	t->inactive = mtk_shade(bg, t->has_fg ? fg : mtk_text_color(bg));
+	/* The built-in grey takes the Base palette's black text, as in mwc; Motif
+	 * would pick white, at 67 %. A grey that is set, #aaaaaa too, gets Motif's
+	 * choice. */
+	t->inactive = mtk_shade(bg, t->has_fg ? fg : builtin ? 0x000000 :
+		mtk_text_color(bg));
 	t->active = mtk_shade(act, t->has_active_fg ? afg : mtk_text_color(act));
 	t->dim = mtk_dimmed(bg, t->inactive.fg);
 }
