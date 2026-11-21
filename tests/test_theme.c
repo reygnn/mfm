@@ -107,6 +107,29 @@ int main(void)
 		readable_all(g * 0x010101, 0x7387ad, &red, &green);
 	}
 
+	/* IRIX's client palette, as mtk_theme_load() has it. Buckingham: the
+	 * palette's text reads, Motif's white on the active stone would not. */
+	uint32_t pal_text = 0xfffffe;
+	theme_palette(&t, 0x795f78, 0x9991a6, &pal_text, NULL);
+	CHECK(t.bg == 0x795f78 && t.fg == 0xfffffe && t.sel_fg == 0x000000);
+	/* Without textForeground the better of black and white, not Motif's. */
+	theme_palette(&t, 0x8c8c8c, 0x9991a6, NULL, NULL);
+	CHECK(t.fg == 0x000000 && mtk_text_color(0x8c8c8c) == 0xffffff);
+	/* Arizona's text has 3.8:1, Monet's activeForeground less: moved to 4.5:1. */
+	theme_palette(&t, 0x868373, 0xaaa5d5, &white, &white);
+	CHECK(t.fg != white && mtk_contrast_ratio(t.fg, t.bg) >= 4.5f);
+	CHECK(t.sel_fg != white && mtk_contrast_ratio(t.sel_fg, t.sel) >= 4.5f);
+	uint32_t navy = 0x000033;
+	theme_palette(&t, 0xb688a5, 0xaaa5d5, NULL, &navy);
+	CHECK(t.sel_fg == navy);
+	for (uint32_t g = 0; g < 256; g += 5) {
+		theme_palette(&t, g * 0x010101, 0x9991a6, &red, &green);
+		CHECK(mtk_contrast_ratio(t.fg, t.bg) >= 4.5f);
+		CHECK(mtk_contrast_ratio(t.sel_fg, t.sel) >= 4.5f);
+		CHECK(mtk_contrast_ratio(t.list_fg, t.list) >= 4.5f);
+		CHECK(mtk_contrast_ratio(t.dim, t.bg) >= 4.5f);
+	}
+
 	printf("test_theme: %d/%d\n", checks - failures, checks);
 	return failures != 0;
 }

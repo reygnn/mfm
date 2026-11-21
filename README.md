@@ -94,6 +94,7 @@ over its entry.
 | `font` | `MFM_FONT` | `Sans 10` | a Pango font name |
 | `background`, `activeBackground` | `MWC_INACTIVE`, `MWC_ACTIVE` | mwc's, from its mwmrc | window and selection |
 | `foreground`, `activeForeground` | | mwc's, else black or white as Motif picks it | their text |
+| `basicBackground`, `textForeground` | | none | IRIX's client palette: the window's face and its text instead of `background` and `foreground`, the text at 4.5:1 at least |
 | `sort`, `sortReverse` | | `name`, `false` | the order at start: `name`, `size` or `date` |
 | `showHidden` | | `false` | hidden files at start |
 

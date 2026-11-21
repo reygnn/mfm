@@ -1204,6 +1204,22 @@ green=$(build/pngtool count "$SHOT" $((CX + 20)) $((ROW0 + 1)) 400 $((ROWH - 2))
 	fail "foreground: $red red on the status line, $moved ad0000 and $unmoved c00000 on a row, $green green on the selected one"
 echo "ok: Mwm*foreground and Mwm*activeForeground, moved on the list"
 mfm_quit
+
+# IRIX's client palette: basicBackground is the face, textForeground its text, and
+# foreground, the red, is left to mwc's titles.
+printf 'Mwm*basicBackground: #795f78\nMwm*textForeground: #fffffe\n' \
+	>>"$XDG_CONFIG_HOME/mwc/mwmrc"
+BG=795f78
+MFM_FONT="Sans Bold 24" mfm_start "$D"
+BG=aaaaaa
+shoot
+H=$(get mfm h)
+red=$(build/pngtool count "$SHOT" "$CX" $((CY + H - 60)) 400 60 c00000 6)
+pal=$(build/pngtool count "$SHOT" "$CX" $((CY + H - 60)) 400 60 fffffe 0)
+[ "$red" = 0 ] && [ "$pal" -gt 0 ] ||
+	fail "palette: $red red and $pal textForeground pixels on the status line"
+echo "ok: basicBackground and textForeground, not foreground"
+mfm_quit
 rm "$XDG_CONFIG_HOME/mwc/mwmrc"
 
 # The date shows where the name keeps at least as much room as the date takes: a big

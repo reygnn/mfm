@@ -35,3 +35,12 @@ void theme_make(struct theme *t, uint32_t bg, uint32_t act, const uint32_t *fg,
 	t->err = mtk_readable(bg, mtk_best_contrast(bg) == 0xffffff ? 0xffa0a0 : 0x8a0303,
 		mtk_best_contrast(bg));
 }
+
+void theme_palette(struct theme *t, uint32_t basic, uint32_t act, const uint32_t *text,
+	const uint32_t *sel_fg)
+{
+	uint32_t best = mtk_best_contrast(basic), abest = mtk_best_contrast(act);
+	uint32_t fg = text ? mtk_readable(basic, *text, best) : best;
+	uint32_t sfg = sel_fg ? mtk_readable(act, *sel_fg, abest) : abest;
+	theme_make(t, basic, act, &fg, &sfg);
+}

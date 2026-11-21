@@ -600,7 +600,12 @@ static void theme_init(void)
 	}
 	int has_sel = rc_color("activeForeground", &sel_fg);
 	struct theme t;
-	theme_make(&t, bg, act, has_fg ? &fg : NULL, has_sel ? &sel_fg : NULL);
+	uint32_t basic, text;
+	if (rc_color("basicBackground", &basic))        /* IRIX's client palette */
+		theme_palette(&t, basic, act, rc_color("textForeground", &text) ? &text :
+			NULL, has_sel ? &sel_fg : NULL);
+	else
+		theme_make(&t, bg, act, has_fg ? &fg : NULL, has_sel ? &sel_fg : NULL);
 
 	px_bg = t.bg;
 	px_top = t.top;
