@@ -405,15 +405,6 @@ static const char *disp(const char *s)
 	return out;
 }
 
-/* What belongs to the character before it: the marks of any script (Hindi
- * vowel signs, Hebrew points, variation selectors too), the joiner in emoji
- * sequences and the skin tones. */
-static int is_combining(uint32_t c)
-{
-	return c >= 0x300 && (g_unichar_ismark(c) || c == 0x200d ||
-		(c >= 0x1f3fb && c <= 0x1f3ff));
-}
-
 /* Lower case for type-ahead. towlower() only knows non-ASCII letters in a
  * UTF-8 locale, so the common European ranges are folded by hand too. */
 static uint32_t fold(uint32_t c)
@@ -3083,143 +3074,31 @@ static void typeahead(const char *txt, int n)
 
 /*
  * One line of input with a cursor at byte *cur, shared by the path field
- * and the prompt. Returns 1 for Return, -1 for Escape, else 0.
+ * and the prompt: mtk's field. Returns 1 for Return, -1 for Escape, else 0.
  * While *fresh, the text before the cursor counts as selected: with
  * `selects`, typing replaces it and Backspace/Delete remove it; without (the
  * path field), only "/" or "~" start over. Only keys that change the text
  * or move the cursor end the fresh state; Shift, AltGr or a dead key
  * pressed on the way to "/" or "~" must not.
  */
-/* The cursor position before (dir < 0) or after c in b: a whole grapheme, a
- * flag or a letter with its marks, as Pango tells them apart. Next to a byte
- * that is not UTF-8 it goes by a letter and the combining marks after it. */
-static size_t grapheme_step(const char *b, size_t c, int dir)
-{
-	size_t len = strlen(b);
-	const char *p;
-	if (dir < 0 ? c == 0 : c >= len)
-		return c;
-	/* The valid UTF-8 around c, between bytes that are not: a Latin-1
-	 * byte elsewhere in a path must not cost the rest its graphemes. */
-	size_t lo = 0, hi = len;
-	for (size_t i = 0; i < len;) {
-		uint32_t cp;
-		int l = u8_len((const unsigned char *)b + i, &cp);
-		if (!l) {
-			if (i < c) {
-				lo = i + 1;
-			} else {
-				hi = i;
-				break;
-			}
-			l = 1;
-		}
-		i += l;
-	}
-	if (dir < 0 ? c == lo : c == hi) {
-		if (dir < 0) {
-			while (c) {
-				c = u8_prev(b, c);
-				p = b + c;
-				if (!is_combining(u8_next(&p)))
-					break;
-			}
-			return c;
-		}
-		p = b + c;
-		u8_next(&p);
-		for (const char *q = p; *q && is_combining(u8_next(&q));)
-			p = q;
-		return p - b;
-	}
-	const char *r = b + lo;
-	glong nch = g_utf8_strlen(r, hi - lo);
-	PangoLogAttr *a = g_new(PangoLogAttr, nch + 1);
-	pango_get_log_attrs(r, hi - lo, -1, pango_language_get_default(), a,
-		nch + 1);
-	glong i = g_utf8_pointer_to_offset(r, b + c);
-	do
-		i += dir < 0 ? -1 : 1;
-	while (i > 0 && i < nch && !a[i].is_cursor_position);
-	g_free(a);
-	return g_utf8_offset_to_pointer(r, i) - b;
-}
-
 static int line_key(char *b, size_t sz, size_t *cur, int *fresh, int selects,
 	xkb_keysym_t ks, const char *txt, int n, int ctrl)
 {
-	size_t len = strlen(b), c = MIN(*cur, len);
-	const char *p;
-	int cut = *fresh && selects && c > 0;       /* a selection to replace */
-	switch (ks) {
-	case XKB_KEY_Return: case XKB_KEY_KP_Enter:
-		return 1;
-	case XKB_KEY_Escape:
-		return -1;
-	/* The cursor stays out of a grapheme. */
-	case XKB_KEY_Left: case XKB_KEY_KP_Left:
-		c = grapheme_step(b, c, -1);
-		break;
-	case XKB_KEY_Right: case XKB_KEY_KP_Right:
-		c = grapheme_step(b, c, 1);
-		break;
-	case XKB_KEY_Home: case XKB_KEY_KP_Home:
-		c = 0;
-		break;
-	case XKB_KEY_End: case XKB_KEY_KP_End:
-		c = len;
-		break;
-	case XKB_KEY_BackSpace:
-		if (cut) {
-			memmove(b, b + c, len - c + 1);
-			c = 0;
-		} else if (c) {         /* the whole grapheme */
-			size_t q = grapheme_step(b, c, -1);
-			memmove(b + q, b + c, len - c + 1);
-			c = q;
-		}
-		break;
-	case XKB_KEY_Delete: case XKB_KEY_KP_Delete:
-		if (cut) {
-			memmove(b, b + c, len - c + 1);
-			c = 0;
-		} else if (c < len) {
-			size_t q = grapheme_step(b, c, 1);
-			memmove(b + c, b + q, len - q + 1);
-		}
-		break;
-	default:
-		if (ctrl && ks == XKB_KEY_u) {
-			b[0] = 0;
-			c = 0;
-			break;
-		}
-		if (ctrl || n <= 0 || (unsigned char)txt[0] < 0x20 ||
-		    txt[0] == 0x7f)
-			return 0;
-		if (cut) {
-			if (len - c + n >= sz)
-				return 0;       /* would not fit: keep all */
-			memmove(b, b + c, len - c + 1);
-			len -= c;
-			c = 0;
-		} else if (*fresh && !selects && (txt[0] == '/' || txt[0] == '~')) {
-			b[0] = 0;
-			len = c = 0;
-		}
-		if (len + n >= sz)
-			return 0;
-		memmove(b + c + n, b + c, len - c + 1);
-		memcpy(b + c, txt, n);
-		c += n;
+	if (*fresh && !selects && !ctrl && n > 0 && (txt[0] == '/' || txt[0] == '~')) {
+		b[0] = 0;
+		*cur = 0;
 	}
-	/* Deleting can join stray bytes into one character; keep the
-	 * cursor on a character boundary. */
-	for (p = b; (size_t)(p - b) < c;)
-		u8_next(&p);
-	*fresh = 0;
-	*cur = p - b;
-	redraw();
+	struct mtk_field f = { .text = b, .size = sz, .cur = *cur, .fresh = *fresh,
+		.selects = selects };
+	int r = mtk_field_key(&f, ks, n > 0 ? txt : "", ctrl ? MTK_MOD_CTRL : 0);
+	*cur = f.cur;
+	*fresh = f.fresh;
+	if (r == MTK_FIELD_ENTER)
+		return 1;
+	if (r == MTK_FIELD_CANCEL)
+		return -1;
+	if (r != MTK_FIELD_NONE)
+		redraw();
 	return 0;
 }
 
@@ -3563,11 +3442,6 @@ static int cut_prefix(const char *s, int n, int maxw)
 	return lo;
 }
 
-static int fit_prefix(const char *s, int n, int maxw)
-{
-	return shape(s, n) <= maxw ? n : cut_prefix(s, n, maxw);
-}
-
 /* Start of the longest suffix of s[0..n) that is at most maxw wide. */
 static int fit_suffix(const char *s, int n, int maxw)
 {
@@ -3619,60 +3493,9 @@ static void draw_input(struct rect r, const char *b, size_t cur,
 {
 	static char pre[PATH_MAX];
 	snprintf(pre, sizeof pre, "%.*s", (int)cur, b);
-	int dc = strlen(disp(pre));
-	const char *d = disp(b);
-	int n = strlen(d);
-	dc = MIN(dc, n);
-	int ew = ell_w, maxw = r.w - 2;
-	int x = r.x, start = 0, end = n;
-	if (maxw <= 2 * ew)
-		return;
-	stops_of(d, n);
-	/* What disp() replaced can make other graphemes than the raw text
-	 * has: the cursor goes to the start of the one it is in. */
-	while (dc > 0 && !cut_stop[dc])
-		dc--;
-	if (fit_prefix(d, n, maxw) < n) {
-		if (fit_prefix(d, dc, maxw - ew) < dc) {
-			start = fit_suffix(d, dc, maxw - 2 * ew);
-			text(xc_pfg, x, r.y, r.h, "...", 3);
-			x += ew;
-		}
-		end = start + fit_prefix(d + start, n - start,
-			maxw - (x - r.x) - ew);
-	}
-	/* One layout for all that shows: cut at the cursor, right-to-left text
-	 * would come apart. Shaping need not grow with the text, so the cut
-	 * can fall short of the cursor: it goes at the end then. */
-	end = MAX(end, dc);
-	int seg = end - start, c = dc - start;
-	PangoRectangle at = { 0 };
-	pango_layout_set_text(plo, d + start, seg);
-	pango_layout_get_cursor_pos(plo, c, &at, NULL);
-	if (selected && c > 0) {
-		int *ranges, nr;
-		pango_layout_line_get_x_ranges(pango_layout_get_line_readonly(plo, 0),
-			0, c, &ranges, &nr);
-		for (int i = 0; i < nr; i++)
-			fill(px_sel, x + PANGO_PIXELS(ranges[2 * i]), r.y + 2,
-				PANGO_PIXELS(ranges[2 * i + 1] - ranges[2 * i]),
-				r.h - 4);
-		g_free(ranges);
-		PangoAttrList *attrs = pango_attr_list_new();
-		PangoAttribute *fg = pango_attr_foreground_new(
-			((xc_sel >> 16) & 0xff) * 257, ((xc_sel >> 8) & 0xff) * 257,
-			(xc_sel & 0xff) * 257);
-		fg->start_index = 0;
-		fg->end_index = c;
-		pango_attr_list_insert(attrs, fg);
-		pango_layout_set_attributes(plo, attrs);
-		pango_attr_list_unref(attrs);
-	}
-	text(xc_pfg, x, r.y, r.h, d + start, seg);
-	pango_layout_set_attributes(plo, NULL);
-	if (end < n)
-		text(xc_pfg, x + shape(d + start, seg), r.y, r.h, "...", 3);
-	fill(xc_pfg, x + PANGO_PIXELS(at.x), r.y + 3, 1, r.h - 6);
+	size_t dc = strlen(disp(pre));
+	mtk_field_draw(cr, plo, disp(b), dc, selected, r.x, r.y, r.w, r.h, xc_pfg,
+		px_sel, xc_sel);
 }
 
 static void draw_icon(int x, int y, const struct ent *e)
